@@ -117,6 +117,11 @@ def run_values(args) -> None:
             daily, missing_ratio, _ = daily_rank_ic(values, target)
             record["daily_ic"] = [_finite_or_none(v) for v in daily.to_numpy(dtype=float)]
             record["missing_ratio"] = float(missing_ratio)
+            # The C++ engine stores panels in float32. Rounding creates ties
+            # that change ranks, so the RankIC of the rounded values is kept
+            # too: it checks the RankIC code apart from the storage precision.
+            daily32, _, _ = daily_rank_ic(values.astype("float32"), target)
+            record["daily_ic_f32"] = [_finite_or_none(v) for v in daily32.to_numpy(dtype=float)]
             candidate, _ = _evaluate_with_values(expression, data, target, config, ExpressionCache())
             record["candidate"] = None if candidate is None else {
                 "rank_ic": candidate.rank_ic,
