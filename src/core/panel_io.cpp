@@ -46,4 +46,26 @@ Panel PanelSet::load_field(const std::string& name) const {
 
 Panel PanelSet::load_target() const { return read_raw_panel(dir + "/target.f32", T, N); }
 
+namespace {
+
+Panel read_rows(const std::string& path, int T_file, int N, int t0, int t1, int halo) {
+    if (t0 - halo < 0 || t1 > T_file || t0 > t1) throw std::runtime_error("row range outside " + path);
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open " + path);
+    Panel p(t1 - t0, N, -halo);
+    in.seekg(static_cast<std::streamoff>(t0 - halo) * N * sizeof(float));
+    in.read(reinterpret_cast<char*>(p.buf.data()), static_cast<std::streamsize>(p.buf.size() * sizeof(float)));
+    if (!in) throw std::runtime_error("short read: " + path);
+    return p;
+}
+
+}  // namespace
+
+Panel PanelSet::load_field_rows(const std::string& name, int t0, int t1, int halo) const {
+    if (!has_field(name)) throw std::runtime_error("unknown field: " + name);
+    return read_rows(dir + "/fields/" + name + ".f32", T, N, t0, t1, halo);
+}
+
+Panel PanelSet::load_target_rows(int t0, int t1) const { return read_rows(dir + "/target.f32", T, N, t0, t1, 0); }
+
 }  // namespace gpe

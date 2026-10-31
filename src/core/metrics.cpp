@@ -96,42 +96,75 @@ DailyIC daily_rank_ic(const Panel& factor, const std::vector<double>& target_ran
             result.ic[t] = pearson_pairwise(rank.data(), y, N);
         }
     }
+    result.eligible = eligible;
+    result.valid = valid;
     result.missing_ratio = eligible == 0 ? 1.0 : 1.0 - static_cast<double>(valid) / eligible;
     return result;
 }
 
-Candidate score_factor(const DailyIC& daily, int depth, int nodes, const FitnessConfig& config) {
+void IcSummary::pack(double* out) const {
+    const size_t k = seg_sum.size();
+    for (size_t i = 0; i < k; ++i) {
+        out[i] = seg_sum[i];
+        out[k + i] = seg_count[i];
+    }
+    out[2 * k] = eligible;
+    out[2 * k + 1] = valid;
+}
+
+IcSummary IcSummary::unpack(const double* in, int segments) {
+    IcSummary s;
+    s.seg_sum.assign(in, in + segments);
+    s.seg_count.assign(in + segments, in + 2 * segments);
+    s.eligible = in[2 * segments];
+    s.valid = in[2 * segments + 1];
+    return s;
+}
+
+IcSummary summarize_ic(const DailyIC& daily, int t0, int T_total, int segments) {
+    IcSummary s;
+    s.seg_sum.assign(segments, 0.0);
+    s.seg_count.assign(segments, 0.0);
+    s.eligible = static_cast<double>(daily.eligible);
+    s.valid = static_cast<double>(daily.valid);
+    // np.array_split: the first T_total % k segments get one extra day.
+    const int base = T_total / segments, extra = T_total % segments;
+    for (size_t i = 0; i < daily.ic.size(); ++i) {
+        double v = daily.ic[i];
+        if (!std::isfinite(v)) continue;
+        int t = t0 + static_cast<int>(i);
+        int seg = t < extra * (base + 1) ? t / (base + 1) : extra + (t - extra * (base + 1)) / base;
+        s.seg_sum[seg] += v;
+        s.seg_count[seg] += 1.0;
+    }
+    return s;
+}
+
+namespace {
+
+// _evaluate_with_values filters and _fitness_from_segments.
+Candidate score(const IcSummary& s, double missing_ratio, int T, int depth, int nodes, const FitnessConfig& config) {
     Candidate c;
-    c.missing_ratio = daily.missing_ratio;
+    c.missing_ratio = missing_ratio;
     if (depth > config.max_depth || nodes > config.max_nodes) return c;
 
-    const int T = static_cast<int>(daily.ic.size());
-    double sum = 0.0;
-    int finite = 0;
-    for (double v : daily.ic)
-        if (std::isfinite(v)) { sum += v; ++finite; }
-    c.rank_ic = finite ? sum / finite : kNaN;
-    c.valid_ratio = T ? static_cast<double>(finite) / T : 0.0;
+    double sum = 0.0, finite = 0.0;
+    for (size_t i = 0; i < s.seg_sum.size(); ++i) {
+        sum += s.seg_sum[i];
+        finite += s.seg_count[i];
+    }
+    c.rank_ic = finite > 0 ? sum / finite : kNaN;
+    c.valid_ratio = T ? finite / T : 0.0;
     if (!std::isfinite(c.rank_ic) || c.valid_ratio < config.min_valid_time_ratio ||
         c.missing_ratio > config.max_missing_ratio)
         return c;
 
-    // np.array_split: the first T % k segments get one extra day.
-    const int k = config.stability_segments;
     std::vector<double> finite_means;
-    for (int i = 0, start = 0; i < k; ++i) {
-        int len = T / k + (i < T % k ? 1 : 0);
-        double s = 0.0;
-        int n = 0;
-        for (int t = start; t < start + len; ++t)
-            if (std::isfinite(daily.ic[t])) { s += daily.ic[t]; ++n; }
-        double mean = n ? s / n : kNaN;
+    for (size_t i = 0; i < s.seg_sum.size(); ++i) {
+        double mean = s.seg_count[i] > 0 ? s.seg_sum[i] / s.seg_count[i] : kNaN;
         c.segment_rank_ics.push_back(mean);
-        if (n) finite_means.push_back(mean);
-        start += len;
+        if (s.seg_count[i] > 0) finite_means.push_back(mean);
     }
-
-    // _fitness_from_segments
     if (finite_means.empty()) {
         c.fitness = -std::numeric_limits<double>::infinity();
         c.segment_rank_ic_std = std::numeric_limits<double>::infinity();
@@ -155,6 +188,18 @@ Candidate score_factor(const DailyIC& daily, int depth, int nodes, const Fitness
     if (c.same_sign_ratio < config.minimum_same_sign_ratio) c.fitness *= config.inconsistent_sign_multiplier;
     c.valid = true;
     return c;
+}
+
+}  // namespace
+
+Candidate score_factor(const DailyIC& daily, int depth, int nodes, const FitnessConfig& config) {
+    const int T = static_cast<int>(daily.ic.size());
+    return score(summarize_ic(daily, 0, T, config.stability_segments), daily.missing_ratio, T, depth, nodes, config);
+}
+
+Candidate score_summary(const IcSummary& s, int T_total, int depth, int nodes, const FitnessConfig& config) {
+    double missing = s.eligible == 0 ? 1.0 : 1.0 - s.valid / s.eligible;
+    return score(s, missing, T_total, depth, nodes, config);
 }
 
 }  // namespace gpe

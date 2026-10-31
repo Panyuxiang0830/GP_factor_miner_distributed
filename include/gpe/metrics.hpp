@@ -29,7 +29,9 @@ std::vector<double> rank_rows_pct(const Panel& p);
 // Daily RankIC series (E6), as metrics.daily_rank_ic in Python.
 struct DailyIC {
     std::vector<double> ic;     // one value per day; NaN if undefined
-    double missing_ratio = 1.0; // 1 - #(factor and target valid) / #(target valid)
+    double missing_ratio = 1.0; // 1 - valid / eligible
+    long eligible = 0;          // cells where the target is valid
+    long valid = 0;             // ... and the factor too
 };
 
 // Pearson correlation per day between the factor's percentile ranks and
@@ -53,5 +55,23 @@ struct Candidate {
 // depth and nodes are expression_depth() and expression_nodes() of the
 // normalized expression (Node::depth and Node::tree_nodes of its root).
 Candidate score_factor(const DailyIC& daily, int depth, int nodes, const FitnessConfig& config = {});
+
+// Additive statistics behind the fitness. A rank summarises the days it owns
+// (global days t0..t0+ic.size()-1); element-wise sums over ranks
+// (MPI_Allreduce) give the statistics of the whole period.
+struct IcSummary {
+    std::vector<double> seg_sum;    // sum of finite daily ICs per stability segment
+    std::vector<double> seg_count;  // number of finite daily ICs per segment
+    double eligible = 0.0, valid = 0.0;
+
+    static constexpr int width(int segments) { return 2 * segments + 2; }
+    void pack(double* out) const;   // width() doubles
+    static IcSummary unpack(const double* in, int segments);
+};
+
+// Segments follow np.array_split of the T_total days.
+IcSummary summarize_ic(const DailyIC& daily, int t0, int T_total, int segments);
+Candidate score_summary(const IcSummary& summary, int T_total, int depth, int nodes,
+                        const FitnessConfig& config = {});
 
 }  // namespace gpe

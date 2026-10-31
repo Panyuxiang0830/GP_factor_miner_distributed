@@ -124,9 +124,19 @@ std::vector<double> roll_var(const std::vector<double>& x, int w, int minp) {
         }
     };
 
+    // Length of the run of equal observations ending at day i (NaN skipped).
+    // When it covers the whole window the variance is exactly 0. The Welford
+    // residue there depends on where the recursion started, so without this
+    // rule a rank that starts at its halo would not reproduce the serial value.
+    double run = 0.0, run_value = kNaN;
+
     int effective_minp = std::max(minp, 1);
     for (size_t i = 0; i < x.size(); ++i) {
         size_t s = i + 1 >= static_cast<size_t>(w) ? i + 1 - w : 0;
+        if (!std::isnan(x[i])) {
+            run = x[i] == run_value ? run + 1 : 1;
+            run_value = x[i];
+        }
         if (i > 0) {
             if (i >= static_cast<size_t>(w)) remove(x[i - w]);
             add(x[i]);
@@ -136,7 +146,7 @@ std::vector<double> roll_var(const std::vector<double>& x, int w, int minp) {
             for (size_t j = s; j <= i; ++j) add(x[j]);
             unstable = false;
         }
-        if (nobs >= effective_minp && nobs > 1) out[i] = ssq / (nobs - 1);
+        if (nobs >= effective_minp && nobs > 1) out[i] = run >= nobs ? 0.0 : ssq / (nobs - 1);
     }
     return out;
 }
@@ -182,17 +192,16 @@ std::vector<double> roll_median(const std::vector<double>& x, int w, int minp) {
 // ewm(span, adjust=False, ignore_na=False).mean(), ported from pandas: the old
 // weight decays by (1-alpha) every day, missing days included, and resets to 1
 // after each observation. span 3 (com == 1) uses new_wt = 1 - old_wt.
-std::vector<double> ewm_mean(const std::vector<double>& x, int span) {
+// (y, old_wt) is the state before x[0]: (NaN, 1) at the start of the data,
+// or the state handed over by the previous rank (distributed scan). With
+// y = NaN the first row sets y = x[0], as pandas does.
+std::vector<double> ewm_mean(const std::vector<double>& x, int span, double y = kNaN, double old_wt = 1.0) {
     std::vector<double> out(x.size(), kNaN);
-    if (x.empty()) return out;
     double com = (span - 1.0) / 2.0;
     double alpha = 1.0 / (1.0 + com);
     double old_wt_factor = 1.0 - alpha;
     double new_wt = alpha;
-    double y = x[0];
-    double old_wt = 1.0;
-    out[0] = y;
-    for (size_t i = 1; i < x.size(); ++i) {
+    for (size_t i = 0; i < x.size(); ++i) {
         double v = x[i];
         bool obs = !std::isnan(v);
         if (!std::isnan(y)) {
@@ -214,19 +223,20 @@ std::vector<double> ewm_mean(const std::vector<double>& x, int span) {
 
 // ---------------------------------------------------------------------------
 
-void column(const Panel& p, int s, std::vector<double>& col) {
-    col.resize(p.rows());
-    for (int t = p.lo; t < p.T; ++t) col[t - p.lo] = p.at(t, s);
+// Rows from..T-1 of stock s.
+void column(const Panel& p, int s, int from, std::vector<double>& col) {
+    col.resize(p.T - from);
+    for (int t = from; t < p.T; ++t) col[t - from] = p.at(t, s);
 }
 
-void store_column(const std::vector<double>& col, int src_lo, Panel& out, int s) {
-    for (int t = out.lo; t < out.T; ++t) out.at(t, s) = static_cast<float>(col[t - src_lo]);
+void store_column(const std::vector<double>& col, int src_lo, Panel& out, int s, int begin) {
+    for (int t = begin; t < out.T; ++t) out.at(t, s) = static_cast<float>(col[t - src_lo]);
 }
 
-void check_shapes(const Panel& a, const Panel* b, const Panel& out) {
-    if (a.T != out.T || a.N != out.N || a.lo > out.lo)
+void check_shapes(const Panel& a, const Panel* b, const Panel& out, int begin) {
+    if (a.T != out.T || a.N != out.N || a.lo > begin || begin < out.lo)
         throw std::invalid_argument("operator input does not cover the output rows");
-    if (b && (b->T != a.T || b->N != a.N || b->lo != a.lo))
+    if (b && (b->T != a.T || b->N != a.N || b->lo > begin))
         throw std::invalid_argument("operator inputs have different shapes");
 }
 
@@ -240,9 +250,9 @@ double binary(Op op, double x, double y) {
     }
 }
 
-void elementwise(Op op, const Panel& a, const Panel* b, Panel& out) {
+void elementwise(Op op, const Panel& a, const Panel* b, Panel& out, int begin) {
     #pragma omp parallel for schedule(static)
-    for (int t = out.lo; t < out.T; ++t) {
+    for (int t = begin; t < out.T; ++t) {
         const float* ra = a.row(t);
         const float* rb = b ? b->row(t) : nullptr;
         float* ro = out.row(t);
@@ -259,9 +269,9 @@ void elementwise(Op op, const Panel& a, const Panel* b, Panel& out) {
     }
 }
 
-void cross_sectional(Op op, const Panel& a, Panel& out) {
+void cross_sectional(Op op, const Panel& a, Panel& out, int begin) {
     #pragma omp parallel for schedule(dynamic, 8)
-    for (int t = out.lo; t < out.T; ++t) {
+    for (int t = begin; t < out.T; ++t) {
         const float* ra = a.row(t);
         float* ro = out.row(t);
         if (op == Op::Rank) {
@@ -300,12 +310,15 @@ void cross_sectional(Op op, const Panel& a, Panel& out) {
     }
 }
 
-void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out) {
+void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out, int begin, const EmaState* ema) {
     int minp = rolling_min_periods(op, w);
+    // Windows read all available history (the inputs may carry different
+    // halos); ema starts at `begin` from the handed-over state instead.
+    int from = op == Op::Ema ? begin : std::max(a.lo, b ? b->lo : a.lo);
     #pragma omp parallel for schedule(static)
     for (int s = 0; s < out.N; ++s) {
         std::vector<double> x, y, r;
-        column(a, s, x);
+        column(a, s, from, x);
         switch (op) {
             case Op::Mean: r = roll_mean(x, w, minp); break;
             case Op::Sum: r = roll_sum(x, w, minp); break;
@@ -316,7 +329,9 @@ void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out) {
             case Op::Max: r = roll_extreme(x, w, minp, true); break;
             case Op::Min: r = roll_extreme(x, w, minp, false); break;
             case Op::Median: r = roll_median(x, w, minp); break;
-            case Op::Ema: r = ewm_mean(x, w); break;
+            case Op::Ema:
+                r = ema ? ewm_mean(x, w, ema->y[s], ema->old_wt[s]) : ewm_mean(x, w);
+                break;
             case Op::Lag: case Op::Delta: case Op::PctChange:
                 r.assign(x.size(), kNaN);
                 for (size_t i = w; i < x.size(); ++i) {
@@ -328,7 +343,7 @@ void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out) {
                 }
                 break;
             case Op::Corr: case Op::Beta: {
-                column(*b, s, y);
+                column(*b, s, from, y);
                 // Pairwise-complete masking: X = a + 0*b, Y = b + 0*a.
                 std::vector<double> mx(x.size()), my(x.size()), xy(x.size());
                 for (size_t i = 0; i < x.size(); ++i) {
@@ -348,7 +363,10 @@ void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out) {
                     auto var_y = roll_var(my, w, minp);
                     for (size_t i = 0; i < x.size(); ++i) {
                         double cov = (mean_xy[i] - mean_x[i] * mean_y[i]) * (count[i] / (count[i] - 1.0));
-                        r[i] = cov / std::pow(var_x[i] * var_y[i], 0.5);  // NaN if negative, as numpy
+                        // A constant window has no correlation; its covariance is only a
+                        // rounding residue, so do not let it become +-inf.
+                        double den = var_x[i] * var_y[i];
+                        r[i] = den == 0.0 ? kNaN : cov / std::pow(den, 0.5);  // NaN if negative, as numpy
                     }
                 } else {
                     auto var_b = roll_var(y, w, minp);  // b alone, not masked by a
@@ -361,7 +379,7 @@ void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out) {
             }
             default: throw std::logic_error("not a rolling operator");
         }
-        store_column(r, a.lo, out, s);
+        store_column(r, from, out, s, begin);
     }
 }
 
@@ -376,12 +394,13 @@ int rolling_min_periods(Op op, int window) {
     }
 }
 
-void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out) {
-    check_shapes(a, b, out);
+void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out, int begin, const EmaState* ema) {
+    if (begin == kFromLo) begin = out.lo;
+    check_shapes(a, b, out, begin);
     switch (op_info(op).kind) {
-        case OpKind::Elementwise: elementwise(op, a, b, out); break;
-        case OpKind::CrossSectional: cross_sectional(op, a, out); break;
-        case OpKind::Rolling: case OpKind::PairRolling: rolling(op, window, a, b, out); break;
+        case OpKind::Elementwise: elementwise(op, a, b, out, begin); break;
+        case OpKind::CrossSectional: cross_sectional(op, a, out, begin); break;
+        case OpKind::Rolling: case OpKind::PairRolling: rolling(op, window, a, b, out, begin, ema); break;
         default: throw std::logic_error("apply_op called on a leaf");
     }
 }

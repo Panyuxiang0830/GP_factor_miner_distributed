@@ -10,8 +10,8 @@ The GP search loop (selection, crossover, mutation, archive bookkeeping) stays i
 Distribution is by **trading date**:
 
 - each MPI rank owns a contiguous block of dates for all stocks;
-- rolling operators use redundant computation or halo exchange, controlled by the halo budget `H0`;
-- `ema` uses an affine `MPI_Exscan`;
+- rolling operators use redundant computation or halo exchange, controlled by the halo budget `H0` (strategy B, the subtree halo exchange, is implemented);
+- `ema` passes a per-stock state from rank to rank: each rank summarises its block as an affine map first, so the chain costs O(N) per rank;
 - statistics and power iterations use `MPI_Allreduce`.
 
 ## Repository layout
@@ -37,6 +37,14 @@ ctest --test-dir build --output-on-failure
 ```
 
 To build the other backends, set the matching option to `ON`: `GPE_ENABLE_MPI` (needs an MPI installation, `mpicxx`) or `GPE_ENABLE_CUDA` (needs `nvcc`; architecture `86` targets the RTX 3090).
+
+Check the distributed engine against the serial one on exported panels (any number of ranks):
+
+```bash
+cmake -S . -B build_mpi -DGPE_ENABLE_MPI=ON
+cmake --build build_mpi -j
+mpirun -np 4 build_mpi/test_mpi_consistency <panel_dir> <expressions.json>
+```
 
 ## Data policy
 

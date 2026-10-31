@@ -45,6 +45,11 @@ struct PanelSet {
     bool has_field(const std::string& name) const;
     Panel load_field(const std::string& name) const;
     Panel load_target() const;
+
+    // Global days t0-halo .. t1-1 as a local panel: local row 0 is day t0 and
+    // the `halo` days before it are rows -halo..-1. Reads only those rows.
+    Panel load_field_rows(const std::string& name, int t0, int t1, int halo = 0) const;
+    Panel load_target_rows(int t0, int t1) const;
 };
 
 // Reads a raw little-endian array of T*N values (float32 or float64) into a panel.

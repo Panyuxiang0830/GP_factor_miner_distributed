@@ -21,6 +21,7 @@ add_library(gpe_core
   src/core/operators.cpp
   src/core/evaluate.cpp
   src/core/metrics.cpp
+  src/core/ema_scan.cpp
 )
 target_include_directories(gpe_core PUBLIC include)
 
@@ -32,6 +33,7 @@ endif()
 
 if(GPE_ENABLE_MPI)
   find_package(MPI REQUIRED)
+  target_sources(gpe_core PRIVATE src/mpi/distributed.cpp)
   target_link_libraries(gpe_core PUBLIC MPI::MPI_CXX)
   target_compile_definitions(gpe_core PUBLIC GPE_HAVE_MPI)
 endif()
@@ -52,6 +54,10 @@ target_link_libraries(test_dag PRIVATE gpe_core)
 target_compile_definitions(test_dag PRIVATE GPE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 add_test(NAME dag COMMAND test_dag)
 
+add_executable(test_ema_scan tests/test_ema_scan.cpp)
+target_link_libraries(test_ema_scan PRIVATE gpe_core)
+add_test(NAME ema_scan COMMAND test_ema_scan)
+
 add_executable(test_metrics tests/test_metrics.cpp)
 target_link_libraries(test_metrics PRIVATE gpe_core)
 add_test(NAME metrics COMMAND test_metrics)
@@ -61,4 +67,11 @@ add_executable(test_ops_reference tests/test_ops_reference.cpp)
 target_link_libraries(test_ops_reference PRIVATE gpe_core)
 if(GPE_REF_DIR)
   add_test(NAME ops_reference COMMAND test_ops_reference ${GPE_REF_DIR})
+endif()
+
+# Distributed engine against the serial one on exported data:
+#   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json>
+if(GPE_ENABLE_MPI)
+  add_executable(test_mpi_consistency tests/test_mpi_consistency.cpp)
+  target_link_libraries(test_mpi_consistency PRIVATE gpe_core)
 endif()
