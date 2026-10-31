@@ -14,6 +14,9 @@ option(GPE_ENABLE_CUDA   "Build the CUDA backend" OFF)
 # Serial core: parser, DAG, operators, RankIC (E1–E8)
 add_library(gpe_core
   src/core/version.cpp
+  src/core/json.cpp
+  src/core/ops.cpp
+  src/core/dag.cpp
 )
 target_include_directories(gpe_core PUBLIC include)
 
@@ -39,3 +42,8 @@ enable_testing()
 add_executable(test_smoke tests/test_smoke.cpp)
 target_link_libraries(test_smoke PRIVATE gpe_core)
 add_test(NAME smoke COMMAND test_smoke)
+
+add_executable(test_dag tests/test_dag.cpp)
+target_link_libraries(test_dag PRIVATE gpe_core)
+target_compile_definitions(test_dag PRIVATE GPE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+add_test(NAME dag COMMAND test_dag)
