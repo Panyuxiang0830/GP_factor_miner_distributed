@@ -29,10 +29,30 @@ def _zscore(a):
     return clean.sub(means, axis=0).div(stds, axis=0)
 
 
+def _constant_window(a, window):
+    """True where every observation in the window is equal.
+
+    The variance of such a window is exactly 0, but the rolling algorithm
+    leaves a rounding residue that depends on where the recursion started.
+    Setting it to 0 makes the result independent of the start, which the
+    date-distributed C++ engine needs.
+    """
+    rolling = a.rolling(int(window), min_periods=1)
+    return rolling.max() == rolling.min()
+
+
+def _rolling_var(a, window):
+    var = a.rolling(int(window), min_periods=min(3, int(window))).var()
+    return var.mask(_constant_window(a, window) & var.notna(), 0.0)
+
+
 def _rolling(method: str):
     def apply(a, window):
         minimum = 1 if method in {"mean", "sum", "median"} else min(3, int(window))
-        return getattr(a.rolling(window=int(window), min_periods=minimum), method)()
+        result = getattr(a.rolling(window=int(window), min_periods=minimum), method)()
+        if method == "std":
+            result = result.mask(_constant_window(a, window) & result.notna(), 0.0)
+        return result
 
     return apply
 
@@ -42,12 +62,16 @@ def _ema(a, window):
 
 
 def _correlation(a, b, window):
-    return a.rolling(int(window), min_periods=min(3, int(window))).corr(b)
+    corr = a.rolling(int(window), min_periods=min(3, int(window))).corr(b)
+    # Pairwise-complete windows as in pandas. A constant window has no
+    # correlation; its covariance is only a residue, so return NaN, not +-inf.
+    variance = _rolling_var(a + 0 * b, window) * _rolling_var(b + 0 * a, window)
+    return corr.mask(variance == 0)
 
 
 def _beta(a, b, window):
     rolling_a = a.rolling(int(window), min_periods=min(3, int(window)))
-    variance = b.rolling(int(window), min_periods=min(3, int(window))).var()
+    variance = _rolling_var(b, window)
     return _clean(rolling_a.cov(b) / variance.where(variance.abs() > 1e-12))
 
 
