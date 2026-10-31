@@ -1,0 +1,41 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.out
+
+# Data and results — never commit market data or run outputs
+data/
+outputs/
+results/
+*.bin
+*.npy
+*.npz
+*.pkl
+*.parquet
+*.feather
+*.h5
+
+# Python
+.venv/
+.deps/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+*.py[cod]
+
+# Secrets and local config
+.env
+*.token
+
+# Cluster job logs
+*.o[0-9]*
+*.e[0-9]*
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

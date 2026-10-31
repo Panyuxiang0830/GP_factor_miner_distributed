@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gp-factor-miner"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "deap>=1.4,<2",
+  "numpy>=2,<3",
+  "pandas>=2.2,<4",
+  "pyarrow>=15,<26",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = [
+  'ignore:This process .* is multi-threaded, use of fork\(\) may lead to deadlocks in the child:DeprecationWarning:multiprocessing.popen_fork',
+]
