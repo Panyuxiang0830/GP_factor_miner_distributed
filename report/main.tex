@@ -1,0 +1,253 @@
+% DSA5208 Project 3 report — written alongside the implementation.
+% Sections marked \todo{} are filled in as the corresponding parts are built.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, frame=single, breaklines=true}
+
+\title{Distributed Acceleration of Hierarchical PCA-QD Genetic-Programming Factor Mining\\[4pt]
+\large DSA5208 Project 3}
+\author{\todo{Name (Student ID)} \and \todo{Name (Student ID)} \and \todo{Name (Student ID)}}
+\date{\todo{date}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We accelerate an existing genetic-programming (GP) factor miner for Chinese A-share stocks. The search loop stays in Python; we re-implement its batch evaluation engine in C++. The engine is parallelised with MPI + OpenMP and MPI + CUDA. The data are decomposed by trading date, which turns per-expression parallelism into a genuinely distributed computation:
+\begin{itemize}[nosep]
+  \item rolling operators need halo exchange or redundant computation;
+  \item exponential moving averages need a parallel prefix scan;
+  \item daily statistics and the PCA power iteration need global reductions.
+\end{itemize}
+We also exploit the layer-wise structure of the GP: shared subexpressions are merged into a DAG and cached across layers.
+\todo{headline speed-up and efficiency numbers}
+\end{abstract}
+
+%======================================================================
+\section{Introduction}
+
+A \emph{factor} is a formula that maps raw stock data to a daily score for every stock. For example, $\mathrm{ema}(\text{turnover}\times\text{amount\_skew}, 5)$. A factor is useful if, on each day, the ranking of stocks by the factor predicts the ranking of their future returns. Genetic programming searches the space of such formulas automatically. The search is expensive: one run evaluates several hundred thousand candidate formulas on panels of about $1461$ trading days $\times$ $5876$ stocks.
+
+Our starting point is a working Python implementation (pandas, 32 processes). It parallelises only across candidate expressions, so it is embarrassingly parallel and limited to one machine. This project rewrites the evaluation engine in C++ and parallelises it across nodes, CPU cores and GPUs. Our contributions are:
+\begin{enumerate}[nosep]
+  \item a date-decomposed evaluation engine with halo exchange, redundant computation and a scan for the recursive operator;
+  \item a DAG of shared subexpressions combined with a cross-layer cache, which exploits the hierarchical GP;
+  \item GPU kernels for the PCA-based diversity signature (batched ranking, batched power iteration, tiled similarity GEMM);
+  \item a heterogeneous design: the CPU handles parsing, scheduling and sequential archive decisions, while the GPU handles the bulk computation.
+\end{enumerate}
+
+%======================================================================
+\section{Background: hierarchical PCA-QD GP factor mining}
+
+\subsection{Factors and RankIC}
+Every raw field is a panel $X\in\mathbb{R}^{T\times N}$ (days $\times$ stocks). A factor $F$ is computed from raw panels by an expression tree. Its quality on day $t$ is the Spearman correlation between factor values and forward returns $Y$:
+\begin{equation}
+  \mathrm{IC}_t = \operatorname{corr}\!\big(\operatorname{rank}(F_{t,\cdot}),\ \operatorname{rank}(Y_{t,\cdot})\big),
+  \qquad \overline{\mathrm{IC}} = \frac{1}{|T_{\mathrm{valid}}|}\sum_{t} \mathrm{IC}_t .
+\end{equation}
+
+\subsection{Expressions and operators}
+Leaves are raw fields. Window lengths are taken from $\{1,5,10,15,20,30,60\}$. There are 20 operators:
+\begin{itemize}[nosep]
+  \item element-wise: $+,-,\times,\div,\log,|\cdot|$;
+  \item cross-sectional: rank, z-score;
+  \item rolling: mean, std, sum, max, min, median, ema, lag, delta, pct\_change;
+  \item pairwise rolling: correlation, beta.
+\end{itemize}
+Expressions are normalised: commutative operands are ordered, $\mathrm{rank}(\mathrm{rank}(x))=\mathrm{rank}(x)$, and $x-x$, $x/x$ are rejected. Trees have at most 11 nodes.
+
+\subsection{Fitness}
+A candidate must have a valid IC on at least $80\%$ of days and at most $20\%$ missing values. Let $m_1,\dots,m_4$ be the mean IC on four consecutive time segments. Then
+\begin{equation}
+  \text{fitness} = |\overline{\mathrm{IC}}| - 0.5\,\operatorname{std}(m_1,\dots,m_4) - 0.0005\max(\text{nodes}-3,0),
+\end{equation}
+and the fitness is multiplied by $0.25$ if fewer than $75\%$ of the segments share the sign of $\overline{\mathrm{IC}}$.
+
+\subsection{Layer-wise generation}
+Evolution runs in three stages, with maximum tree depth $1$, $2$ and $3$. Each stage evolves a population of $10{,}000$ for $10$ generations and works as follows:
+\begin{itemize}[nosep]
+  \item Parents are drawn from a feature-capped pool, by tournament or by $\varepsilon$-lexicase selection over the four IC segments.
+  \item Offspring come from same-level crossover and from feature, operator, window and subtree mutation. Each family keeps its two best members.
+  \item Random immigrants make up $10\%$ of each generation.
+  \item At the end of a stage, the best $2{,}000$ admitted expressions become a \emph{gene pool}. Deeper stages build $70\%$ of their subtrees from these gene pools.
+\end{itemize}
+
+\subsection{PCA-QD diversity archive}
+Each candidate is compressed into a signature:
+\begin{enumerate}[nosep]
+  \item take every 5th day and its cross-sectional percentile ranks (missing values set to $0.5$), and centre each row, giving $R\in\mathbb{R}^{T_s\times N}$;
+  \item run four power iterations for the leading right singular vector $v$;
+  \item set $s = Rv/\|Rv\|$, with its sign fixed.
+\end{enumerate}
+A candidate enters the archive if its $|$correlation$|$ with every archived signature is below $0.9$. Otherwise it replaces its nearest neighbour, but only if its RankIC is better by at least $0.002$. Admission is sequential.
+
+\subsection{The original implementation and its bottlenecks}
+The Python engine evaluates each expression independently in a pool of 32 processes. We identified three bottlenecks:
+\begin{itemize}[nosep]
+  \item shared subtrees are recomputed from raw data every time, because its cache stores only final scores and is recreated for every task;
+  \item the signature is computed in single-threaded NumPy;
+  \item only the final small similarity matrix multiplication uses the GPU.
+\end{itemize}
+A previous run selected $1481$ factors, with mean out-of-sample $|\mathrm{RankIC}|$ of $0.080$ in 2022.
+
+%======================================================================
+\section{Data}
+The raw data are daily panels of 132 numeric fields for Chinese A-shares. The label is a forward-return panel, masked to tradable, non-ST stocks. The evolution period (2016--2021) has $T=1461$ trading days and $N=5876$ stocks. Panels are exported once to raw little-endian float32 files in date-major layout (element $t\cdot N+s$), about $34$\,MB per field and $4.3$\,GB in total. The export reuses the original cleaning code, so the C++ engine sees exactly the values the Python miner sees. A $120\times300$ sample is used for testing.
+
+%======================================================================
+\section{Parallel design}
+
+\subsection{Overview and heterogeneous split}
+The engine evaluates one batch of expressions in two parts:
+\begin{itemize}[nosep]
+  \item \textbf{factor computation and evaluation} (E1--E8): parse, build the DAG, execute the operators, compute daily RankIC and fitness;
+  \item \textbf{PCA signatures and similarity} (E9--E14): sampled ranks, batched power iteration, similarity matrix, sequential admission.
+\end{itemize}
+Steps with irregular control flow and little data run on the CPU: parsing, DAG construction, scheduling, and sequential admission. Bulk numerical steps run on the GPU. MPI is used only at date-block boundaries and for reductions across dates.
+
+\subsection{Decomposition by trading date}
+Each of the $p$ ranks owns a contiguous block of about $T/p$ days for all $N$ stocks. With this choice:
+\begin{itemize}[nosep]
+  \item cross-sectional work (ranking, daily IC) is local;
+  \item time-series operators need data from the preceding block;
+  \item global statistics need reductions.
+\end{itemize}
+We decompose the data rather than the expression graph. Each rank evaluates every node of the DAG, but only on its own dates. This way, communication involves only a few boundary rows, never whole panels.
+
+\subsection{Parsing, normalisation and the subexpression DAG (E1--E3)}
+A batch of expressions is merged into one DAG by \emph{hash-consing}. Before a node is created, the key (operator, window, child ids) is looked up in a hash table. An existing node is reused, so a subexpression shared by several candidates is computed once. Normalisation is applied during construction:
+\begin{itemize}[nosep]
+  \item the children of commutative operators are ordered by id;
+  \item a rank whose child is a rank returns the child;
+  \item equal children of $-$ and $\div$ reject the whole expression.
+\end{itemize}
+A rejected expression is rolled back, so no orphan nodes remain. Children are always created before their parents, so the node array is already a topological execution order.
+
+Every MPI rank builds the identical DAG from the broadcast expression text. Node ids therefore agree across ranks. As a result, halo messages need no descriptors, and collective calls such as the scan for ema are issued in the same order on every rank.
+
+For each node we record two quantities.
+\begin{itemize}[nosep]
+  \item The \emph{cumulative lookback} $h(n) = \ell(n) + \max_{c} h(c)$, where $\ell = w-1$ for rolling windows and $\ell = k$ for lag, delta and pct\_change. It decides whether a subtree can be recomputed locally from preloaded raw history.
+  \item The \emph{halo rows} $\max_{\text{parents }q} \ell(q)$: the number of rows a node must provide before its first owned day when results are exchanged between ranks.
+\end{itemize}
+Ema depends on the whole history. It contributes no halo and is handled by a scan (Section~\ref{sec:ema}).
+
+On the $1481$ selected factors, merging all expressions into one DAG reduces $11{,}413$ tree nodes to $4{,}052$ distinct nodes, including leaves. This shows how much computation the original per-expression evaluation repeats. \todo{reduction for realistic per-generation batches; cache hit rates across layers}
+
+\subsection{Operators (E5)}
+\label{sec:operators}
+A panel is stored as a contiguous float32 array in date-major order, together with the index \code{lo}$\le0$ of its first stored row. Rows below 0 hold history that precedes the rank's own block. The operators fall into three groups:
+\begin{itemize}[nosep]
+  \item element-wise operators sweep the array once;
+  \item cross-sectional operators (rank, z-score) process one day (one row) at a time;
+  \item rolling operators process one stock (one column) at a time with $O(T)$ sliding-window updates.
+\end{itemize}
+Each group parallelises over a different axis: days for the cross-sectional operators, stocks for the rolling ones.
+
+\paragraph{Reproducing pandas exactly.} Small differences in floating-point rounding can change which windows look constant, and hence whether a correlation is finite, so we port the pandas~3.0.3 window kernels rather than textbook formulas.
+\begin{itemize}[nosep]
+  \item Rolling sums and means use Kahan summation with separate compensations for additions and removals. When the last $n_{obs}$ observations are identical, the repeated value is returned exactly.
+  \item Rolling variance uses Welford's update and recomputes the window from scratch when cancellation is detected ($m_2^{\text{prev}}\cdot10^3\varepsilon > m_2$).
+  \item Windows count only non-missing observations. The minimum count is 1 for mean, sum and median, and $\min(3,w)$ for std, max, min, correlation and beta.
+  \item Correlation and covariance use pairwise-complete observations. Beta divides by the variance of $b$ alone.
+  \item Infinite results of $+,-,\times,\div$, pct\_change and beta become missing values. pct\_change is computed in float32, as in pandas.
+\end{itemize}
+The exponential moving average follows pandas' \code{adjust=False} recursion with missing values: the previous weight decays by $(1-\alpha)$ every day, so after $k$ missing days
+\begin{equation}
+  y_t = \frac{o\,y_{\text{prev}} + \alpha x_t}{o+\alpha}, \qquad o = (1-\alpha)^{k+1}.
+\end{equation}
+This is still an affine function of $y_{\text{prev}}$, which the distributed scan of Section~\ref{sec:ema} relies on. Max and min use monotone deques, and the median keeps the window sorted ($w\le60$).
+
+\subsection{Halo exchange versus redundant computation}
+\label{sec:halo}
+A rolling operator on the first days of a block needs earlier values, which belong to the preceding rank. We consider three strategies:
+\begin{itemize}[nosep]
+  \item \textbf{A, redundant computation:} each rank preloads $H_0$ extra days of raw data and recomputes subtrees on them. This needs no communication.
+  \item \textbf{B, halo exchange:} each rank receives the last $\ell$ rows of intermediate results from its left neighbour, one \code{MPI\_Sendrecv} per DAG level.
+  \item \textbf{Hybrid:} a subtree is recomputed if its cumulative lookback is at most $H_0$, and exchanged otherwise.
+\end{itemize}
+$H_0$ is therefore a single tuning knob: $H_0=0$ gives strategy B, and $H_0\ge \max h$ gives strategy A. For the selected factors, $1451/1481$ have $h\le 59$ and all have $h\le 88$. The redundant work per rank grows like $H_0/(T/p)$, so the best $H_0$ depends on $p$. \todo{measured crossover}
+
+\subsection{Recursive operator: ema as an affine scan}
+\label{sec:ema}
+For ema, $y_t = (1-\alpha)y_{t-1} + \alpha x_t$. A block of days therefore maps its initial value through an affine map $y\mapsto Ay+B$. Affine maps compose associatively: $(A_2,B_2)\circ(A_1,B_1) = (A_2A_1, A_2B_1+B_2)$. The parallel algorithm is:
+\begin{enumerate}[nosep]
+  \item each rank computes the $(A,B)$ of its block for every stock;
+  \item an \code{MPI\_Exscan} with a user-defined operator gives each rank the composed map of all preceding blocks;
+  \item each rank re-runs its block from the correct initial value.
+\end{enumerate}
+\todo{NaN handling, implementation, cost}
+
+\subsection{Daily RankIC and fitness (E6--E8)}
+\todo{one block (GPU) or one task (CPU) per day; reductions of segment sums with MPI\_Allreduce}
+
+\subsection{PCA signatures and similarity (E9--E14)}
+\todo{distributed power iteration with one Allreduce per iteration; batched CUDA kernels; tiled GEMM}
+
+\subsection{CPU--GPU pipeline}
+\todo{overlap of DAG preparation, GPU evaluation and sequential admission within a generation}
+
+%======================================================================
+\section{Validation}
+All C++ results are checked against the original pandas implementation.
+
+\paragraph{Parsing and DAG.} We test 1531 expressions: the 1481 selected factors plus crafted cases for every operator and normalisation rule. For every valid expression, the C++ engine reproduces the Python depth and node count. Two expressions share a DAG root exactly when Python gives them the same normalised key. Both degenerate cases are rejected, as in Python.
+
+\paragraph{Operators.} We evaluate 88 expressions on a $120\times300$ sample of the real data with all 132 fields:
+\begin{itemize}[nosep]
+  \item every operator, with windows 1, 5 and 20;
+  \item several nested expressions;
+  \item 40 selected factors.
+\end{itemize}
+Each result is compared with the pandas output, element by element, using the criterion $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and an identical pattern of missing values. The absolute term absorbs rounding that pandas itself performs in float32 (pct\_change, z-score). 86 of the 88 cases pass, about half of them bit-identical after rounding to float32.
+
+The two remaining cases apply correlation to an intermediate std on windows where that intermediate is almost constant. There, the correlation denominator is close to zero and pandas returns $\pm\infty$ or noise. pandas keeps intermediates in float64, whereas we store them in float32 to halve memory traffic. This flips the finiteness of $0.6\%$ of the elements in one case. \todo{effect of this discrepancy on daily RankIC and fitness}
+
+\paragraph{RankIC and fitness.} \todo{}
+
+\paragraph{Distributed consistency.} \todo{results for $p=1$ and $p>1$ agree for every halo strategy}
+
+%======================================================================
+\section{Experiments}
+\todo{hardware (own server: RTX 3090 + AMD EPYC; Atlas/Vanda), timing methodology (barrier, MPI\_Wtime, max over ranks, median of repeats)}
+
+\subsection{Baselines}
+\todo{Python (32 processes) vs serial C++ vs OpenMP vs CUDA on the same batches}
+
+\subsection{Strong and weak scaling}
+\todo{speed-up, efficiency, Karp--Flatt metric; time breakdown into compute, halo, Allreduce and sequential admission}
+
+\subsection{Effect of $H_0$, caching and batch size}
+\todo{}
+
+%======================================================================
+\section{Results on real data}
+\todo{reproduction of the selected factors; how much more search fits in the same time}
+
+\section{Conclusion}
+\todo{}
+
+\section*{Use of AI tools}
+\todo{Describe honestly how AI assistants were used, for example design discussion, code drafting and review, and how the results were verified.}
+
+\appendix
+\section{Building and running}
+\begin{lstlisting}
+cmake -S . -B build -DGPE_ENABLE_OPENMP=ON -DGPE_ENABLE_MPI=ON -DGPE_ENABLE_CUDA=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+\end{lstlisting}
+
+\end{document}
