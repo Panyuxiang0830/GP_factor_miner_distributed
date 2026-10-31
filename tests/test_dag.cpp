@@ -8,6 +8,7 @@
 #include <string>
 
 #include "gpe/dag.hpp"
+#include "gpe/halo_plan.hpp"
 #include "gpe/json.hpp"
 
 namespace {
@@ -53,6 +54,41 @@ void test_shared_subtree_example() {
     CHECK(dag.max_level() == 2);
     CHECK(n[sd].parents == 3);
     CHECK(n[y].parents == 2);
+}
+
+// The H0 knob on the same example: H0 = 0 is strategy B, a large H0 computes
+// std(x,10) redundantly so that x must provide 19 + 9 rows; ema is always
+// exchanged.
+void test_halo_plan() {
+    gpe::Dag dag;
+    dag.add_expression(J(R"(["mean", ["std", "x", 10], 5])"));
+    dag.add_expression(J(R"(["*", ["std", "x", 10], "y"])"));
+    dag.add_expression(J(R"(["correlation", ["std", "x", 10], "y", 20])"));
+    dag.finalize();
+    int x = 0, sd = 1, y = 3;
+
+    auto b = gpe::plan_halos(dag, 0);
+    CHECK(b[sd].need == 19 && b[sd].exchanged());
+    CHECK(b[x].need == 9 && !b[x].exchanged());  // leaves read history from file
+    CHECK(b[y].need == 19 && !b[y].exchanged());
+    for (size_t i = 0; i < b.size(); ++i) CHECK(b[i].need == dag.nodes()[i].halo_rows);
+
+    auto mid = gpe::plan_halos(dag, 10);         // 19 > 10: still exchanged
+    CHECK(mid[sd].exchanged() && mid[x].need == 9);
+
+    auto a = gpe::plan_halos(dag, 19);
+    CHECK(a[sd].redundant && a[sd].need == 19);
+    CHECK(a[x].need == 28);                      // = lookback of the correlation root
+    for (const auto& p : a) CHECK(!p.exchanged());
+
+    gpe::Dag e;
+    int root = e.add_expression(J(R"(["mean", ["ema", ["mean", "x", 5], 3], 10])"));
+    e.finalize();
+    auto pe = gpe::plan_halos(e, 1000);
+    int ema = e.nodes()[root].a, inner = e.nodes()[ema].a;
+    CHECK(pe[ema].need == 9 && pe[ema].exchanged());
+    CHECK(pe[inner].need == 0);                  // ema reads only the rank's own days
+    CHECK(pe[e.nodes()[inner].a].need == 4);
 }
 
 void test_normalisation_and_rollback() {
@@ -133,6 +169,7 @@ void test_python_fixture(const std::string& path) {
 
 int main(int argc, char** argv) {
     test_shared_subtree_example();
+    test_halo_plan();
     test_normalisation_and_rollback();
     test_python_fixture(argc > 1 ? argv[1] : GPE_TEST_DATA_DIR "/normalize_cases.json");
     if (g_failures) {

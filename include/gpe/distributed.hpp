@@ -31,6 +31,7 @@ struct MpiTiming {
     double total = 0.0;
     double halo_bytes = 0.0;  // bytes this rank sent in halo exchanges
     int halo_messages = 0;    // number of non-empty halo sends
+    long redundant_rows = 0;  // history rows computed redundantly, summed over nodes (x N cells)
 };
 
 struct MpiBatchResult {
@@ -43,18 +44,28 @@ struct MpiBatchResult {
     MpiTiming timing;
 };
 
+struct MpiOptions {
+    FitnessConfig fitness;
+    int H0 = 0;               // redundant-computation budget, see halo_plan.hpp
+    bool keep_roots = false;  // return root panels and daily ICs (tests)
+};
+
 // Distributed evaluation of a finalized DAG, decomposed by trading date.
 //
-// Strategy B (subtree halo exchange): each node is computed for the rank's own
-// days only. The DAG is processed level by level; after a level, every node
-// whose parents need history sends its last halo_rows rows to the next rank,
-// all nodes of the level packed into one MPI_Sendrecv. Leaves read their halo
-// directly from the panel files. ema nodes use the scan in ema_scan.hpp.
+// The DAG is processed level by level. How a node gets the history its
+// parents read is set by plan_halos(dag, H0):
+//   - redundant nodes are computed for their history rows as well (strategy A
+//     when every node is redundant);
+//   - exchanged nodes are computed for the rank's own days; after the level,
+//     their last `need` rows go to the next rank, all nodes of the level packed
+//     into one MPI_Sendrecv (strategy B when H0 = 0);
+//   - leaves read their history directly from the panel files;
+//   - ema nodes use the scan in ema_scan.hpp.
 // Daily RankIC is local; one MPI_Allreduce of IcSummary gives the fitness.
 //
-// Requires every block to have at least max(halo_rows) days, so that a halo
-// always comes from the left neighbour alone.
+// Requires every block to have at least as many days as the largest exchanged
+// history, so that it always comes from the left neighbour alone.
 MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm comm,
-                                  const FitnessConfig& config = {}, bool keep_roots = false);
+                                  const MpiOptions& options = {});
 
 }  // namespace gpe

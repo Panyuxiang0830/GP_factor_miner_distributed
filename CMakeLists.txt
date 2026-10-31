@@ -22,6 +22,7 @@ add_library(gpe_core
   src/core/evaluate.cpp
   src/core/metrics.cpp
   src/core/ema_scan.cpp
+  src/core/halo_plan.cpp
 )
 target_include_directories(gpe_core PUBLIC include)
 

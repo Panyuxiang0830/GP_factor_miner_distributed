@@ -1,10 +1,11 @@
 // The distributed engine (strategy B) against the serial engine on exported
 // data. Run with any number of ranks:
 //
-//   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json> [max_expressions]
+//   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json> [H0] [max_expressions]
 //
 // <expressions.json> is a reference.json (cases[].input), a list of
-// expressions, or a list of objects with an "expression" key. Rank 0 also runs
+// expressions, or a list of objects with an "expression" key. H0 is the
+// redundant-computation budget (0 = strategy B, default). Rank 0 also runs
 // the serial engine and compares, for every root:
 //   - the panel, gathered from all ranks: bit-identical count, and the
 //     allclose criterion of test_ops_reference, |q-p| <= 1e-4|p| + 1e-5 rms(p)
@@ -26,6 +27,7 @@
 #include "gpe/dag.hpp"
 #include "gpe/distributed.hpp"
 #include "gpe/evaluate.hpp"
+#include "gpe/halo_plan.hpp"
 #include "gpe/json.hpp"
 #include "gpe/metrics.hpp"
 #include "gpe/ops.hpp"
@@ -63,19 +65,22 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &P);
     if (argc < 3) {
-        if (rank == 0) std::printf("usage: %s <panel_dir> <expressions.json> [max_expressions]\n", argv[0]);
+        if (rank == 0) std::printf("usage: %s <panel_dir> <expressions.json> [H0] [max_expressions]\n", argv[0]);
         MPI_Finalize();
         return 2;
     }
     gpe::PanelSet data = gpe::PanelSet::open(argv[1]);
-    size_t max_count = argc > 3 ? std::stoul(argv[3]) : 1000000;
+    gpe::MpiOptions options;
+    options.H0 = argc > 3 ? std::stoi(argv[3]) : 0;
+    options.keep_roots = true;
+    size_t max_count = argc > 4 ? std::stoul(argv[4]) : 1000000;
 
     gpe::Dag dag;
     for (const auto& e : read_expressions(argv[2], max_count)) dag.add_expression(e);
     dag.finalize();
 
     MPI_Barrier(MPI_COMM_WORLD);
-    gpe::MpiBatchResult dist = gpe::evaluate_batch_mpi(dag, data, MPI_COMM_WORLD, {}, /*keep_roots=*/true);
+    gpe::MpiBatchResult dist = gpe::evaluate_batch_mpi(dag, data, MPI_COMM_WORLD, options);
 
     // Every rank must hold the same candidates (fitness compared bit for bit).
     const size_t R = dist.candidates.size();
@@ -86,9 +91,10 @@ int main(int argc, char** argv) {
 
     // Timing: maximum over ranks of each phase.
     const gpe::MpiTiming& tm = dist.timing;
-    double mine[9] = {tm.load, tm.compute, tm.halo, tm.scan, tm.metrics, tm.reduce, tm.total, tm.halo_bytes, tm.wait};
-    double worst[9];
-    MPI_Reduce(mine, worst, 9, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    double mine[10] = {tm.load,  tm.compute, tm.halo,       tm.scan, tm.metrics,
+                       tm.reduce, tm.total,  tm.halo_bytes, tm.wait, static_cast<double>(tm.redundant_rows)};
+    double worst[10];
+    MPI_Reduce(mine, worst, 10, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     std::map<int, gpe::Panel> serial;
     std::vector<gpe::Candidate> serial_cands;
@@ -175,8 +181,16 @@ int main(int argc, char** argv) {
 
         int max_halo = 0;
         for (const auto& n : dag.nodes()) max_halo = std::max(max_halo, n.halo_rows);
-        std::printf("P=%d  T=%d N=%d  expressions=%zu  DAG nodes=%zu levels=%d max halo=%d\n", P, data.T, data.N, R,
-                    dag.nodes().size(), dag.max_level() + 1, max_halo);
+        auto plan = gpe::plan_halos(dag, options.H0);
+        int exchanged = 0, redundant = 0;
+        for (size_t i = 0; i < plan.size(); ++i) {
+            if (plan[i].exchanged()) ++exchanged;
+            else if (plan[i].need > 0 && dag.nodes()[i].op != gpe::Op::Leaf) ++redundant;
+        }
+        std::printf("P=%d H0=%d  T=%d N=%d  expressions=%zu  DAG nodes=%zu levels=%d max halo=%d  "
+                    "exchanged nodes=%d redundant nodes=%d\n",
+                    P, options.H0, data.T, data.N, R, dag.nodes().size(), dag.max_level() + 1, max_halo, exchanged,
+                    redundant);
         std::printf("panels:     %ld cells, %.4f%% bit-identical, max allclose err %.2e (<= 1 passes), "
                     "nan/inf mismatch %ld\n",
                     cells, 100.0 * identical / std::max(cells, 1L), max_err, nan_mismatch);
@@ -185,7 +199,8 @@ int main(int argc, char** argv) {
         std::printf("time (max over ranks, s): total %.3f  load %.3f  compute %.3f  halo %.3f  scan %.3f  metrics %.3f"
                     "  wait %.3f  reduce %.4f;  serial %.3f\n",
                     worst[6], worst[0], worst[1], worst[2], worst[3], worst[4], worst[8], worst[5], serial_time);
-        std::printf("halo bytes sent (max over ranks): %.1f MB\n", worst[7] / 1e6);
+        std::printf("halo bytes sent (max over ranks): %.1f MB;  redundant rows computed (max over ranks): %.0f\n",
+                    worst[7] / 1e6, worst[9]);
         std::printf("%s\n", ok ? "CONSISTENT" : "INCONSISTENT");
     }
     MPI_Bcast(&failures, 1, MPI_INT, 0, MPI_COMM_WORLD);
