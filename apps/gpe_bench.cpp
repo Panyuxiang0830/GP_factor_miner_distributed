@@ -7,6 +7,8 @@
 //     --repeat r       timed repetitions (default 3), after one warm-up run
 //     --csv file       append one result row to this CSV file
 //     --label text     free-text label stored in the CSV row
+//     --profile file   append per-operator times (mean per repetition, max over
+//                      ranks) to this CSV file and print them
 //
 // Each phase is the maximum over ranks within a repetition; the reported value
 // is the median over repetitions.
@@ -24,6 +26,7 @@
 #include "gpe/distributed.hpp"
 #include "gpe/halo_plan.hpp"
 #include "gpe/json.hpp"
+#include "gpe/operators.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -64,9 +67,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     gpe::MpiOptions options;
+    gpe::BufferPool pool;  // kept across repetitions, as across GP generations
+    options.pool = &pool;
     int dates = 0, repeat = 3;
     size_t exprs = 1000000;
-    std::string csv, label;
+    std::string csv, label, profile;
     for (int i = 3; i + 1 < argc; i += 2) {
         std::string k = argv[i], v = argv[i + 1];
         if (k == "--H0") options.H0 = std::stoi(v);
@@ -75,6 +80,7 @@ int main(int argc, char** argv) {
         else if (k == "--repeat") repeat = std::stoi(v);
         else if (k == "--csv") csv = v;
         else if (k == "--label") label = v;
+        else if (k == "--profile") profile = v;
     }
 
     gpe::PanelSet data = gpe::PanelSet::open(argv[1]);
@@ -98,6 +104,7 @@ int main(int argc, char** argv) {
     double halo_mb = 0.0, redundant = 0.0;
     for (int r = 0; r <= repeat; ++r) {
         MPI_Barrier(MPI_COMM_WORLD);
+        if (r == 1) gpe::reset_op_stats();  // count the timed repetitions only (the warm-up fills the pool)
         gpe::MpiBatchResult res = gpe::evaluate_batch_mpi(dag, data, MPI_COMM_WORLD, options);
         const gpe::MpiTiming& t = res.timing;
         double mine[K + 2] = {t.total, t.load,  t.compute, t.halo, t.scan, t.metrics,
@@ -137,6 +144,29 @@ int main(int argc, char** argv) {
                 << dag.roots().size() << "," << dag.nodes().size() << "," << exchanged << "," << repeat;
             for (int k = 0; k < K; ++k) out << "," << med[k];
             out << "," << tmin << "," << tmax << "," << halo_mb << "," << redundant << "\n";
+        }
+    }
+    if (!profile.empty()) {
+        std::vector<double> mine(gpe::kNumOps), worst(gpe::kNumOps);
+        for (int k = 0; k < gpe::kNumOps; ++k) mine[k] = gpe::op_stats()[k].seconds / repeat;
+        MPI_Reduce(mine.data(), worst.data(), gpe::kNumOps, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            std::ifstream probe(profile);
+            bool fresh = !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
+            probe.close();
+            std::ofstream out(profile, std::ios::app);
+            if (fresh) out << "label,P,threads,op,calls,seconds,cells,ns_per_cell\n";
+            std::printf("%-12s %6s %9s %10s\n", "op", "calls", "seconds", "ns/cell");
+            for (int k = 0; k < gpe::kNumOps; ++k) {
+                const gpe::OpStat& st = gpe::op_stats()[k];
+                if (st.calls == 0) continue;
+                const char* name = gpe::op_info(static_cast<gpe::Op>(k)).name;
+                long calls = st.calls / repeat;
+                double cells = st.cells / repeat, ns = cells > 0 ? 1e9 * worst[k] / cells : 0.0;
+                std::printf("%-12s %6ld %9.3f %10.3f\n", name, calls, worst[k], ns);
+                out << label << "," << P << "," << threads << "," << name << "," << calls << "," << worst[k] << ","
+                    << cells << "," << ns << "\n";
+            }
         }
     }
     MPI_Finalize();

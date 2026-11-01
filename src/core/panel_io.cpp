@@ -7,6 +7,20 @@
 
 namespace gpe {
 
+PanelBuffer BufferPool::take(size_t cells) {
+    auto best = free_.end();
+    for (auto it = free_.begin(); it != free_.end(); ++it)
+        if (it->capacity() >= cells && (best == free_.end() || it->capacity() < best->capacity())) best = it;
+    if (best == free_.end()) return {};
+    PanelBuffer buf = std::move(*best);
+    free_.erase(best);
+    return buf;
+}
+
+void BufferPool::give(PanelBuffer&& buf) {
+    if (buf.capacity() > 0) free_.push_back(std::move(buf));
+}
+
 Panel read_raw_panel(const std::string& path, int T, int N, bool float64) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);

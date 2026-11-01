@@ -30,6 +30,17 @@ constexpr int kFromLo = -(1 << 30);
 void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out, int begin = kFromLo,
               const EmaState* ema = nullptr);
 
+// Time spent in apply_op per operator since the last reset, in this process
+// (profiling). Indexed by static_cast<int>(Op).
+struct OpStat {
+    double seconds = 0.0;
+    long calls = 0;
+    double cells = 0.0;  // output cells written
+};
+constexpr int kNumOps = static_cast<int>(Op::Beta) + 1;
+const OpStat* op_stats();
+void reset_op_stats();
+
 // min_periods used by pandas for a rolling operator.
 int rolling_min_periods(Op op, int window);
 

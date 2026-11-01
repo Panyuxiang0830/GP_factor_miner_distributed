@@ -5,6 +5,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "gpe/ema_scan.hpp"
 #include "gpe/halo_plan.hpp"
@@ -20,41 +21,67 @@ DateBlock date_block(int T, int ranks, int rank) {
 
 namespace {
 
-// Packs the last `need` rows of each node into one buffer, sends it to the
-// right neighbour and receives the left neighbour's rows into rows -need..-1.
+// Halo exchange of the exchanged nodes of one level. Rank s needs, for node
+// i, the global days [t0_s - need_i, t0_s); they may span several ranks to the
+// left when blocks are shorter than the halo. Each rank packs, per partner,
+// the rows of its own block that the partner needs (all nodes of the level in
+// one message per partner) and exchanges them with non-blocking sends.
 void exchange_halos(const std::vector<int>& ids, const std::vector<HaloPlan>& plan, std::vector<Panel>& values,
-                    int left, int right, int tag, MPI_Comm comm, MpiTiming& timing) {
+                    const DateBlock& me, int rank, int P, int T, int tag, MPI_Comm comm, MpiTiming& timing) {
     const int N = values[ids.front()].N;
-    size_t send_rows = 0, recv_rows = 0;
-    for (int i : ids) {
-        if (right != MPI_PROC_NULL) send_rows += plan[i].need;
-        if (left != MPI_PROC_NULL) recv_rows += plan[i].need;
-    }
-    std::vector<float> send(send_rows * N), recv(recv_rows * N);
-    size_t off = 0;
-    if (right != MPI_PROC_NULL) {
+    int max_need = 0;
+    for (int i : ids) max_need = std::max(max_need, plan[i].need);
+    // Global days of q's block that rank s needs for a node with history h.
+    auto overlap = [&](int q, int s, int h) {
+        DateBlock bq = date_block(T, P, q), bs = date_block(T, P, s);
+        return std::make_pair(std::max(bq.t0, bs.t0 - h), std::min(bq.t1, bs.t0));
+    };
+
+    std::vector<std::vector<float>> send_buf, recv_buf;
+    std::vector<int> recv_from;
+    std::vector<MPI_Request> requests;
+    for (int q = rank - 1; q >= 0 && date_block(T, P, q).t1 > me.t0 - max_need; --q) {
+        size_t rows = 0;
         for (int i : ids) {
-            const Panel& p = values[i];
-            int h = plan[i].need;
-            std::memcpy(send.data() + off, p.row(p.T - h), sizeof(float) * h * N);
-            off += static_cast<size_t>(h) * N;
+            auto [lo, hi] = overlap(q, rank, plan[i].need);
+            rows += std::max(hi - lo, 0);
         }
+        if (rows == 0) continue;
+        recv_buf.emplace_back(rows * N);
+        recv_from.push_back(q);
+    }
+    for (int s = rank + 1; s < P && date_block(T, P, s).t0 - max_need < me.t1; ++s) {
+        std::vector<float> buf;
+        for (int i : ids) {
+            auto [lo, hi] = overlap(rank, s, plan[i].need);
+            if (hi <= lo) continue;
+            const float* src = values[i].row(lo - me.t0);
+            buf.insert(buf.end(), src, src + static_cast<size_t>(hi - lo) * N);
+        }
+        if (buf.empty()) continue;
+        send_buf.push_back(std::move(buf));
+        requests.emplace_back();
+        timing.halo_bytes += sizeof(float) * send_buf.back().size();
+        ++timing.halo_messages;
+        MPI_Isend(send_buf.back().data(), static_cast<int>(send_buf.back().size()), MPI_FLOAT, s, tag, comm,
+                  &requests.back());
     }
     double t = MPI_Wtime();
-    MPI_Sendrecv(send.data(), static_cast<int>(send.size()), MPI_FLOAT, right, tag, recv.data(),
-                 static_cast<int>(recv.size()), MPI_FLOAT, left, tag, comm, MPI_STATUS_IGNORE);
-    timing.halo += MPI_Wtime() - t;
-    if (!send.empty()) {
-        timing.halo_bytes += sizeof(float) * send.size();
-        ++timing.halo_messages;
+    for (size_t k = 0; k < recv_buf.size(); ++k) {
+        requests.emplace_back();
+        MPI_Irecv(recv_buf[k].data(), static_cast<int>(recv_buf[k].size()), MPI_FLOAT, recv_from[k], tag, comm,
+                  &requests.back());
     }
-    off = 0;
-    if (left != MPI_PROC_NULL) {
+    MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+    timing.halo += MPI_Wtime() - t;
+
+    for (size_t k = 0; k < recv_buf.size(); ++k) {
+        size_t off = 0;
         for (int i : ids) {
-            Panel& p = values[i];
-            int h = plan[i].need;
-            std::memcpy(p.row(-h), recv.data() + off, sizeof(float) * h * N);
-            off += static_cast<size_t>(h) * N;
+            auto [lo, hi] = overlap(recv_from[k], rank, plan[i].need);
+            if (hi <= lo) continue;
+            std::memcpy(values[i].row(lo - me.t0), recv_buf[k].data() + off, sizeof(float) * (hi - lo) * N);
+            off += static_cast<size_t>(hi - lo) * N;
         }
     }
 }
@@ -121,14 +148,6 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
     const auto& nodes = dag.nodes();
 
     const std::vector<HaloPlan> plan = plan_halos(dag, options.H0);
-    int max_exchange = 0;
-    for (const HaloPlan& p : plan)
-        if (p.exchanged()) max_exchange = std::max(max_exchange, p.need);
-    int min_block = date_block(data.T, P, P - 1).size();
-    if (P > 1 && min_block < max_exchange)
-        throw std::runtime_error("date blocks of " + std::to_string(min_block) + " days are shorter than the halo of " +
-                                 std::to_string(max_exchange) + " days; use fewer ranks or a larger H0");
-
     const int left = rank > 0 ? rank - 1 : MPI_PROC_NULL;
     const int right = rank < P - 1 ? rank + 1 : MPI_PROC_NULL;
     // History rows this rank holds for node i: none before the first day of
@@ -139,6 +158,8 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
     for (size_t i = 0; i < nodes.size(); ++i) levels[nodes[i].level].push_back(static_cast<int>(i));
     std::set<int> roots(dag.roots().begin(), dag.roots().end());
     std::vector<Panel> values(nodes.size());
+    BufferPool local_pool;
+    BufferPool& pool = options.pool ? *options.pool : local_pool;
     std::vector<int> pending(nodes.size());
     for (size_t i = 0; i < nodes.size(); ++i) pending[i] = nodes[i].parents;
 
@@ -165,6 +186,7 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
             const Panel& a = values[n.a];
             const Panel* b = n.b >= 0 ? &values[n.b] : nullptr;
             const int h = rows_before(i);
+            values[i].buf = pool.take(static_cast<size_t>(Tl + h) * N);
             values[i].reset(Tl, N, -h);
             // Redundant nodes also compute their history rows; exchanged ones
             // compute their own days and receive the rest.
@@ -182,11 +204,14 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
             timing.compute += MPI_Wtime() - t;
             if (plan[i].exchanged()) exchanged.push_back(i);
         }
-        if (!exchanged.empty()) exchange_halos(exchanged, plan, values, left, right, halo_tag, comm, timing);
+        if (!exchanged.empty()) exchange_halos(exchanged, plan, values, block, rank, P, data.T, halo_tag, comm, timing);
 
         for (int i : levels[L]) {
             for (int c : {nodes[i].a, nodes[i].b}) {
-                if (c >= 0 && --pending[c] == 0 && !roots.count(c)) values[c] = Panel();
+                if (c >= 0 && --pending[c] == 0 && !roots.count(c)) {
+                    pool.give(std::move(values[c].buf));
+                    values[c] = Panel();
+                }
             }
         }
     }
@@ -223,6 +248,7 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
     }
     if (keep_roots)
         for (int r : unique_roots) result.roots[r] = std::move(values[r]);
+    for (Panel& v : values) pool.give(std::move(v.buf));
     timing.total = MPI_Wtime() - t_start;
     return result;
 }

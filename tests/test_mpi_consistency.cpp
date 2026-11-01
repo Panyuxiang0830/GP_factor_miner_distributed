@@ -49,7 +49,8 @@ std::vector<gpe::Json> read_expressions(const std::string& path, size_t max_coun
 
 constexpr double kRtol = 1e-4, kAtol = 1e-5;
 
-double rms(const std::vector<float>& v) {
+template <class Floats>
+double rms(const Floats& v) {
     double sum = 0.0;
     long n = 0;
     for (float x : v)

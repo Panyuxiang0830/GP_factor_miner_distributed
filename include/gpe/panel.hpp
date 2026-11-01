@@ -1,20 +1,41 @@
 #pragma once
 
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gpe {
+
+// Allocator whose value-initialization leaves elements uninitialized.
+// Every panel row is written (by an operator, a file read or the halo
+// exchange) before it is read, so zero-filling on allocation would only add a
+// single-threaded pass over memory; the operators touch the pages in parallel.
+template <class T>
+struct NoInitAllocator : std::allocator<T> {
+    template <class U>
+    struct rebind { using other = NoInitAllocator<U>; };
+    NoInitAllocator() = default;
+    template <class U>
+    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+    template <class U>
+    void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) { ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...); }
+};
 
 // A date-major float32 panel: day t, asset s at row(t)[s].
 //
 // Rows lo..T-1 are stored, with lo <= 0. Rows below 0 hold history that
 // precedes the rank's own block (halo or redundant computation). In the serial
 // engine lo == 0 and row 0 is the first day of the data set.
+using PanelBuffer = std::vector<float, NoInitAllocator<float>>;
+
 struct Panel {
     int T = 0;
     int N = 0;
     int lo = 0;
-    std::vector<float> buf;
+    PanelBuffer buf;  // uninitialized after reset(); keeps its capacity
 
     Panel() = default;
     Panel(int T_, int N_, int lo_ = 0) { reset(T_, N_, lo_); }
@@ -23,13 +44,27 @@ struct Panel {
         T = T_;
         N = N_;
         lo = lo_;
-        buf.assign(static_cast<size_t>(T - lo) * N, 0.0f);
+        buf.clear();
+        buf.resize(static_cast<size_t>(T - lo) * N);
     }
     int rows() const { return T - lo; }
     float* row(int t) { return buf.data() + static_cast<size_t>(t - lo) * N; }
     const float* row(int t) const { return buf.data() + static_cast<size_t>(t - lo) * N; }
     float& at(int t, int s) { return row(t)[s]; }
     float at(int t, int s) const { return row(t)[s]; }
+};
+
+// Buffers of released panels, handed out again so that later nodes reuse
+// memory whose pages are already mapped. A fresh allocation is first touched
+// by the operator; with many threads those page faults queue in the kernel.
+class BufferPool {
+public:
+    // Smallest kept buffer that holds `cells`, or an empty one.
+    PanelBuffer take(size_t cells);
+    void give(PanelBuffer&& buf);
+
+private:
+    std::vector<PanelBuffer> free_;
 };
 
 // A directory written by python/scripts/export_panels.py.

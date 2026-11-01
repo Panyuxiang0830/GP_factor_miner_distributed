@@ -23,7 +23,7 @@ DateBlock date_block(int T, int ranks, int rank);
 struct MpiTiming {
     double load = 0.0;     // reading leaf panels (own days + halo) and the target
     double compute = 0.0;  // operators, including ema block summaries
-    double halo = 0.0;     // halo MPI_Sendrecv per level (includes waiting for the neighbour)
+    double halo = 0.0;     // halo messages per level (includes waiting for the neighbours)
     double scan = 0.0;     // ema state chain
     double metrics = 0.0;  // daily RankIC and IC summaries
     double wait = 0.0;     // barrier before the reduction: load imbalance
@@ -48,6 +48,9 @@ struct MpiOptions {
     FitnessConfig fitness;
     int H0 = 0;               // redundant-computation budget, see halo_plan.hpp
     bool keep_roots = false;  // return root panels and daily ICs (tests)
+    // Reuses panel memory across batches (one GP generation after another);
+    // without it each batch starts from an empty pool.
+    BufferPool* pool = nullptr;
 };
 
 // Distributed evaluation of a finalized DAG, decomposed by trading date.
@@ -57,14 +60,13 @@ struct MpiOptions {
 //   - redundant nodes are computed for their history rows as well (strategy A
 //     when every node is redundant);
 //   - exchanged nodes are computed for the rank's own days; after the level,
-//     their last `need` rows go to the next rank, all nodes of the level packed
-//     into one MPI_Sendrecv (strategy B when H0 = 0);
+//     the rows each later rank needs are sent to it, all nodes of the level
+//     packed into one message per partner (strategy B when H0 = 0). Usually
+//     the partner is the right neighbour; with blocks shorter than the halo a
+//     rank also receives from ranks further left;
 //   - leaves read their history directly from the panel files;
 //   - ema nodes use the scan in ema_scan.hpp.
 // Daily RankIC is local; one MPI_Allreduce of IcSummary gives the fitness.
-//
-// Requires every block to have at least as many days as the largest exchanged
-// history, so that it always comes from the left neighbour alone.
 MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm comm,
                                   const MpiOptions& options = {});
 

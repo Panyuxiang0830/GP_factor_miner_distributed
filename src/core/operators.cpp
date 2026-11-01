@@ -1,6 +1,7 @@
 #include "gpe/operators.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -50,9 +51,11 @@ struct KahanWindow {
     }
 };
 
+// The kernels write into `out`, which the caller reuses from stock to stock
+// (assign keeps the capacity, so there is no allocation after the first one).
 template <typename Result>
-std::vector<double> kahan_roll(const std::vector<double>& x, int w, Result result) {
-    std::vector<double> out(x.size(), kNaN);
+void kahan_roll(const std::vector<double>& x, int w, std::vector<double>& out, Result result) {
+    out.assign(x.size(), kNaN);
     KahanWindow k;
     for (size_t i = 0; i < x.size(); ++i) {
         if (i == 0) {
@@ -63,11 +66,10 @@ std::vector<double> kahan_roll(const std::vector<double>& x, int w, Result resul
         k.add(x[i]);
         out[i] = result(k);
     }
-    return out;
 }
 
-std::vector<double> roll_mean(const std::vector<double>& x, int w, int minp) {
-    return kahan_roll(x, w, [minp](const KahanWindow& k) {
+void roll_mean(const std::vector<double>& x, int w, int minp, std::vector<double>& out) {
+    kahan_roll(x, w, out, [minp](const KahanWindow& k) {
         if (k.nobs < minp || k.nobs == 0) return kNaN;
         if (k.same_run >= k.nobs) return k.prev;
         double r = k.sum / k.nobs;
@@ -77,8 +79,8 @@ std::vector<double> roll_mean(const std::vector<double>& x, int w, int minp) {
     });
 }
 
-std::vector<double> roll_sum(const std::vector<double>& x, int w, int minp) {
-    return kahan_roll(x, w, [minp](const KahanWindow& k) {
+void roll_sum(const std::vector<double>& x, int w, int minp, std::vector<double>& out) {
+    kahan_roll(x, w, out, [minp](const KahanWindow& k) {
         if (k.nobs == 0 && minp == 0) return 0.0;
         if (k.nobs < minp) return kNaN;
         if (k.same_run >= k.nobs) return k.prev * k.nobs;
@@ -89,9 +91,9 @@ std::vector<double> roll_sum(const std::vector<double>& x, int w, int minp) {
 // Sample variance (ddof = 1) with pandas' Welford update. When an update
 // loses most of the sum of squares to cancellation, pandas recomputes the
 // window from scratch; that is reproduced too.
-std::vector<double> roll_var(const std::vector<double>& x, int w, int minp) {
+void roll_var(const std::vector<double>& x, int w, int minp, std::vector<double>& out) {
     constexpr double kInvCondTol = std::numeric_limits<double>::epsilon() * 1e3;
-    std::vector<double> out(x.size(), kNaN);
+    out.assign(x.size(), kNaN);
     double mean = 0.0, ssq = 0.0, comp_add = 0.0, comp_rem = 0.0;
     double nobs = 0.0;
     bool unstable = false;
@@ -148,14 +150,13 @@ std::vector<double> roll_var(const std::vector<double>& x, int w, int minp) {
         }
         if (nobs >= effective_minp && nobs > 1) out[i] = run >= nobs ? 0.0 : ssq / (nobs - 1);
     }
-    return out;
 }
 
 // pandas' zsqrt: negative variances from rounding become 0.
 inline double zsqrt(double v) { return v < 0 ? 0.0 : std::sqrt(v); }
 
-std::vector<double> roll_extreme(const std::vector<double>& x, int w, int minp, bool want_max) {
-    std::vector<double> out(x.size(), kNaN);
+void roll_extreme(const std::vector<double>& x, int w, int minp, bool want_max, std::vector<double>& out) {
+    out.assign(x.size(), kNaN);
     std::deque<size_t> dq;  // indices of non-NaN values, monotone
     int nobs = 0;
     for (size_t i = 0; i < x.size(); ++i) {
@@ -172,11 +173,10 @@ std::vector<double> roll_extreme(const std::vector<double>& x, int w, int minp, 
         }
         if (nobs >= minp && !dq.empty()) out[i] = x[dq.front()];
     }
-    return out;
 }
 
-std::vector<double> roll_median(const std::vector<double>& x, int w, int minp) {
-    std::vector<double> out(x.size(), kNaN);
+void roll_median(const std::vector<double>& x, int w, int minp, std::vector<double>& out) {
+    out.assign(x.size(), kNaN);
     std::vector<double> sorted;  // non-NaN values of the window
     for (size_t i = 0; i < x.size(); ++i) {
         if (!std::isnan(x[i])) sorted.insert(std::upper_bound(sorted.begin(), sorted.end(), x[i]), x[i]);
@@ -186,7 +186,6 @@ std::vector<double> roll_median(const std::vector<double>& x, int w, int minp) {
         if (n >= minp && n > 0)
             out[i] = (n % 2) ? sorted[n / 2] : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
     }
-    return out;
 }
 
 // ewm(span, adjust=False, ignore_na=False).mean(), ported from pandas: the old
@@ -195,8 +194,9 @@ std::vector<double> roll_median(const std::vector<double>& x, int w, int minp) {
 // (y, old_wt) is the state before x[0]: (NaN, 1) at the start of the data,
 // or the state handed over by the previous rank (distributed scan). With
 // y = NaN the first row sets y = x[0], as pandas does.
-std::vector<double> ewm_mean(const std::vector<double>& x, int span, double y = kNaN, double old_wt = 1.0) {
-    std::vector<double> out(x.size(), kNaN);
+void ewm_mean(const std::vector<double>& x, int span, std::vector<double>& out, double y = kNaN,
+              double old_wt = 1.0) {
+    out.assign(x.size(), kNaN);
     double com = (span - 1.0) / 2.0;
     double alpha = 1.0 / (1.0 + com);
     double old_wt_factor = 1.0 - alpha;
@@ -218,7 +218,6 @@ std::vector<double> ewm_mean(const std::vector<double>& x, int span, double y = 
         }
         out[i] = y;
     }
-    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,71 +314,76 @@ void rolling(Op op, int w, const Panel& a, const Panel* b, Panel& out, int begin
     // Windows read all available history (the inputs may carry different
     // halos); ema starts at `begin` from the handed-over state instead.
     int from = op == Op::Ema ? begin : std::max(a.lo, b ? b->lo : a.lo);
-    #pragma omp parallel for schedule(static)
-    for (int s = 0; s < out.N; ++s) {
-        std::vector<double> x, y, r;
-        column(a, s, from, x);
-        switch (op) {
-            case Op::Mean: r = roll_mean(x, w, minp); break;
-            case Op::Sum: r = roll_sum(x, w, minp); break;
-            case Op::Std:
-                r = roll_var(x, w, minp);
-                for (double& v : r) v = zsqrt(v);
-                break;
-            case Op::Max: r = roll_extreme(x, w, minp, true); break;
-            case Op::Min: r = roll_extreme(x, w, minp, false); break;
-            case Op::Median: r = roll_median(x, w, minp); break;
-            case Op::Ema:
-                r = ema ? ewm_mean(x, w, ema->y[s], ema->old_wt[s]) : ewm_mean(x, w);
-                break;
-            case Op::Lag: case Op::Delta: case Op::PctChange:
-                r.assign(x.size(), kNaN);
-                for (size_t i = w; i < x.size(); ++i) {
-                    double cur = x[i], past = x[i - w];
-                    // pct_change stays in float32 as in pandas, so it rounds the same way.
-                    r[i] = op == Op::Lag ? past
-                         : op == Op::Delta ? cur - past
-                         : clean(static_cast<float>(cur) / static_cast<float>(past) - 1.0f);
-                }
-                break;
-            case Op::Corr: case Op::Beta: {
-                column(*b, s, from, y);
-                // Pairwise-complete masking: X = a + 0*b, Y = b + 0*a.
-                std::vector<double> mx(x.size()), my(x.size()), xy(x.size());
-                for (size_t i = 0; i < x.size(); ++i) {
-                    mx[i] = x[i] + 0.0 * y[i];
-                    my[i] = y[i] + 0.0 * x[i];
-                    xy[i] = mx[i] * my[i];
-                }
-                std::vector<double> valid(x.size());
-                for (size_t i = 0; i < x.size(); ++i) valid[i] = std::isnan(mx[i] + my[i]) ? 0.0 : 1.0;
-                auto mean_xy = roll_mean(xy, w, minp);
-                auto mean_x = roll_mean(mx, w, minp);
-                auto mean_y = roll_mean(my, w, minp);
-                auto count = roll_sum(valid, w, 0);
-                r.assign(x.size(), kNaN);
-                if (op == Op::Corr) {
-                    auto var_x = roll_var(mx, w, minp);
-                    auto var_y = roll_var(my, w, minp);
-                    for (size_t i = 0; i < x.size(); ++i) {
-                        double cov = (mean_xy[i] - mean_x[i] * mean_y[i]) * (count[i] / (count[i] - 1.0));
-                        // A constant window has no correlation; its covariance is only a
-                        // rounding residue, so do not let it become +-inf.
-                        double den = var_x[i] * var_y[i];
-                        r[i] = den == 0.0 ? kNaN : cov / std::pow(den, 0.5);  // NaN if negative, as numpy
+    #pragma omp parallel
+    {
+        // Work arrays of this thread, reused for every stock.
+        std::vector<double> x, y, r, mx, my, xy, valid, mean_xy, mean_x, mean_y, count, var_x, var_y;
+        #pragma omp for schedule(static)
+        for (int s = 0; s < out.N; ++s) {
+            column(a, s, from, x);
+            switch (op) {
+                case Op::Mean: roll_mean(x, w, minp, r); break;
+                case Op::Sum: roll_sum(x, w, minp, r); break;
+                case Op::Std:
+                    roll_var(x, w, minp, r);
+                    for (double& v : r) v = zsqrt(v);
+                    break;
+                case Op::Max: roll_extreme(x, w, minp, true, r); break;
+                case Op::Min: roll_extreme(x, w, minp, false, r); break;
+                case Op::Median: roll_median(x, w, minp, r); break;
+                case Op::Ema:
+                    if (ema) ewm_mean(x, w, r, ema->y[s], ema->old_wt[s]);
+                    else ewm_mean(x, w, r);
+                    break;
+                case Op::Lag: case Op::Delta: case Op::PctChange:
+                    r.assign(x.size(), kNaN);
+                    for (size_t i = w; i < x.size(); ++i) {
+                        double cur = x[i], past = x[i - w];
+                        // pct_change stays in float32 as in pandas, so it rounds the same way.
+                        r[i] = op == Op::Lag ? past
+                             : op == Op::Delta ? cur - past
+                             : clean(static_cast<float>(cur) / static_cast<float>(past) - 1.0f);
                     }
-                } else {
-                    auto var_b = roll_var(y, w, minp);  // b alone, not masked by a
-                    for (size_t i = 0; i < x.size(); ++i) {
-                        double cov = (mean_xy[i] - mean_x[i] * mean_y[i]) * (count[i] / (count[i] - 1.0));
-                        r[i] = std::fabs(var_b[i]) > 1e-12 ? clean(cov / var_b[i]) : kNaN;
+                    break;
+                case Op::Corr: case Op::Beta: {
+                    column(*b, s, from, y);
+                    // Pairwise-complete masking: X = a + 0*b, Y = b + 0*a.
+                    const size_t n = x.size();
+                    mx.resize(n), my.resize(n), xy.resize(n), valid.resize(n);
+                    for (size_t i = 0; i < n; ++i) {
+                        mx[i] = x[i] + 0.0 * y[i];
+                        my[i] = y[i] + 0.0 * x[i];
+                        xy[i] = mx[i] * my[i];
+                        valid[i] = std::isnan(mx[i] + my[i]) ? 0.0 : 1.0;
                     }
+                    roll_mean(xy, w, minp, mean_xy);
+                    roll_mean(mx, w, minp, mean_x);
+                    roll_mean(my, w, minp, mean_y);
+                    roll_sum(valid, w, 0, count);
+                    r.assign(n, kNaN);
+                    if (op == Op::Corr) {
+                        roll_var(mx, w, minp, var_x);
+                        roll_var(my, w, minp, var_y);
+                        for (size_t i = 0; i < n; ++i) {
+                            double cov = (mean_xy[i] - mean_x[i] * mean_y[i]) * (count[i] / (count[i] - 1.0));
+                            // A constant window has no correlation; its covariance is only a
+                            // rounding residue, so do not let it become +-inf.
+                            double den = var_x[i] * var_y[i];
+                            r[i] = den == 0.0 ? kNaN : cov / std::pow(den, 0.5);  // NaN if negative, as numpy
+                        }
+                    } else {
+                        roll_var(y, w, minp, var_y);  // b alone, not masked by a
+                        for (size_t i = 0; i < n; ++i) {
+                            double cov = (mean_xy[i] - mean_x[i] * mean_y[i]) * (count[i] / (count[i] - 1.0));
+                            r[i] = std::fabs(var_y[i]) > 1e-12 ? clean(cov / var_y[i]) : kNaN;
+                        }
+                    }
+                    break;
                 }
-                break;
+                default: throw std::logic_error("not a rolling operator");
             }
-            default: throw std::logic_error("not a rolling operator");
+            store_column(r, from, out, s, begin);
         }
-        store_column(r, from, out, s, begin);
     }
 }
 
@@ -394,15 +398,27 @@ int rolling_min_periods(Op op, int window) {
     }
 }
 
+namespace {
+OpStat g_op_stats[kNumOps];
+}
+
+const OpStat* op_stats() { return g_op_stats; }
+void reset_op_stats() { std::fill(g_op_stats, g_op_stats + kNumOps, OpStat{}); }
+
 void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out, int begin, const EmaState* ema) {
     if (begin == kFromLo) begin = out.lo;
     check_shapes(a, b, out, begin);
+    auto start = std::chrono::steady_clock::now();
     switch (op_info(op).kind) {
         case OpKind::Elementwise: elementwise(op, a, b, out, begin); break;
         case OpKind::CrossSectional: cross_sectional(op, a, out, begin); break;
         case OpKind::Rolling: case OpKind::PairRolling: rolling(op, window, a, b, out, begin, ema); break;
         default: throw std::logic_error("apply_op called on a leaf");
     }
+    OpStat& st = g_op_stats[static_cast<int>(op)];
+    st.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    ++st.calls;
+    st.cells += static_cast<double>(out.T - begin) * out.N;
 }
 
 }  // namespace gpe
