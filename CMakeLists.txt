@@ -73,6 +73,9 @@ endif()
 # Distributed engine against the serial one on exported data:
 #   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json>
 if(GPE_ENABLE_MPI)
+  add_executable(gpe_bench apps/gpe_bench.cpp)
+  target_link_libraries(gpe_bench PRIVATE gpe_core)
+
   add_executable(test_mpi_consistency tests/test_mpi_consistency.cpp)
   target_link_libraries(test_mpi_consistency PRIVATE gpe_core)
 endif()
