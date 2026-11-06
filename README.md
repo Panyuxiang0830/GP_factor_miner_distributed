@@ -49,3 +49,7 @@ mpirun -np 4 build_mpi/test_mpi_consistency <panel_dir> <expressions.json>
 ## Data policy
 
 Market data, exported panels and run outputs are **never committed** (see `.gitignore`). Data live outside the repository on the experiment machines.
+
+## DAG analysis tools (S1–S5)
+
+See [tools/dag_analysis](tools/dag_analysis/README.md) for DAG statistics, serial planning benchmarks, live-panel scheduling and cross-batch cache simulators, S4 reproduction helpers, and the S5 serial execution-plan proposal. These tools do not change the numerical engine. Private inputs and experiment outputs remain outside the repository.
