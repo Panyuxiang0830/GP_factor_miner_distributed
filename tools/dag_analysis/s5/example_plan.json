@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "mode": "serial_full_panel",
+  "context": {
+    "dataset_id": "synthetic-demo-v1",
+    "dates_id": "demo-date-order",
+    "assets_id": "demo-stock-order",
+    "operator_semantics_id": "handoff-2026-11-04",
+    "T": 120,
+    "N": 300,
+    "ranks": 1,
+    "rank": 0,
+    "dtype": "float32",
+    "layout": "date_major"
+  },
+  "normalizer": "handed-off Python expression_key (compact JSON)",
+  "nodes": [
+    {
+      "id": 0,
+      "operator": "leaf",
+      "inputs": [],
+      "expression": "x",
+      "expression_sha256": "ba2df4903a2c14e86dc3bcca58911b44ac1d2514b7227bf6eb08cfb978f55a1b",
+      "source": "load"
+    },
+    {
+      "id": 1,
+      "operator": "mean",
+      "inputs": [
+        0
+      ],
+      "expression": [
+        "mean",
+        "x",
+        5
+      ],
+      "expression_sha256": "4e8a31a65ba838a40a6f48f51bd7bf0cedc3c4e2235c0656172f45b8bd6ceee0",
+      "source": "compute"
+    },
+    {
+      "id": 2,
+      "operator": "rank",
+      "inputs": [
+        1
+      ],
+      "expression": [
+        "rank",
+        [
+          "mean",
+          "x",
+          5
+        ]
+      ],
+      "expression_sha256": "a877e78c17f6d0e44d01661d686ef4645f106317220b65bea9090da7a075b0a6",
+      "source": "compute"
+    },
+    {
+      "id": 3,
+      "operator": "*",
+      "inputs": [
+        0,
+        0
+      ],
+      "expression": [
+        "*",
+        "x",
+        "x"
+      ],
+      "expression_sha256": "302a8c2f1b0f6246dff691fbd3a8de3572155a70cb7e0d470473d0ce4ea0fcad",
+      "source": "compute"
+    }
+  ],
+  "root_outputs": {
+    "1": [
+      0,
+      3
+    ],
+    "2": [
+      1
+    ],
+    "3": [
+      2
+    ]
+  },
+  "rejected_input_indices": [],
+  "input_count": 4,
+  "initial_cache": [],
+  "policy": "level_chunk",
+  "chunk": 1,
+  "predicted_peak_live_panels": 3,
+  "instructions": [
+    {
+      "op": "begin_group",
+      "nodes": [
+        0
+      ]
+    },
+    {
+      "op": "load",
+      "node": 0
+    },
+    {
+      "op": "end_group"
+    },
+    {
+      "op": "begin_group",
+      "nodes": [
+        1
+      ]
+    },
+    {
+      "op": "compute",
+      "node": 1
+    },
+    {
+      "op": "consume_root",
+      "node": 1
+    },
+    {
+      "op": "end_group"
+    },
+    {
+      "op": "begin_group",
+      "nodes": [
+        3
+      ]
+    },
+    {
+      "op": "compute",
+      "node": 3
+    },
+    {
+      "op": "consume_root",
+      "node": 3
+    },
+    {
+      "op": "release",
+      "node": 3
+    },
+    {
+      "op": "release",
+      "node": 0
+    },
+    {
+      "op": "end_group"
+    },
+    {
+      "op": "begin_group",
+      "nodes": [
+        2
+      ]
+    },
+    {
+      "op": "compute",
+      "node": 2
+    },
+    {
+      "op": "consume_root",
+      "node": 2
+    },
+    {
+      "op": "release",
+      "node": 2
+    },
+    {
+      "op": "release",
+      "node": 1
+    },
+    {
+      "op": "end_group"
+    }
+  ]
+}
