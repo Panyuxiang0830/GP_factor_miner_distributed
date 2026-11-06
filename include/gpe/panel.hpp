@@ -67,7 +67,21 @@ private:
     std::vector<PanelBuffer> free_;
 };
 
-// A directory written by python/scripts/export_panels.py.
+// A directory written by python/scripts/export_panels.py, or synthetic data.
+//
+// T and N may be lowered after open() to use the first T dates and the first
+// N assets (problem-size experiments); the files keep their full width.
+//
+// Synthetic panels (weak scaling) are generated on demand, so a rank only
+// produces its own rows. Every cell is a function of (seed, field, global
+// day, asset) alone, so results do not depend on the number of ranks:
+//   - each field is either log-normal, exp(mu + 0.5 z), with mu in [-2, 6]
+//     (prices, volumes, amounts), or normal, sigma z with sigma in [0.01, 1]
+//     (returns, flows), chosen by a hash of the field name;
+//   - the target is 0.02 z;
+//   - z ~ N(0, 1) is drawn independently for every cell, and 2% of the cells
+//     are missing (NaN), also independently.
+// Any field name is accepted, so real expression batches run unchanged.
 struct PanelSet {
     int T = 0;
     int N = 0;
@@ -75,8 +89,12 @@ struct PanelSet {
     std::vector<std::string> assets;
     std::vector<std::string> fields;   // all fields listed in meta.json
     std::string dir;
+    int N_file = 0;                    // assets per row in the files
+    bool synthetic = false;
+    unsigned long long seed = 0;
 
     static PanelSet open(const std::string& dir);
+    static PanelSet make_synthetic(int T, int N, unsigned long long seed = 1);
     bool has_field(const std::string& name) const;
     Panel load_field(const std::string& name) const;
     Panel load_target() const;

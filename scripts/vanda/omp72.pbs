@@ -1,0 +1,16 @@
+#!/bin/bash
+# Rerun of the 1 rank x 72 threads points of scaling_1node.pbs (both thread
+# strategies), which failed to bind a rank across both sockets.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_omp72
+#PBS -j oe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+OUT=/scratch/$USER/gp_runs/20261104
+source scripts/vanda/env.sh
+S="--exprs 200 --warmup 1 --repeat 3"
+for m in op node; do bench 1 72 1 $S --threads $m --csv $OUT/x5_omp.csv --label omp; done
+echo DONE

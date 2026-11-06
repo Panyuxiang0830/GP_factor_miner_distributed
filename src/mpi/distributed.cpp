@@ -135,6 +135,7 @@ std::vector<double> ema_chain(const std::vector<int>& ids, const std::vector<Nod
 MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm comm, const MpiOptions& options) {
     const FitnessConfig& config = options.fitness;
     const bool keep_roots = options.keep_roots;
+    const bool by_node = options.threads == ThreadMode::Node;
     double t_start = MPI_Wtime();
     int rank = 0, P = 1;
     MPI_Comm_rank(comm, &rank);
@@ -157,11 +158,29 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
     std::vector<std::vector<int>> levels(dag.max_level() + 1);
     for (size_t i = 0; i < nodes.size(); ++i) levels[nodes[i].level].push_back(static_cast<int>(i));
     std::set<int> roots(dag.roots().begin(), dag.roots().end());
+    std::vector<int> unique_roots(roots.begin(), roots.end());
+    std::vector<int> slot(nodes.size(), -1);  // index of a root in unique_roots
+    for (size_t r = 0; r < unique_roots.size(); ++r) slot[unique_roots[r]] = static_cast<int>(r);
     std::vector<Panel> values(nodes.size());
     BufferPool local_pool;
     BufferPool& pool = options.pool ? *options.pool : local_pool;
     std::vector<int> pending(nodes.size());
     for (size_t i = 0; i < nodes.size(); ++i) pending[i] = nodes[i].parents;
+    auto release = [&](int i) {
+        pool.give(std::move(values[i].buf));
+        values[i] = Panel();
+    };
+
+    // Target ranks for the RankIC of each root as soon as it is computed.
+    double t = MPI_Wtime();
+    Panel target = data.load_target_rows(block.t0, block.t1);
+    timing.load += MPI_Wtime() - t;
+    t = MPI_Wtime();
+    std::vector<double> target_rank = rank_rows_pct(target);
+    target = Panel();
+    const int K = config.stability_segments, W = IcSummary::width(K);
+    std::vector<double> stats(unique_roots.size() * W);
+    timing.metrics += MPI_Wtime() - t;
 
     for (size_t L = 0; L < levels.size(); ++L) {
         // Separate tags for the ema chain and the halo of each level.
@@ -173,25 +192,30 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
         std::vector<double> ema_in;
         if (!ema_ids.empty()) ema_in = ema_chain(ema_ids, nodes, values, left, right, ema_tag, comm, timing);
 
-        std::vector<int> exchanged;
+        // Leaves are read and output panels taken from the pool before any
+        // operator runs, so that the pool is never used by several threads.
+        std::vector<int> work, exchanged;
         for (int i : levels[L]) {
             const Node& n = nodes[i];
+            const int h = rows_before(i);
             if (n.op == Op::Leaf) {
-                double t = MPI_Wtime();
-                values[i] = data.load_field_rows(dag.fields()[n.field], block.t0, block.t1, rows_before(i));
+                t = MPI_Wtime();
+                values[i] = data.load_field_rows(dag.fields()[n.field], block.t0, block.t1, h);
                 timing.load += MPI_Wtime() - t;
                 continue;
             }
-            double t = MPI_Wtime();
-            const Panel& a = values[n.a];
-            const Panel* b = n.b >= 0 ? &values[n.b] : nullptr;
-            const int h = rows_before(i);
             values[i].buf = pool.take(static_cast<size_t>(Tl + h) * N);
             values[i].reset(Tl, N, -h);
+            if (plan[i].redundant) timing.redundant_rows += h;
+            if (plan[i].exchanged()) exchanged.push_back(i);
+            work.push_back(i);
+        }
+        auto compute = [&](int i) {
+            const Node& n = nodes[i];
+            const Panel* b = n.b >= 0 ? &values[n.b] : nullptr;
             // Redundant nodes also compute their history rows; exchanged ones
             // compute their own days and receive the rest.
-            const int begin = plan[i].redundant ? -h : 0;
-            if (plan[i].redundant) timing.redundant_rows += h;
+            const int begin = plan[i].redundant ? -rows_before(i) : 0;
             EmaState state;
             const EmaState* ema = nullptr;
             if (n.op == Op::Ema && left != MPI_PROC_NULL) {
@@ -200,37 +224,46 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
                 state.old_wt = state.y + N;
                 ema = &state;
             }
-            apply_op(n.op, n.window, a, b, values[i], begin, ema);
-            timing.compute += MPI_Wtime() - t;
-            if (plan[i].exchanged()) exchanged.push_back(i);
+            apply_op(n.op, n.window, values[n.a], b, values[i], begin, ema);
+        };
+        t = MPI_Wtime();
+        if (by_node) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (size_t k = 0; k < work.size(); ++k) compute(work[k]);
+        } else {
+            for (int i : work) compute(i);
         }
+        timing.compute += MPI_Wtime() - t;
         if (!exchanged.empty()) exchange_halos(exchanged, plan, values, block, rank, P, data.T, halo_tag, comm, timing);
 
-        for (int i : levels[L]) {
-            for (int c : {nodes[i].a, nodes[i].b}) {
-                if (c >= 0 && --pending[c] == 0 && !roots.count(c)) {
-                    pool.give(std::move(values[c].buf));
-                    values[c] = Panel();
-                }
-            }
+        // RankIC of the roots of this level (own days only).
+        std::vector<int> done;
+        for (int i : levels[L])
+            if (slot[i] >= 0) done.push_back(i);
+        std::vector<DailyIC> daily(done.size());
+        auto score = [&](size_t k) {
+            daily[k] = daily_rank_ic(values[done[k]], target_rank);
+            summarize_ic(daily[k], block.t0, data.T, K).pack(stats.data() + slot[done[k]] * W);
+        };
+        t = MPI_Wtime();
+        if (by_node) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (size_t k = 0; k < done.size(); ++k) score(k);
+        } else {
+            for (size_t k = 0; k < done.size(); ++k) score(k);
         }
-    }
+        timing.metrics += MPI_Wtime() - t;
 
-    // Daily RankIC on own days, then one reduction for the whole batch.
-    double t = MPI_Wtime();
-    Panel target = data.load_target_rows(block.t0, block.t1);
-    timing.load += MPI_Wtime() - t;
-    t = MPI_Wtime();
-    std::vector<double> target_rank = rank_rows_pct(target);
-    const int K = config.stability_segments, W = IcSummary::width(K);
-    std::vector<int> unique_roots(roots.begin(), roots.end());
-    std::vector<double> stats(unique_roots.size() * W);
-    for (size_t r = 0; r < unique_roots.size(); ++r) {
-        DailyIC daily = daily_rank_ic(values[unique_roots[r]], target_rank);
-        summarize_ic(daily, block.t0, data.T, K).pack(stats.data() + r * W);
-        if (keep_roots) result.daily[unique_roots[r]] = std::move(daily);
+        if (keep_roots) {
+            for (size_t k = 0; k < done.size(); ++k) result.daily[done[k]] = std::move(daily[k]);
+        } else {
+            for (int i : done)
+                if (pending[i] == 0) release(i);  // not a subtree of a later node
+        }
+        for (int i : levels[L])
+            for (int c : {nodes[i].a, nodes[i].b})
+                if (c >= 0 && --pending[c] == 0 && !(keep_roots && slot[c] >= 0)) release(c);
     }
-    timing.metrics += MPI_Wtime() - t;
 
     // Separates waiting for the slowest rank from the reduction itself.
     t = MPI_Wtime();
@@ -241,10 +274,9 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
     timing.reduce += MPI_Wtime() - t;
 
     for (int root : dag.roots()) {
-        size_t r = std::lower_bound(unique_roots.begin(), unique_roots.end(), root) - unique_roots.begin();
         const Node& n = nodes[root];
         result.candidates.push_back(
-            score_summary(IcSummary::unpack(stats.data() + r * W, K), data.T, n.depth, n.tree_nodes, config));
+            score_summary(IcSummary::unpack(stats.data() + slot[root] * W, K), data.T, n.depth, n.tree_nodes, config));
     }
     if (keep_roots)
         for (int r : unique_roots) result.roots[r] = std::move(values[r]);

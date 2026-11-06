@@ -415,10 +415,15 @@ void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out, int
         case OpKind::Rolling: case OpKind::PairRolling: rolling(op, window, a, b, out, begin, ema); break;
         default: throw std::logic_error("apply_op called on a leaf");
     }
-    OpStat& st = g_op_stats[static_cast<int>(op)];
-    st.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    ++st.calls;
-    st.cells += static_cast<double>(out.T - begin) * out.N;
+    double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    // Several nodes may run at once (ThreadMode::Node).
+    #pragma omp critical(gpe_op_stats)
+    {
+        OpStat& st = g_op_stats[static_cast<int>(op)];
+        st.seconds += seconds;
+        ++st.calls;
+        st.cells += static_cast<double>(out.T - begin) * out.N;
+    }
 }
 
 }  // namespace gpe

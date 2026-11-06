@@ -1,0 +1,21 @@
+#!/bin/bash
+# X1: serial run time against problem size (1 rank, 1 thread, whole node so
+# that nothing shares the memory bandwidth). Varies the dates T, the assets N
+# (real prefixes, then synthetic data beyond the real size) and the batch size.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_x1_serial
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+source scripts/vanda/env.sh
+B="--warmup 1 --repeat 1 --csv $OUT/x1_serial.csv"
+
+for T in 91 183 365 730 1461; do bench 1 1 1 --dates $T --exprs 50 $B --label T_real; done
+for N in 367 734 1469 2938 5876; do bench 1 1 1 --stocks $N --exprs 50 $B --label N_real; done
+for T in 1461 2922 5844 11688; do bench 1 1 1 --synthetic $T --exprs 50 $B --label T_synthetic; done
+for N in 5876 11752 23504; do bench 1 1 1 --synthetic 1461 --stocks $N --exprs 50 $B --label N_synthetic; done
+for E in 25 50 100 200 400 800; do bench 1 1 1 --exprs $E $B --label batch_real; done
+echo DONE

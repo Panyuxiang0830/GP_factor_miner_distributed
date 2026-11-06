@@ -1,0 +1,23 @@
+#!/bin/bash
+# One 72-core node: pure-MPI strong (X2) and weak (X3) scaling up to 72 ranks,
+# single-node OpenMP with both thread strategies (X5), the H0 scan at 72 ranks
+# (X4) and the consistency check at 72 ranks.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_1node
+#PBS -j oe
+#PBS -l walltime=03:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+source scripts/vanda/env.sh
+S="--exprs 200 --warmup 1 --repeat 3"
+
+for P in 1 2 4 8 16 36 72; do bench $P 1 1 $S --csv $OUT/x2_strong.csv --label strong; done
+for P in 1 2 4 8 16 36 72; do bench $P 1 1 $S --synthetic $((64 * P)) --csv $OUT/x3_weak.csv --label weak; done
+for t in 2 4 8 16 36 72; do
+    for m in op node; do bench 1 $t 1 $S --threads $m --csv $OUT/x5_omp.csv --label omp; done
+done
+for H in 0 10 30 60 89; do bench 72 1 1 $S --H0 $H --csv $OUT/x4_comm.csv --label h0_scan; done
+consistency 72 1 1 0 200 op
+echo DONE

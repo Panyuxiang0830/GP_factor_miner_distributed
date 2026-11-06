@@ -1,0 +1,29 @@
+#!/bin/bash
+# Four nodes (288 cores): strong and weak scaling at 288 ranks, the H0 scan,
+# the same rank counts spread over four nodes (network vs shared memory), the
+# MPI x OpenMP split of 288 cores with both thread strategies, H0 for hybrid
+# splits, and the consistency checks.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_4node
+#PBS -j oe
+#PBS -l walltime=03:00:00
+#PBS -l select=4:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+source scripts/vanda/env.sh
+S="--exprs 200 --warmup 1 --repeat 3"
+
+bench 288 1 4 $S --csv $OUT/x2_strong.csv --label strong
+bench 288 1 4 $S --synthetic $((64 * 288)) --csv $OUT/x3_weak.csv --label weak
+for H in 0 10 30 60 89; do bench 288 1 4 $S --H0 $H --csv $OUT/x4_comm.csv --label h0_scan; done
+for P in 36 72 144; do bench $P 1 4 $S --csv $OUT/x4_comm.csv --label spread4; done
+for rt in 144:2 72:4 36:8 16:18 8:36 4:72; do
+    for m in op node; do bench ${rt%:*} ${rt#*:} 4 $S --threads $m --csv $OUT/x5_hybrid.csv --label hybrid; done
+done
+for rt in 72:4 16:18 4:72; do
+    for H in 10 30 60 89; do bench ${rt%:*} ${rt#*:} 4 $S --H0 $H --csv $OUT/x4_comm.csv --label h0_hybrid; done
+done
+consistency 288 1 4 0 200 op
+consistency 16 18 4 0 200 node
+echo DONE
