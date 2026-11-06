@@ -1,0 +1,445 @@
+% DSA5208 Project 3 报告（中文版；英文版为 main.tex，两者结构一致）。
+% 用 xelatex 编译。标有 \todo{} 的部分随实现和实验结果补充。
+\documentclass[11pt,a4paper,UTF8,fontset=fandol]{ctexart}
+
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, frame=single, breaklines=true}
+
+\title{分层 PCA-QD 遗传规划因子挖掘的分布式加速\\[4pt]
+\large DSA5208 Project 3}
+\author{\todo{姓名（学号）} \and \todo{姓名（学号）} \and \todo{姓名（学号）}}
+\date{\todo{日期}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+我们对一个已有的 A 股遗传规划（GP）因子挖掘程序做分布式加速。搜索循环保留在 Python 中；批量评估引擎用 C++ 重写，因子计算与评估用 MPI + OpenMP 并行，PCA 签名与相似度用 CUDA 并行。数据按交易日切分，使原来"按表达式并行"的做法变成真正的分布式计算：滚动算子需要 halo 交换或冗余计算，指数移动平均需要跨进程的扫描，每日统计量需要全局归约。同一批表达式的公共子表达式合并成 DAG，每个只计算一次。
+\todo{主要数字：288 核的加速比和效率、GPU 加速比}
+\end{abstract}
+
+%======================================================================
+\section*{术语表}
+\todo{每项一行；表中术语在正文中都会用到}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+术语 & 含义 \\
+\midrule
+因子（factor） & 把原始股票数据映射为每只股票每日得分的公式 \\
+面板（panel） & $T\times N$ 的数组（交易日 $\times$ 股票） \\
+RankIC & 因子与未来收益的每日 Spearman 相关系数 \\
+适应度（fitness） & 由 RankIC 计算的 GP 目标函数（第~\ref{sec:fitness}~节） \\
+基因池（gene pool） & 每个阶段的最优表达式，供更深阶段作为子树复用 \\
+PCA-QD 签名 & 概括一个因子的短向量，用于衡量因子间相似度 \\
+DAG & 一批表达式中所有不同子表达式构成的有向无环图 \\
+根节点（root） & DAG 中对应一个完整表达式（候选因子）的节点 \\
+halo & 一个进程需要从左侧进程获得的历史行 \\
+$H_0$ & 冗余计算预算（在本地重新计算的历史天数） \\
+ema & 指数移动平均 \\
+强扩展 / 弱扩展 & 总问题规模固定 / 每个进程的问题规模固定 \\
+Karp--Flatt 指标 & 由实测得到的串行比例 \\
+\todo{补充} & \\
+\bottomrule
+\end{tabular}
+
+%======================================================================
+\section{背景与算法}
+
+\subsection{因子与 RankIC}
+每个原始字段是一个面板 $X\in\mathbb{R}^{T\times N}$（交易日 $\times$ 股票）。因子 $F$ 由原始面板通过一棵表达式树计算得到，例如 $\mathrm{mean}(\text{volume}/\text{amount}, 10)$。如果每天按因子对股票排序能够预测它们未来收益 $Y$ 的排序，这个因子就是有用的。它在第 $t$ 天的质量为
+\begin{equation}
+  \mathrm{IC}_t = \operatorname{corr}\!\big(\operatorname{rank}(F_{t,\cdot}),\ \operatorname{rank}(Y_{t,\cdot})\big),
+  \qquad \overline{\mathrm{IC}} = \frac{1}{|T_{\mathrm{valid}}|}\sum_{t} \mathrm{IC}_t .
+\end{equation}
+
+\subsection{表达式与算子}
+叶子是原始字段，窗口长度取自 $\{1,5,10,15,20,30,60\}$。共有 20 个算子：
+\begin{itemize}[nosep]
+  \item 逐元素：$+,-,\times,\div,\log,|\cdot|$；
+  \item 截面：rank、z-score；
+  \item 时序滚动：mean、std、sum、max、min、median、ema、lag、delta、pct\_change；
+  \item 成对滚动：correlation、beta。
+\end{itemize}
+表达式会做规范化：可交换算子的操作数排序，$\mathrm{rank}(\mathrm{rank}(x))=\mathrm{rank}(x)$，$x-x$ 和 $x/x$ 被拒绝。树最多 11 个节点。
+\todo{各深度的搜索空间大小}
+
+\subsection{适应度}
+\label{sec:fitness}
+候选因子必须至少在 $80\%$ 的交易日有有效 IC，缺失值不超过 $20\%$。设 $m_1,\dots,m_4$ 为四个连续时间段上的平均 IC，则
+\begin{equation}
+  \text{fitness} = |\overline{\mathrm{IC}}| - 0.5\,\operatorname{std}(m_1,\dots,m_4) - 0.0005\max(\text{nodes}-3,0),
+\end{equation}
+若与 $\overline{\mathrm{IC}}$ 同号的时间段少于 $75\%$，适应度再乘以 $0.25$。
+
+\subsection{分层生成}
+进化分三个阶段，最大树深度依次为 $1$、$2$、$3$。每个阶段对规模 $10{,}000$ 的种群进化 $10$ 代：
+\begin{itemize}[nosep]
+  \item 父代从限制了字段占比的父代池中选出，方式为锦标赛选择，或基于四个 IC 时间段的 $\varepsilon$-lexicase 选择；
+  \item 子代来自同层交叉，以及字段、算子、窗口和子树变异；每个家族保留最好的两个；
+  \item 每一代有 $10\%$ 是随机移民；
+  \item 每个阶段结束时，最好的 $2{,}000$ 个已入档表达式组成\emph{基因池}；更深的阶段有 $70\%$ 的子树取自这些基因池。
+\end{itemize}
+
+\subsection{PCA-QD 多样性档案}
+很多候选因子彼此几乎重复。直接两两比较完整的因子面板，每一对的代价是 $O(TN)$，几千个候选对几千个档案因子时无法承受。因此每个候选被压缩成一个短签名：
+\begin{enumerate}[nosep]
+  \item 每 5 天取一天，计算截面百分位排名（缺失值记为 $0.5$），每行减去均值，得到 $R\in\mathbb{R}^{T_s\times N}$；
+  \item 做四次幂迭代，求第一右奇异向量 $v$；
+  \item 令 $s = Rv/\|Rv\|$，并固定符号。
+\end{enumerate}
+若候选与每个档案签名的 $|$相关系数$|$ 都低于 $0.9$，就进入档案；否则只有当它的 RankIC 比最相似的档案因子至少高 $0.002$ 时才替换后者。准入是串行的。
+
+\subsection{各部分的复杂度}
+\label{sec:cost}
+\todo{每个表达式：每个节点的算子 $O(TN)$（median 为 $O(TNw)$）；RankIC $O(TN\log N)$；$k$ 次迭代的签名 $O(T_s N k)$；$C$ 个候选与 $A$ 个档案签名的相似度 $O(C\,A\,T_s)$。第~\ref{sec:x1}~节把实测斜率与这些理论值对比。}
+
+\subsection{原实现及其瓶颈}
+Python 引擎在 32 个进程的进程池中逐个独立评估表达式：
+\begin{itemize}[nosep]
+  \item 公共子树每次都从原始数据重新计算，因为它的缓存只保存最终得分；
+  \item 每个进程都持有全部数据，并行度受一批中表达式个数的限制；
+  \item 签名用单线程 NumPy 计算，只有最后的相似度矩阵乘法用到 GPU。
+\end{itemize}
+此前的一次运行选出了 $1481$ 个因子，2022 年样本外平均 $|\mathrm{RankIC}|$ 为 $0.080$。
+
+%======================================================================
+\section{数据}
+
+\subsection{真实数据}
+原始数据是 A 股 132 个数值字段的日频面板，其中一部分字段由分钟频数据降频到日频得到。标签是未来收益面板，只保留可交易、非 ST 的股票。进化期（2016--2021 年）共 $T=1461$ 个交易日、$N=5876$ 只股票；有数据的股票数从 2016 年初的 2636 只增长到 2021 年底的 4845 只。面板一次性导出为小端 float32 原始文件，按日期为主序存储（第 $t\cdot N+s$ 个元素），每个字段约 $34$\,MB，共 $4.3$\,GB。导出复用了原有的数据清洗代码，所以 C++ 引擎看到的数值与 Python 挖掘程序完全相同。
+\todo{字段分组}
+
+\subsection{合成数据}
+弱扩展要求问题规模随进程数增长：每个进程 64 天时，288 个进程需要 $18{,}432$ 天，远超真实数据的 1461 天。合成面板按需生成，每个进程只生成自己的行。每个格子只由（种子、字段、全局日期、股票）决定，因此结果与进程数无关：
+\begin{itemize}[nosep]
+  \item 每个字段由字段名的哈希决定为对数正态 $\exp(\mu + 0.5z)$，$\mu\in[-2,6]$（类似价格、成交量、成交额），或正态 $\sigma z$，$\sigma\in[0.01,1]$（类似收益率、资金流）；
+  \item 标签为 $0.02z$；
+  \item $z\sim N(0,1)$ 对每个格子独立抽取，$2\%$ 的格子为缺失值。
+\end{itemize}
+与真实数据不同，合成数据每天的股票数不变，因此不存在由股票池扩大引起的负载不均。
+
+%======================================================================
+\section{计算平台：Vanda}
+\todo{NUS Vanda 集群：CPU 节点 2$\times$ Intel Xeon 8452Y（72 核）、512\,GB 内存；GPU 节点 NVIDIA A40（48\,GB）；节点间 100\,Gb 以太网；PBS 队列与限制（免费队列每个作业最多 160 核，288 核使用项目队列）；home 与 scratch 文件系统；OpenMPI 5.0.8、GCC 14.3；进程与线程的摆放和绑核方式。}
+
+%======================================================================
+\section{并行设计}
+
+\setcounter{subsection}{-1}
+\subsection{总览、切分方式与数据布局}
+\todo{整体流程图：Python GP 循环 $\to$ C++ 引擎（因子计算与评估在 CPU 上用 MPI + OpenMP；签名与相似度在 GPU 上）$\to$ 串行准入。MPI+X：因子评估的 X 为 OpenMP，PCA 部分为 CUDA。}
+
+$p$ 个进程中的每一个负责约 $T/p$ 个连续交易日的全部 $N$ 只股票。这样：
+\begin{itemize}[nosep]
+  \item 截面计算（排名、每日 IC）都在本地完成；
+  \item 时序算子需要前面日期块的数据；
+  \item 全局统计量需要归约。
+\end{itemize}
+我们切分的是数据而不是表达式。每个进程按层计算整批 DAG（第~\ref{sec:dag}~节）的所有节点，但只算自己的日期，因此通信只涉及少量边界行，从不传整张面板。如果改为按股票切分，每个截面排名都会变成全局排序；如果像 Python 版那样按表达式切分，每个进程都要持有全部数据。
+面板以按日期为主序的连续 float32 数组存储，并记录第一行的下标 \code{lo}$\le0$；下标小于 0 的行存放本进程日期块之前的历史。
+
+\subsection{因子计算与评估}
+
+\subsubsection{算子分类及其并行方向}
+\label{sec:operators}
+\begin{itemize}[nosep]
+  \item 逐元素算子遍历数组一次，按天切分给线程；
+  \item 截面算子（rank、z-score）每次处理一天（一行），按天动态分配给线程；
+  \item 滚动算子每次处理一只股票（一列），用 $O(T)$ 的滑动窗口更新，按股票切分；每个线程把这一列拷进自己的临时数组，计算后写回。
+\end{itemize}
+\todo{按列跨步访问，以及它在 CPU 上为何可以接受}
+
+\subsubsection{与 pandas 完全一致}
+浮点舍入的细微差别会改变哪些窗口看起来是常数，进而改变相关系数是否有限，所以我们移植 pandas~3.0.3 的窗口算法，而不是用教科书公式。
+\begin{itemize}[nosep]
+  \item 滚动求和与均值使用 Kahan 求和，加入和移出分别补偿。当最近 $n_{obs}$ 个观测完全相同时，直接返回这个重复值。
+  \item 滚动方差使用 Welford 更新，检测到抵消（$m_2^{\text{prev}}\cdot10^3\varepsilon > m_2$）时重新计算整个窗口。
+  \item 窗口只统计非缺失观测。最少观测数：mean、sum、median 为 1，std、max、min、correlation、beta 为 $\min(3,w)$。
+  \item 相关系数与协方差使用成对完整的观测。beta 只除以 $b$ 的方差。
+  \item $+,-,\times,\div$、pct\_change 和 beta 的无穷结果记为缺失值。pct\_change 与 pandas 一样用 float32 计算。
+\end{itemize}
+max 和 min 使用单调队列，median 保持窗口有序（$w\le60$）。
+
+\subsubsection{halo 交换与冗余计算}
+\label{sec:halo}
+日期块开头几天的滚动算子需要更早的数据，这些数据属于左侧的进程。我们考虑三种策略：
+\begin{itemize}[nosep]
+  \item \textbf{A，冗余计算：}每个进程多读 $H_0$ 天原始数据，在本地重新计算子树，不需要通信；
+  \item \textbf{B，halo 交换：}每层 DAG 算完后，每个进程把右侧进程需要的行发给它们；一层所有节点的数据对每个通信对象打包成一条消息（\code{MPI\_Isend}/\code{MPI\_Irecv}）。日期块比 halo 短时，一个进程要从左侧多个进程接收数据（多跳 halo）；
+  \item \textbf{混合：}累计回看长度不超过 $H_0$ 的子树在本地重新计算，否则交换。
+\end{itemize}
+因此 $H_0$ 是一个统一的旋钮：$H_0=0$ 即策略 B，$H_0\ge \max h$ 即策略 A。每个进程的冗余计算量约按 $H_0/(T/p)$ 增长，而日期块变短时消息数随 $p$ 增长，所以最优的 $H_0$ 取决于 $p$，也取决于相邻进程是否在同一节点上。
+
+\subsubsection{递归算子：ema}
+\label{sec:ema}
+指数移动平均沿用 pandas 在 \code{adjust=False} 下带缺失值的递推：之前的权重每天衰减 $(1-\alpha)$，因此连续缺失 $k$ 天之后
+\begin{equation}
+  y_t = \frac{o\,y_{\text{prev}} + \alpha x_t}{o+\alpha}, \qquad o = (1-\alpha)^{k+1}.
+\end{equation}
+它是 $y_{\text{prev}}$ 的仿射函数，所以一个日期块把它的初始状态通过一个仿射映射变换出去，而仿射映射的复合满足结合律。每个进程先按股票汇总自己的日期块，再沿进程链传递状态（第 $r$ 个进程从第 $r-1$ 个进程得到自己第一天之前的状态），最后每个进程从正确的初始状态算完自己的日期块。
+\todo{链式传递的代价：$p-1$ 跳；改用 \code{MPI\_Exscan} 只需 $O(\log p)$ 步（后续工作）}
+
+\subsubsection{每日 RankIC 与适应度}
+每日 RankIC 在进程本地计算，因为一天的截面从不被切开。根节点所在的 DAG 层算完后，立即计算它的 RankIC，随后根节点的面板和其他节点一样被释放。每个进程对每个根只保留很小的汇总量（各时间段的和与计数），整批只需一次 \code{MPI\_Allreduce} 就得到全部适应度。
+
+\subsubsection{线程策略与内存}
+\todo{两种策略：(i) 算子内部并行，节点逐个计算，每个算子按天或按股票分给线程；(ii) 按节点并行，一层的各节点分给不同线程，每个节点单线程计算。开发阶段的发现：首次访问的缺页、跨批保留的内存池、每个线程复用的临时数组。}
+
+\subsubsection{通信与负载模型}
+\todo{每层的 halo 字节数和消息数随 $p$ 的变化；ema 链；一次 Allreduce；股票池扩大引起的负载不均}
+
+\subsection{GPU 上的 PCA 签名与相似度}
+\todo{批量抽样排名；批量幂迭代（分布式时 $Rv$ 在本地，$R^\top u$ 每次迭代需要一次长度为 $N$ 的 Allreduce，多个因子合并成一次）；分块相似度 GEMM 与 cuBLAS 对比；串行准入作为串行比例}
+
+\subsection{幂迭代与 Lanczos}
+\todo{两者的收敛速度都取决于奇异值间隔；每次迭代的代价（一次乘 $R$、一次乘 $R^\top$）；Lanczos 基向量的存储；四次幂迭代对准入判定是否足够准确}
+
+\subsection{子表达式 DAG、内存与缓存}
+\label{sec:dag}
+一批表达式通过\emph{哈希合并}（hash-consing）构成一个 DAG。创建节点前，先在哈希表中查找键（算子、窗口、子节点编号）；已有的节点直接复用，因此多个候选共享的子表达式只计算一次。构建时同时做规范化：
+\begin{itemize}[nosep]
+  \item 可交换算子的子节点按编号排序；
+  \item 子节点为 rank 的 rank 直接返回子节点；
+  \item $-$ 和 $\div$ 的两个子节点相同时拒绝整个表达式，并回滚。
+\end{itemize}
+子节点总是先于父节点创建，所以节点数组本身就是拓扑序。每个进程构建完全相同的 DAG，节点编号在各进程间一致，halo 消息不需要额外的描述信息。
+
+每个节点记录\emph{累计回看长度} $h(n) = \ell(n) + \max_{c} h(c)$（滚动窗口 $\ell = w-1$，lag、delta、pct\_change 为 $\ell = k$），以及 \emph{halo 行数} $\max_{\text{父节点 }q} \ell(q)$。每个节点还记录父节点个数；所有父节点都算完后，它的面板归还内存池。
+
+对 $1481$ 个已选因子，把全部表达式合并成一个 DAG 后，$11{,}413$ 个树节点减少为 $4{,}052$ 个不同节点（含叶子）。
+\todo{用红蓝卵石博弈（Lecture 12）描述内存：快存储为内存或显存，慢存储为重新计算或主机内存；一批的峰值内存；宽层分块计算；跨批、跨代缓存}
+
+%======================================================================
+\section{验证}
+\label{sec:validation}
+验证用来证明 C++ 引擎及其并行版本与原 Python 挖掘程序、与串行引擎的计算结果一致。
+
+\paragraph{解析与 DAG。}测试 1531 个表达式：1481 个已选因子，加上覆盖每个算子和每条规范化规则的构造用例。对每个有效表达式，C++ 得到的深度和节点数与 Python 相同；两个表达式在 Python 中规范化键相同，当且仅当它们在 DAG 中共用同一个根。
+
+\paragraph{算子。}在真实数据 $120\times300$ 的样本上（含全部 132 个字段）计算 88 个表达式：每个算子取窗口 1、5、20，若干嵌套表达式，以及 40 个已选因子。用例数由这一设计（算子 $\times$ 窗口，加上嵌套）决定，而不是凑数。每个结果与 pandas 逐元素比较，判据为 $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$，且缺失值位置完全相同。
+\todo{88/88 通过；逐位相同的比例；float32 中间结果问题及其解决}
+
+\paragraph{RankIC、适应度与签名。}\todo{RankIC/适应度 88/88，误差 $\le 10^{-12}$；签名代码 88/88 逐位相同，完整数据端到端 $1-$相似度 $\le 6.9\times10^{-6}$}
+
+\paragraph{分布式与串行。}分布式引擎必须给出与串行引擎相同的候选有效性，fitness 相差不超过 $10^{-5}$。面板不要求逐位相同：滚动和与滚动方差（Kahan 和 Welford）在每个日期块边界重新开始累计，所以一个格子的最后几位可能不同；接近 0 的格子相对误差可能很大，但不会改变任何排序。最多 288 个进程、两种线程策略的结果见第~\ref{sec:v}~节。
+
+%======================================================================
+\section{实验}
+每次运行先 \code{MPI\_Barrier}，再用 \code{MPI\_Wtime} 计时。每个阶段（读数据、算子、halo 交换、ema 扫描、RankIC、等待、归约）取所有进程中的最大值，总时间取最慢进程的墙钟时间。每个配置先预热一次（同时填满内存池，相当于 GP 一代接一代调用引擎的情形），再跑三次取中位数。除非另行说明，批量是 200 个已选因子（752 个 DAG 节点），数据是完整真实数据，$T=1461$ 天、$N=5876$ 只股票。读数据单独报告，因为它取决于共享文件系统。所有图中时间、问题规模和核数都用对数轴。所有运行都只用 Intel Xeon 8452Y 节点，每个作业都记录了所在主机的 CPU 型号。
+
+\subsection{因子计算与评估}
+
+\subsubsection{串行运行时间与问题规模}
+\label{sec:x1}
+一个进程、一个线程。每次只改变一个维度：天数 $T$（真实数据的前缀，50 个因子）、股票数 $N$（前 $N$ 只股票）和批量大小；合成数据把 $T$ 和 $N$ 扩大到真实数据之外（图~\ref{fig:x1}）。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+维度 & 范围 & 总时间（s） & 斜率 \\
+\midrule
+$T$，真实，50 个因子 & 91 -- 1461 & 2.34 -- 34.2 & 0.99 \\
+$N$，真实，50 个因子 & 367 -- 5876 & 2.82 -- 34.1 & 0.93 \\
+$T$，合成 & 1461 -- 11688 & 64.9 -- 610.7 & 1.10 \\
+$N$，合成 & 5876 -- 23504 & 64.8 -- 273.1 & 1.05 \\
+批量大小，真实 & 25 -- 800 & 17.1 -- 525.2 & 0.99 \\
+\bottomrule
+\end{tabular}
+\caption{串行运行时间。斜率是在双对数坐标下对不含读数据的时间拟合得到的。}
+\end{table}
+
+各个维度上运行时间都接近线性，与第~\ref{sec:cost}~节的预测一致：每个节点的算子是 $O(TN)$，RankIC 是 $O(TN\log N)$，其中的 $\log N$ 体现为合成数据上 $N$ 方向的斜率略大。合成面板每个格子比真实数据慢，因为它只有 2\% 的缺失值，而真实数据早年有大量股票缺失。算子和 RankIC 用时大致相同，所以评估并不是计算之外的小开销。时间对批量大小也是线性的：DAG 去掉了重复子表达式，但剩下的节点每个开销差不多。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figures/x1_serial.pdf}
+\caption{串行运行时间随 $T$、$N$ 和批量大小的变化，以及其中的算子和 RankIC 部分。}
+\label{fig:x1}
+\end{figure}
+
+\subsubsection{强扩展（纯 MPI）}
+每个进程一个线程，$H_0=0$；1 到 72 个进程在一个节点上，144 和 288 个进程分别用两个和四个节点。
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+进程数 & 1 & 2 & 4 & 8 & 16 & 36 & 72 & 144 & 288 \\
+节点数 & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 2 & 4 \\
+\midrule
+时间（s） & 136.65 & 74.77 & 40.16 & 21.42 & 11.38 & 6.19 & 3.62 & 2.44 & 2.27 \\
+加速比 & 1 & 1.83 & 3.40 & 6.38 & 12.0 & 22.1 & 37.8 & 55.9 & 60.2 \\
+效率 & 1 & 0.91 & 0.85 & 0.80 & 0.75 & 0.61 & 0.52 & 0.39 & 0.21 \\
+\bottomrule
+\end{tabular}
+\caption{强扩展，真实数据上的 200 个因子。}
+\label{tab:x2}
+\end{table}
+
+算子和 RankIC 大致按 $1/p$ 继续下降（288 个进程时分别为 1.18\,s 和 0.39\,s），但从 16 个进程起，halo 交换加等待一直在 1.5--1.9\,s（图~\ref{fig:x2}）。从 144 到 288 个进程总时间几乎不变。Karp--Flatt 串行比例从两个进程时的 0.09 降到约 0.01，并没有上升，所以损失不是来自不断增大的串行部分，而是逐层交换的固定开销和块之间的不均：日期是等分的，但后面年份的股票更多。用逐进程计时确认负载不均留作后续工作。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figures/x2_strong.pdf}
+\includegraphics[width=0.6\linewidth]{figures/x2_strong_breakdown.pdf}
+\caption{强扩展：时间、加速比、效率和 Karp--Flatt 指标（上）；各阶段时间（下）。}
+\label{fig:x2}
+\end{figure}
+
+\subsubsection{弱扩展（纯 MPI）}
+合成数据，每个进程 64 天（一个进程时 $T=64$，288 个进程时 $T=18432$），$N=5876$，200 个因子。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+进程数 & 1 & 2--16 & 36 & 72 & 144 & 288 \\
+\midrule
+时间（s） & 9.36 & $\approx$11.0 & 12.69 & 13.19 & 12.97 & 13.60 \\
+效率 & 1 & $\approx$0.85 & 0.74 & 0.71 & 0.72 & 0.69 \\
+\bottomrule
+\end{tabular}
+\caption{合成数据上的弱扩展。}
+\end{table}
+
+从一个进程到两个进程的下降来自 halo 交换（约 1.1\,s，之后不变）。16 到 72 个进程之间效率再次下降，这时一个节点被占满，内存带宽被共享；跨两个和四个节点时效率保持在 0.7 左右，说明跨网络增加的开销很小（图~\ref{fig:x3}）。这里用合成数据，是因为真实数据不能随进程数增长；而且合成数据每块工作量相同，可以把通信和负载不均分开。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.45\linewidth]{figures/x3_weak.pdf}
+\includegraphics[width=0.5\linewidth]{figures/x3_weak_breakdown.pdf}
+\caption{弱扩展效率和各阶段时间。}
+\label{fig:x3}
+\end{figure}
+
+\subsubsection{通信分析}
+\paragraph{halo 交换与冗余计算。}纯 MPI 时，把 $H_0$ 从 0 提高到 89 天，halo 数据量从 7.1--8.0\,MB 降到 0.7--0.8\,MB，需要交换的节点从 29 个降到 1 个，代价是每个进程多算 439 行。72、144 和 288 个进程下总时间的变化都小于 2\%（图~\ref{fig:x4} 左）。可见 halo 时间不是传输时间，而是等左邻居算完这一层的时间。混合配置下，$H_0\ge10$ 对 72 进程 $\times$ 4 线程有帮助（1.55\,s 降到 1.38\,s，$-11\%$），对 16 $\times$ 18 没有影响，对 4 $\times$ 72 没有稳定的趋势。
+
+\paragraph{共享内存与网络。}同样的进程数，尽量集中在少数节点或分散到四个节点：36 个进程在一个节点上 6.19\,s，四个节点上 5.44\,s；72 个进程分别为 3.62\,s 和 3.17\,s；144 个进程在两个节点上 2.44\,s，四个节点上 2.41\,s。分散反而更快：多出来的网络通信，比更多进程共享一个节点的内存带宽代价小。
+
+\paragraph{哪部分通信最多。}每一层，每个进程只向需要它尾部行的每个伙伴发一条打包消息；整个批量加起来只有几 MB，与 $p$ 无关。ema 链需要 $p-1$ 次串行传递，但每只股票只传一个摘要。fitness 只需要一次 IC 摘要的 \code{MPI\_Allreduce}，用时不到一毫秒。通信的主要代价是每一层 halo 交换带来的同步，而不是数据量。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figures/x4_comm.pdf}
+\caption{左：纯 MPI（实线）和混合配置（点线）下总时间随 $H_0$ 的变化。中：halo 加等待时间。右：同样进程数集中放置与分散到四个节点。}
+\label{fig:x4}
+\end{figure}
+
+\subsubsection{MPI + OpenMP}
+\paragraph{单个进程。}一个进程、2 到 72 个线程时，按算子并行分别用 70.6、37.5、19.6、10.5、6.13 和 3.82\,s，按节点并行分别用 68.7、35.2、18.4、10.2、6.15 和 4.55\,s。16 个线程以内按节点并行略快，因为不需要为每个算子开一次并行区；72 个线程时按节点并行更慢，因为窄的 DAG 层节点数少于线程数。在一个节点上，72 个线程（3.82\,s）与 72 个进程（3.62\,s）一样快。
+
+\paragraph{288 核。}把四个节点拆成进程 $\times$ 线程（表~\ref{tab:x5}，图~\ref{fig:x5}）。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrrr}
+\toprule
+进程 $\times$ 线程 & 288$\times$1 & 144$\times$2 & 72$\times$4 & 36$\times$8 & 16$\times$18 & 8$\times$36 & 4$\times$72 \\
+\midrule
+按算子（s） & 2.27 & 1.76 & 1.55 & 1.43 & 1.28 & 1.32 & 1.61 \\
+按节点（s） & 2.27 & 1.45 & 1.09 & 1.25 & \textbf{0.98} & 1.06 & 1.44 \\
+\bottomrule
+\end{tabular}
+\caption{288 核在 MPI 进程和 OpenMP 线程之间的拆分。}
+\label{tab:x5}
+\end{table}
+
+最好的配置是 16 个进程 $\times$ 18 个线程（每个 socket 两个进程）加按节点并行：0.98\,s，比同样 288 核的纯 MPI 快 2.3 倍，比单核快 140 倍。更少、更大的块同时减少了交换的进程对数和负载不均，halo 时间从约 0.75\,s 降到 0.05--0.25\,s。36 $\times$ 8 比相邻配置慢（1.43\,s 和 1.25\,s）：每个节点 9 个进程无法均分两个 36 核的 socket，OpenMPI 不能绑定；而这些节点的核编号是交错的（偶数核在一个 socket，奇数核在另一个），所以每个进程的线程落在了两个 socket 上。在每种拆分下按节点并行都更快，因为块更大的进程仍然看到整个批量的 DAG，每层足够宽，线程不会空闲。进程很少时（4 $\times$ 72）又变慢，可能是因为每个进程跨两个 socket，一部分内存访问要在 socket 之间传递。
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figures/x5_hybrid.pdf}
+\caption{左：单个进程使用 OpenMP 线程的加速比。右：288 核拆成进程 $\times$ 线程，两种线程策略。}
+\label{fig:x5}
+\end{figure}
+
+\subsubsection{大规模下的一致性}
+\label{sec:v}
+用第~\ref{sec:validation}~节的判据（候选有效性相同且 $|\Delta\text{fitness}|\le10^{-5}$）比较分布式与串行结果。以下配置全部通过：16 个进程；4 个进程 $\times$ 4 个线程，两种线程策略；4 个进程、$H_0=30$；一个节点上 72 个进程；四个节点上 288 个进程；四个节点上 16 个进程 $\times$ 18 个线程、按节点并行。
+
+\subsection{PCA 签名与相似度}
+
+\subsubsection{串行代价}
+\todo{}
+
+\subsubsection{GPU kernel 与 CPU 对比}
+\todo{}
+
+\subsubsection{MPI + CUDA 扩展性}
+\todo{}
+
+\subsubsection{签名与准入判定的一致性}
+\todo{}
+
+\subsection{幂迭代与 Lanczos}
+
+\subsubsection{精度与迭代次数}
+\todo{}
+
+\subsubsection{计算代价}
+\todo{}
+
+\subsubsection{对准入判定的影响}
+\todo{}
+
+\subsection{DAG、内存与缓存}
+
+\subsubsection{子表达式共享}
+\todo{}
+
+\subsubsection{峰值内存与批量大小}
+\todo{}
+
+\subsubsection{跨代复用}
+\todo{}
+
+\subsubsection{缓存策略}
+\todo{}
+
+%======================================================================
+\section{讨论}
+
+\subsection{各部分如何并行}
+\todo{表：模块 $\times$ 技术（MPI、OpenMP、CUDA）$\times$ 通信量 $\times$ 瓶颈；哪部分通信最多}
+
+\subsection{关于数据的结论}
+\todo{股票池扩大与负载不均；已选因子的 RankIC 分布；float32 对排序的影响}
+
+\subsection{后续工作}
+\todo{异步稳态 GP；CPU 与 GPU 重叠工作；移民提前计算，不必等一代的 PCA 完成；ema 改用 \code{MPI\_Exscan}；按工作量加权切块；逐元素算子融合}
+
+%======================================================================
+\section{结论}
+\todo{}
+
+\section*{AI 工具的使用}
+\todo{如实说明 AI 助手的使用方式，例如设计讨论、代码起草与审查，以及如何验证结果。}
+
+\appendix
+\section{代码结构、编译与运行}
+\todo{目录结构}
+\begin{lstlisting}
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+cmake -S . -B build_vanda -DGPE_ENABLE_MPI=ON
+cmake --build build_vanda -j
+qsub scripts/vanda/build_test.pbs      # 编译与验证测试
+bash scripts/vanda/submit.sh           # 实验作业
+python python/scripts/plot_vanda.py <csv_dir> <figure_dir>
+\end{lstlisting}
+
+\end{document}

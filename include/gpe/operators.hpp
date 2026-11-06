@@ -31,7 +31,8 @@ void apply_op(Op op, int window, const Panel& a, const Panel* b, Panel& out, int
               const EmaState* ema = nullptr);
 
 // Time spent in apply_op per operator since the last reset, in this process
-// (profiling). Indexed by static_cast<int>(Op).
+// (profiling). Indexed by static_cast<int>(Op). With ThreadMode::Node the
+// seconds of nodes running at once are summed (thread time, not wall time).
 struct OpStat {
     double seconds = 0.0;
     long calls = 0;

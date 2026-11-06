@@ -1,0 +1,17 @@
+#!/bin/bash
+# Two nodes (144 cores): strong and weak scaling at 144 ranks and the H0 scan.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_2node
+#PBS -j oe
+#PBS -l walltime=02:00:00
+#PBS -l select=2:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+source scripts/vanda/env.sh
+S="--exprs 200 --warmup 1 --repeat 3"
+
+bench 144 1 2 $S --csv $OUT/x2_strong.csv --label strong
+bench 144 1 2 $S --synthetic $((64 * 144)) --csv $OUT/x3_weak.csv --label weak
+for H in 0 10 30 60 89; do bench 144 1 2 $S --H0 $H --csv $OUT/x4_comm.csv --label h0_scan; done
+echo DONE

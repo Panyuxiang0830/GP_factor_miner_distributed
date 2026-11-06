@@ -1,0 +1,17 @@
+#!/bin/bash
+#PBS -N gpe_36x8
+#PBS -P personal-panyuxiang
+#PBS -l select=4:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+#PBS -l walltime=00:30:00
+#PBS -j oe
+# Rerun of the 36 ranks x 8 threads hybrid point (9 ranks per node straddle
+# the two sockets, so they are left unbound; see placement() in env.sh).
+cd "$PBS_O_WORKDIR"
+OUT=/scratch/$USER/gp_runs/20261104
+source scripts/vanda/env.sh
+lscpu | grep -E "NUMA node[0-9] CPU"
+for m in op node; do
+    OMP_DISPLAY_AFFINITY=true bench 36 8 4 --exprs 200 --warmup 1 --repeat 3 --threads $m --csv "$OUT/x5_hybrid.csv" --label hybrid
+done
+echo DONE

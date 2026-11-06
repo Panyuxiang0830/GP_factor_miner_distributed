@@ -1,0 +1,36 @@
+#!/bin/bash
+# Build on a Vanda compute node, run the validation tests and check that the
+# rank/thread placement used by the experiment scripts works.
+#   qsub scripts/vanda/build_test.pbs      (from the repository root)
+#PBS -q auto_free
+#PBS -N gpe_build_test
+#PBS -j oe
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=16:ompthreads=1:mem=64gb
+
+set -eo pipefail
+cd "$PBS_O_WORKDIR"
+source scripts/vanda/env.sh
+
+echo "== node $(hostname), $(nproc --all) cpus"
+lscpu | grep -E "Model name|Socket|Core|NUMA node\(s\)"
+
+cmake -S . -B "$BIN" -DGPE_ENABLE_MPI=ON -DGPE_REF_DIR="$DATA/GP_distributed/ref_sample_120x300"
+cmake --build "$BIN" -j 16
+
+echo "== unit and sample reference tests"
+(cd "$BIN" && ctest --output-on-failure)
+
+echo "== PCA signature reference on the full panel"
+"$BIN/test_ops_reference" "$DATA/GP_distributed/ref_sig_full"
+
+echo "== placement"
+mpirun -np 4 --map-by ppr:4:node:PE=4 --bind-to core --report-bindings true 2>&1 | head -8
+
+echo "== synthetic data smoke run"
+bench 4 1 1 --synthetic 256 --stocks 1000 --exprs 50 --repeat 1 --warmup 0
+
+echo "== distributed vs serial, 200 factors"
+consistency 16 1 1 0 200 op
+consistency 4 4 1 0 200 node
+consistency 4 4 1 30 200 op

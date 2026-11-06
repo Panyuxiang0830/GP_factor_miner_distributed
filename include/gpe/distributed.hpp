@@ -25,7 +25,7 @@ struct MpiTiming {
     double compute = 0.0;  // operators, including ema block summaries
     double halo = 0.0;     // halo messages per level (includes waiting for the neighbours)
     double scan = 0.0;     // ema state chain
-    double metrics = 0.0;  // daily RankIC and IC summaries
+    double metrics = 0.0;  // target ranks, daily RankIC and IC summaries of the roots
     double wait = 0.0;     // barrier before the reduction: load imbalance
     double reduce = 0.0;   // MPI_Allreduce of the IC summaries
     double total = 0.0;
@@ -33,6 +33,14 @@ struct MpiTiming {
     int halo_messages = 0;    // number of non-empty halo sends
     long redundant_rows = 0;  // history rows computed redundantly, summed over nodes (x N cells)
 };
+
+// How OpenMP threads share the work of one level.
+//   Operator: nodes one after another; each operator splits its days or stocks
+//             over the threads (see operators.cpp).
+//   Node:     the nodes of a level (and the RankIC of its roots) are spread over
+//             the threads; each runs single-threaded, as nested parallel
+//             regions are inactive.
+enum class ThreadMode { Operator, Node };
 
 struct MpiBatchResult {
     DateBlock block;
@@ -48,6 +56,7 @@ struct MpiOptions {
     FitnessConfig fitness;
     int H0 = 0;               // redundant-computation budget, see halo_plan.hpp
     bool keep_roots = false;  // return root panels and daily ICs (tests)
+    ThreadMode threads = ThreadMode::Operator;
     // Reuses panel memory across batches (one GP generation after another);
     // without it each batch starts from an empty pool.
     BufferPool* pool = nullptr;
@@ -66,7 +75,10 @@ struct MpiOptions {
 //     rank also receives from ranks further left;
 //   - leaves read their history directly from the panel files;
 //   - ema nodes use the scan in ema_scan.hpp.
-// Daily RankIC is local; one MPI_Allreduce of IcSummary gives the fitness.
+// Daily RankIC is local and computed as soon as a root's level is done; the
+// root's panel is then released like any other node once its parents are
+// computed (kept to the end only with keep_roots). One MPI_Allreduce of the
+// IcSummary of all roots gives the fitness.
 MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm comm,
                                   const MpiOptions& options = {});
 
