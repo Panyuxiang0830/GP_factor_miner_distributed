@@ -7,7 +7,6 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{graphicx}
-\usepackage{float}
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{hyperref}
@@ -59,15 +58,6 @@ Karp--Flatt metric & experimentally determined serial fraction \\
 %======================================================================
 \section{Background and algorithm}
 
-\subsection{What the miner does}
-\paragraph{Factors in quantitative stock selection.} A quantitative equity strategy ranks thousands of stocks every day and buys the ones it expects to outperform. The ranking is built from \emph{factors}: formulas that turn raw market data (prices, volumes, money flows, intraday statistics) into one score per stock per day, such as ``10-day average of volume divided by amount''. A factor is valuable when its daily ranking of stocks agrees with the ranking of their future returns. Practitioners combine many such factors in a multi-factor model, so the goal is not one good formula but a large library of good and mutually different ones.
-
-\paragraph{Why genetic programming.} Hand-crafting factors is slow and limited by the researcher's ideas. Every factor is an expression tree over raw fields and a small set of operators, so factor discovery can be posed as a search over trees. The space is combinatorial (Section~\ref{sec:space}: about $10^{12}$ trees of depth 2 and $10^{20}$ of depth 3), the objective is computed by evaluating the formula on years of data and is neither smooth nor differentiable, and the result must remain a readable formula. Genetic programming (GP) fits these constraints: it keeps a population of expression trees, selects the fitter ones, and creates new trees by exchanging and mutating subtrees. Its cost is that every generation evaluates thousands of new expressions on the full panel data, which is the workload we parallelise.
-
-\paragraph{Why measure the correlation between factors.} GP readily produces many variants of the same idea, e.g.\ the same signal with a window of 10 or 15 days, or wrapped in a rank. Such near-duplicates score well individually but add almost no information to a multi-factor model, and they crowd out genuinely new ideas in the population. The miner therefore keeps a \emph{diversity archive} (quality-diversity, QD): a new factor is admitted only if it is not too correlated with any archived factor. Correlating full panels pair by pair would cost $O(TN)$ per pair for thousands of candidates against thousands of archived factors, so each factor is compressed by a principal-component (PCA) step into a short signature vector, and similarity is measured between signatures (Section~\ref{sec:pcaqd}).
-
-\paragraph{The workload.} One GP generation therefore consists of (i) computing a batch of new factor panels from the raw data, (ii) evaluating each against future returns (daily RankIC and fitness), (iii) computing PCA signatures and their similarity to the archive, and (iv) admitting candidates one by one. Steps (i)--(ii) are the factor computation and evaluation part, parallelised with MPI + OpenMP; step (iii) is the PCA part, parallelised on GPUs.
-
 \subsection{Factors and RankIC}
 Every raw field is a panel $X\in\mathbb{R}^{T\times N}$ (days $\times$ stocks). A factor $F$ is computed from raw panels by an expression tree, for example $\mathrm{mean}(\text{volume}/\text{amount}, 10)$. A factor is useful if, on each day, the ranking of stocks by the factor predicts the ranking of their future returns $Y$. Its quality on day $t$ is
 \begin{equation}
@@ -84,22 +74,7 @@ Leaves are raw fields. Window lengths are taken from $\{1,5,10,15,20,30,60\}$. T
   \item pairwise rolling: correlation, beta.
 \end{itemize}
 Expressions are normalised: commutative operands are ordered, $\mathrm{rank}(\mathrm{rank}(x))=\mathrm{rank}(x)$, and $x-x$, $x/x$ are rejected. Trees have at most 11 nodes.
-
-\label{sec:space}
-The depth of a tree is the number of operators on its longest path (a raw field has depth 0). With 132 fields there are 74 single-input choices (4 operators without a window, 10 rolling operators $\times$ 7 windows) and 18 two-input choices (4 arithmetic operators, 2 pairwise rolling operators $\times$ 7 windows). Counting trees with at most 11 nodes, before normalisation removes equivalent forms:
-
-\begin{center}
-\begin{tabular}{lr}
-\toprule
-depth & number of distinct trees \\
-\midrule
-1 & $3.2\times10^{5}$ \\
-2 & $1.9\times10^{12}$ \\
-3 & $5.4\times10^{20}$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-A stage of the GP evaluates about $10^5$ expressions (10 generations of 10{,}000), so exhaustive search is impossible beyond depth 1 and the evaluation of each generation is the cost to reduce.
+\todo{size of the search space by depth}
 
 \subsection{Fitness}
 \label{sec:fitness}
@@ -119,7 +94,6 @@ Evolution runs in three stages, with maximum tree depth $1$, $2$ and $3$. Each s
 \end{itemize}
 
 \subsection{PCA-QD diversity archive}
-\label{sec:pcaqd}
 Many candidates are near-duplicates of each other. Comparing full factor panels pairwise costs $O(TN)$ per pair, which is prohibitive for thousands of candidates against thousands of archived factors. Each candidate is therefore compressed into a short signature:
 \begin{enumerate}[nosep]
   \item take every 5th day and its cross-sectional percentile ranks (missing values set to $0.5$), and centre each row, giving $R\in\mathbb{R}^{T_s\times N}$;
@@ -130,14 +104,7 @@ A candidate enters the archive if its $|$correlation$|$ with every archived sign
 
 \subsection{Cost of each part}
 \label{sec:cost}
-For one expression on $T$ days and $N$ stocks:
-\begin{itemize}[nosep]
-  \item each operator node costs $O(TN)$: element-wise and sliding-window updates are constant work per cell, except the rolling median, which keeps a sorted window and costs $O(TNw)$ with $w\le60$;
-  \item the daily RankIC sorts every day's cross-section, $O(TN\log N)$;
-  \item the signature ranks $T_s=T/5$ sampled days, $O(T_s N\log N)$, and runs $k=4$ power iterations, $O(T_s N k)$;
-  \item the similarity of $C$ candidates against $A$ archived signatures of length $T_s$ costs $O(C\,A\,T_s)$.
-\end{itemize}
-A batch of $E$ expressions costs $O(E\,TN\log N)$ in total. The run time should therefore grow linearly in $T$ and in the batch size and slightly faster than linearly in $N$; Section~\ref{sec:x1} compares these slopes with measurements.
+\todo{per expression: operators $O(TN)$ per node (median $O(TNw)$); RankIC $O(TN\log N)$; signature $O(T_s N k)$ for $k$ iterations; similarity $O(C\,A\,T_s)$ for $C$ candidates and $A$ archived signatures. These are the slopes compared with measurements in Section~\ref{sec:x1}.}
 
 \subsection{The original implementation and its bottlenecks}
 The Python engine evaluates each expression independently in a pool of 32 processes:
@@ -153,21 +120,7 @@ A previous run selected $1481$ factors, with mean out-of-sample $|\mathrm{RankIC
 
 \subsection{Real data}
 The raw data are daily panels of 132 numeric fields for Chinese A-shares; part of the fields are aggregated from minute-frequency data to daily frequency. The label is a forward-return panel, masked to tradable, non-ST stocks. The evolution period (2016--2021) has $T=1461$ trading days and $N=5876$ stocks. The number of stocks with data grows from 2636 at the start of 2016 to 4845 at the end of 2021. Panels are exported once to raw little-endian float32 files in date-major layout (element $t\cdot N+s$), about $34$\,MB per field and $4.3$\,GB in total. The export reuses the original cleaning code, so the C++ engine sees exactly the values the Python miner sees.
-The 132 fields fall into five groups:
-\begin{center}
-\begin{tabular}{lrp{0.62\linewidth}}
-\toprule
-group & fields & examples \\
-\midrule
-daily quotes & 10 & open, high, low, close, vwap, vol, amount, pct\_chg, turnover\_rate, total\_share \\
-price limits & 3 & limit\_up\_price, limit\_down\_price, limit\_status \\
-market identifier & 1 & mkt \\
-money flow & 18 & buy/sell amount and volume by order size (small, medium, large, extra large), net flow \\
-minute-derived & 100 & intraday return moments and quantiles, realised and up/down volatility, jump variation, morning/afternoon and opening/closing returns, volume concentration, candle shape, VWAP deviation, return autocorrelation \\
-\bottomrule
-\end{tabular}
-\end{center}
-The 100 minute-derived fields are computed from each stock's one-minute bars of the day and aggregated to one value per day.
+\todo{list of field groups}
 
 \subsection{Synthetic data}
 Weak scaling needs a problem that grows with the number of ranks: with 64 days per rank, 288 ranks need $18{,}432$ days, far more than the 1461 real days. Synthetic panels are generated on demand, so a rank produces only its own rows. Every cell depends only on (seed, field, global day, stock), so results do not depend on the number of ranks:
@@ -207,9 +160,9 @@ A panel is stored as a contiguous float32 array in date-major order, together wi
   \item cross-sectional operators (rank, z-score) process one day (one row) at a time, split over days with dynamic scheduling;
   \item rolling operators process one stock (one column) at a time with $O(T)$ sliding-window updates, split over stocks; each thread copies the column into its own scratch array, computes, and writes back.
 \end{itemize}
-In the date-major layout a stock's history is a column with stride $N$ floats ($23.5$\,KB), so reading it touches one cache line per day for only four useful bytes. This is acceptable for two reasons. First, the loop over stocks uses a static schedule, so each thread processes a contiguous range of stocks: the $T$ cache lines loaded for one column ($T\times64$\,B $\approx 93$\,KB for the full period, less per rank) stay in the 2\,MB per-core L2 cache and serve the next 15 columns. Second, the gather is $O(T)$ per column, while the window kernels that follow do considerably more work per element (Kahan compensation, deque updates, sorted windows for the median), so the copy is a small part of the operator time. Storing panels stock-major instead would make the cross-sectional operators and the daily RankIC strided, and those are at least as expensive.
+\todo{strided column access and why it is acceptable on the CPU}
 
-\subsubsection{Calibrating floating-point differences}
+\subsubsection{Reproducing pandas exactly}
 Small differences in floating-point rounding can change which windows look constant, and hence whether a correlation is finite, so we port the pandas~3.0.3 window kernels rather than textbook formulas.
 \begin{itemize}[nosep]
   \item Rolling sums and means use Kahan summation with separate compensations for additions and removals. When the last $n_{obs}$ observations are identical, the repeated value is returned exactly.
@@ -237,39 +190,16 @@ The exponential moving average follows pandas' \code{adjust=False} recursion wit
   y_t = \frac{o\,y_{\text{prev}} + \alpha x_t}{o+\alpha}, \qquad o = (1-\alpha)^{k+1}.
 \end{equation}
 This is an affine function of $y_{\text{prev}}$, so a block of days maps its initial state through an affine map, and affine maps compose associatively. Each rank summarises its block per stock; the states are then passed along the ranks in a chain (rank $r$ receives the state at its first day from rank $r-1$), and each rank runs its block from the correct initial state.
-The chain takes $p-1$ sequential hops per level that contains an ema, each carrying two numbers per stock. Rank $r$ cannot start its ema until all ranks to its left have finished theirs, so the measured scan time includes this waiting: it is 0.13\,s at 72 ranks and 0.58\,s at 288 ranks.
+\todo{cost of the chain: $p-1$ hops; an \code{MPI\_Exscan} would need $O(\log p)$ steps (future work)}
 
 \subsubsection{Daily RankIC and fitness}
 Daily RankIC is local to a rank, because a day's cross-section is never split. A root's RankIC is computed as soon as its DAG level is done, and the root's panel is then released like any other node. Each rank keeps only a small summary per root (segment sums and counts), and one \code{MPI\_Allreduce} of all summaries gives the fitness of the whole batch.
 
 \subsubsection{Thread strategies and memory}
-Inside a rank we implement two thread strategies, selected at run time:
-\begin{itemize}[nosep]
-  \item \textbf{operator-level:} the nodes of a level are computed one after another, and each operator is split over days or stocks as in Section~\ref{sec:operators};
-  \item \textbf{node-level:} the nodes of a level are distributed over the threads (\code{schedule(dynamic,1)}), and each node is computed by one thread. Nested parallel regions are disabled, so the operators run serially inside a thread.
-\end{itemize}
-Operator-level threading parallelises every node, including the narrow top levels of the DAG, but opens a parallel region per operator. Node-level threading has no per-operator overhead and keeps each node's data in one core's cache, but leaves threads idle when a level has fewer nodes than threads.
-
-Threads only read shared input panels and write their own output panels, so no locks are needed on the data. The buffer pool and the per-operator timers are the only shared mutable state: output buffers are taken from the pool in a serial pass before the parallel loop, and the timers are updated in a critical section. The contention that remains is for memory bandwidth and cache capacity.
-
-Memory handling went through three problems, each found by timing every operator separately on an earlier 32-core development server:
-\begin{itemize}[nosep]
-  \item \textbf{Page faults on fresh memory.} At first every node allocated a new panel. The operating system only maps physical pages when they are first written, and it zeroes each page at that moment. With 32 threads writing new panels at once, these page faults queued in the kernel and took about 45\% of the compute phase, outside the operators themselves.
-  \item \textbf{Fix: a buffer pool.} Instead of returning a released panel to the operating system, the engine keeps the buffer, whose pages are already mapped, in a pool, and the next node that needs a panel takes the smallest pooled buffer that fits. Nothing is copied or moved; the memory simply stays allocated in RAM. The pool lives as long as the engine object, so it carries over from one batch to the next, as in a GP run where the engine is called generation after generation. Only the very first batch still pays for page faults, and the benchmark's warm-up run absorbs that. The pool doubled the single-rank 32-thread speed-up (10.9 to 19.9) and removed run-to-run variation of up to 50\%.
-  \item \textbf{Per-thread scratch arrays.} A rolling correlation used to allocate about 13 temporary arrays per stock, and many threads allocating at once contend inside the allocator. Each thread now allocates them once and reuses them for every stock, which cut 32-thread time by another 8\%.
-\end{itemize}
+\todo{two strategies: (i) operator-level, nodes one after another and each operator split over days or stocks; (ii) node-level, the nodes of one level spread over the threads, each single-threaded. Development findings: first-touch page faults, buffer pool kept across batches, per-thread scratch arrays.}
 
 \subsubsection{Communication and load model}
-For $p$ ranks and a batch with exchanged node set $\mathcal{X}$:
-\begin{itemize}[nosep]
-  \item \textbf{Halo volume.} Each rank sends, for each exchanged node $n\in\mathcal{X}$, its last $\mathrm{halo}(n)$ rows of $N$ floats, i.e.\ $4N\sum_{n\in\mathcal{X}}\mathrm{halo}(n)$ bytes per rank, independent of $p$. For the 200-factor batch this is 29 nodes and about 7.1\,MB per rank.
-  \item \textbf{Messages.} One packed message per partner per level. While a block is longer than the longest halo, the only partner is the left neighbour; the measured maximum is 2 messages per rank for the whole batch up to 36 ranks. When $T/p$ drops below the halo, rows come from several ranks, and the maximum rises to 3, 5 and 10 messages at 72, 144 and 288 ranks.
-  \item \textbf{ema chain.} $p-1$ sequential hops per ema level, two numbers per stock each (Section~\ref{sec:ema}).
-  \item \textbf{Fitness.} One \code{MPI\_Allreduce} of a short summary vector per root (segment sums and counts), under 0.5\,ms at 288 ranks.
-\end{itemize}
-Per rank, computation shrinks as $1/p$ while the halo volume stays constant and the chain grows with $p$, so communication dominates at large $p$. In practice the synchronisation matters more than the volume: a rank cannot finish a level before it has received its left neighbour's rows for that level.
-
-\textbf{Load balance.} Blocks have equal numbers of days, but not equal work. Rolling and element-wise operators process all $N$ columns, but ranking and RankIC sort only the stocks with data, whose number grows from 2636 in 2016 to 4845 in 2021. The last block's cross-sectional work is therefore up to $1.8\times$ the first block's, and the earlier ranks wait for it at every halo exchange and at the final reduction. Synthetic data have a constant number of stocks and isolate this effect.
+\todo{halo bytes and messages per level as a function of $p$; ema chain; one Allreduce; load imbalance from the growing stock universe}
 
 \subsection{PCA signatures and similarity on the GPU}
 \todo{batched sampled ranking; batched power iteration (distributed: $Rv$ is local, $R^\top u$ needs one Allreduce of a length-$N$ vector per iteration, batched over factors); tiled similarity GEMM vs cuBLAS; sequential admission as the serial fraction}
@@ -302,25 +232,20 @@ The S5 JSON proposal provides dataset/date/asset/semantic identity, node definit
 %======================================================================
 \section{Validation}
 \label{sec:validation}
-A faster engine is only useful if it computes the same numbers. We had a ready-made reference for this. An earlier full run of the original Python miner produced a factor library of 1481 factors, and Python had already computed their values, daily RankIC and fitness. Validation therefore means asking the C++ engine to compute the same things again and comparing them with Python's results item by item.
+Validation shows that the C++ engine and its parallel versions compute the same results as the original Python miner and as the serial engine.
 
-\paragraph{Parsing and DAG.} We first checked that C++ reads expressions the way Python does. We parsed all 1481 library expressions plus 50 hand-written ones (at least one for every operator and every normalisation rule), 1531 in total, on both sides. Every valid expression gets the same depth and node count, and two expressions that Python considers equivalent (same normalised key) end up on the same DAG root in C++.
+\paragraph{Parsing and DAG.} We test 1531 expressions: the 1481 selected factors plus crafted cases for every operator and normalisation rule. For every valid expression, the C++ engine reproduces the Python depth and node count, and two expressions share a DAG root exactly when Python gives them the same normalised key.
 
-\paragraph{Operators.} Comparing every cell of the full data would be slow, so we cut a sample of 120 days $\times$ 300 stocks from the real data, keeping all 132 fields, and evaluated 88 expressions on it. The first 48 test single operators, each with windows 1, 5 and 20, plus a few nested combinations; the other 40 are taken from the factor library, to check that operators still agree when combined as in real factors. The number of cases follows from this design, not from a target. A cell passes if $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and missing values are in the same places; the absolute term is there because pandas itself computes a few operators in float32.
+\paragraph{Operators.} We evaluate 88 expressions on a $120\times300$ sample of the real data with all 132 fields: every operator with windows 1, 5 and 20, several nested expressions, and 40 selected factors. The number of cases follows from this design (operator $\times$ window, plus nesting), not from a target count. Each result is compared with the pandas output element by element, using $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and an identical pattern of missing values.
+\todo{88/88 pass; bit-identical share; the float32 intermediate issue and how it was resolved}
 
-With textbook sliding-window formulas only 53 of the 88 cases passed. Every failure came from rounding: a tiny rounding difference decides whether a window counts as constant, and that decides whether a correlation is finite, missing or infinite. After porting the pandas~3.0.3 window kernels line by line (Section~\ref{sec:operators}) and treating windows that are constant within their range consistently, all 88 cases pass, with missing and infinite values in exactly the same places.
+\paragraph{RankIC, fitness and signatures.} \todo{88/88 RankIC/fitness to $10^{-12}$; signatures 88/88 code-identical, end-to-end $1-$similarity $\le 6.9\times10^{-6}$ on the full data}
 
-\paragraph{RankIC, fitness and signatures.} Here two kinds of difference have to be told apart: a bug in the code, and rounding caused by storing panels in float32. We therefore compared everything twice. First we gave C++ pandas' own factor values, rounded to float32, so both sides had identical input and only the code was tested. The daily RankIC agreed in 88/88 cases (largest difference $8.9\times10^{-16}$), the fitness in 88/88 ($8.3\times10^{-17}$), and the PCA signature was bit-identical to Python's in 88/88. Then we let C++ compute everything from the raw data. 63 of 88 cases matched Python exactly; for the rest the daily IC differed by at most $1.5\times10^{-4}$ and the fitness by at most $2.4\times10^{-5}$, and whether a factor is accepted agreed in all 88. These differences come from float32: two distinct float64 values can round to the same float32 and create a tie in the ranking. When we rounded pandas' own factor values to float32 and recomputed the IC in Python, we got exactly the same differences as C++, so the cause is storage precision, not the code. Signatures were also compared end to end on the full data ($1461\times5876$): $1-$similarity was at most $6.9\times10^{-6}$, tiny next to the 0.9 correlation threshold used for admission.
-
-Small hand-computed unit tests cover the corner cases that real data rarely hit: ties, perfectly positive and negative correlation, constant cross-sections, the segment split, the sign-consistency penalty and the three rejection rules. The ema scan is checked bit for bit against the serial ema for several block splits, missing-value patterns and spans.
-
-\paragraph{DAG-tool checks.} The separate planner suite has 17 passing tests on synthetic expressions, including all operator classes against the C++ DAG, shared roots, repeated edges, zero/full cache budgets, hit-subtree pruning, fixed-trace Belady against exhaustive short sequences, trace ordering and invalid execution plans. The random-batch comparisons agree at every measured prefix. These structural tests do not execute factor values; the small numerical formula-chunk check is reported in Section~\ref{sec:dag-exp}.
-
-\paragraph{Distributed against serial.} The distributed engine is compared with our own serial engine rather than with Python. It must give the same validity for every candidate and fitness within $10^{-5}$. We do not require bit-identical panels: rolling sums and variances restart at every block boundary, so the last bits of a cell can differ, and a cell close to zero can differ by a large relative amount without changing any ranking. In the runs where we counted them (up to 32 ranks), more than 99.998\% of cells were bit-identical. Results for up to 288 ranks and both thread strategies are in Section~\ref{sec:v}.
+\paragraph{Distributed against serial.} The distributed engine must give the same candidate validity as the serial engine and fitness within $10^{-5}$. Panels are not required to be bit-identical: rolling sums and variances (Kahan and Welford) restart at every block boundary, so a cell can differ in the last bits, and a near-zero cell can differ by a large relative amount without changing any ranking. Results for up to 288 ranks and both thread strategies are in Section~\ref{sec:v}.
 
 %======================================================================
 \section{Experiments}
-The factor-engine scaling runs are timed with \code{MPI\_Barrier} followed by \code{MPI\_Wtime}. Each phase (loading, operators, halo exchange, ema scan, RankIC, waiting, reduction) is the maximum over ranks, and the total is the slowest rank's wall time. Each configuration runs once to warm up (which also fills the buffer pool, as in a GP run where the engine is called generation after generation) and then three times; we report the median. Unless stated otherwise the batch has 200 selected factors (752 DAG nodes) on the full real data, $T=1461$ days and $N=5876$ stocks. Loading is reported separately because it depends on the shared file system. Engine-scaling plots use logarithmic axes for time, problem size and core count. Those runs used Intel Xeon 8452Y nodes only; each job records the CPU model of its hosts.
+Every run is timed with \code{MPI\_Barrier} followed by \code{MPI\_Wtime}. Each phase (loading, operators, halo exchange, ema scan, RankIC, waiting, reduction) is the maximum over ranks, and the total is the slowest rank's wall time. Each configuration runs once to warm up (which also fills the buffer pool, as in a GP run where the engine is called generation after generation) and then three times; we report the median. Unless stated otherwise the batch has 200 selected factors (752 DAG nodes) on the full real data, $T=1461$ days and $N=5876$ stocks. Loading is reported separately because it depends on the shared file system. All plots use logarithmic axes for time, problem size and core count. Runs used Intel Xeon 8452Y nodes only; each job records the CPU model of its hosts.
 
 \subsection{Factor computation and evaluation}
 
@@ -328,7 +253,7 @@ The factor-engine scaling runs are timed with \code{MPI\_Barrier} followed by \c
 \label{sec:x1}
 One rank and one thread. We vary one dimension at a time: the number of days $T$ (prefixes of the real data, 50 factors), the number of stocks $N$ (the first $N$ stocks), and the batch size; synthetic data extend $T$ and $N$ beyond the real data (Figure~\ref{fig:x1}).
 
-\begin{table}[H]
+\begin{table}[h]
 \centering
 \begin{tabular}{lrrr}
 \toprule
@@ -346,7 +271,7 @@ batch size, real & 25 -- 800 & 17.1 -- 525.2 & 0.99 \\
 
 The run time is close to linear in every dimension, as Section~\ref{sec:cost} predicts: operators are $O(TN)$ per node and RankIC is $O(TN\log N)$, whose $\log N$ factor shows up as the slightly larger slope in $N$ on synthetic data. The synthetic panels are slower per cell than the real ones because only 2\% of their cells are missing, while the real data have many missing stocks in early years. Operators and RankIC take about the same time, so evaluation is not a small add-on to computation. The time is also linear in the batch size: the DAG removes repeated subexpressions, but the remaining nodes cost about the same each.
 
-\begin{figure}[H]
+\begin{figure}[h]
 \centering
 \includegraphics[width=\linewidth]{figures/x1_serial.pdf}
 \caption{Serial run time against $T$, $N$ and batch size, with the operator and RankIC parts.}
@@ -356,7 +281,7 @@ The run time is close to linear in every dimension, as Section~\ref{sec:cost} pr
 \subsubsection{Strong scaling (pure MPI)}
 One thread per rank, $H_0=0$, 1 to 72 ranks on one node and 144 and 288 ranks on two and four nodes.
 
-\begin{table}[H]
+\begin{table}[h]
 \centering
 \small
 \begin{tabular}{lrrrrrrrrr}
@@ -375,7 +300,7 @@ efficiency & 1 & 0.91 & 0.85 & 0.80 & 0.75 & 0.61 & 0.52 & 0.39 & 0.21 \\
 
 Operators and RankIC keep falling roughly as $1/p$ (at 288 ranks: 1.18\,s and 0.39\,s), but halo exchange plus waiting stays at 1.5--1.9\,s from 16 ranks on (Figure~\ref{fig:x2}). From 144 to 288 ranks the total time barely changes. The Karp--Flatt serial fraction falls from 0.09 at two ranks to about 0.01 and does not grow, so the loss is not a growing serial part but the fixed cost of the level-by-level exchange and of uneven blocks: the dates are split evenly, but later years have more stocks. Per-rank timing to confirm the imbalance is future work.
 
-\begin{figure}[H]
+\begin{figure}[h]
 \centering
 \includegraphics[width=\linewidth]{figures/x2_strong.pdf}
 \includegraphics[width=0.6\linewidth]{figures/x2_strong_breakdown.pdf}
@@ -386,7 +311,7 @@ Operators and RankIC keep falling roughly as $1/p$ (at 288 ranks: 1.18\,s and 0.
 \subsubsection{Weak scaling (pure MPI)}
 Synthetic data with 64 days per rank (from $T=64$ at one rank to $T=18432$ at 288 ranks), $N=5876$, 200 factors.
 
-\begin{table}[H]
+\begin{table}[h]
 \centering
 \begin{tabular}{lrrrrrr}
 \toprule
@@ -401,7 +326,7 @@ efficiency & 1 & $\approx$0.85 & 0.74 & 0.71 & 0.72 & 0.69 \\
 
 The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant). The efficiency falls again between 16 and 72 ranks, when one node is filled and its memory bandwidth is shared, and stays at about 0.7 across two and four nodes, so crossing the network adds little (Figure~\ref{fig:x3}). Synthetic data are used here because the real data cannot grow with the number of ranks; their blocks also have equal work, which separates communication from imbalance.
 
-\begin{figure}[H]
+\begin{figure}[h]
 \centering
 \includegraphics[width=0.45\linewidth]{figures/x3_weak.pdf}
 \includegraphics[width=0.5\linewidth]{figures/x3_weak_breakdown.pdf}
@@ -416,7 +341,7 @@ The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant
 
 \paragraph{Which parts communicate most.} Per level each rank sends one packed message to each partner that needs its tail rows; over a batch this is a few megabytes, independent of $p$. The ema chain needs $p-1$ sequential hops but carries only one summary per stock. The fitness needs a single \code{MPI\_Allreduce} of the IC summaries, which takes less than a millisecond. The dominant communication cost is the synchronisation of the halo exchange at every level, not its volume.
 
-\begin{figure}[H]
+\begin{figure}[h]
 \centering
 \includegraphics[width=\linewidth]{figures/x4_comm.pdf}
 \caption{Left: total time against $H_0$ for pure MPI (solid) and hybrid splits (dotted). Middle: halo plus waiting time. Right: the same rank count packed and spread over four nodes.}
@@ -428,7 +353,7 @@ The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant
 
 \paragraph{288 cores.} We split four nodes into ranks $\times$ threads (Table~\ref{tab:x5}, Figure~\ref{fig:x5}).
 
-\begin{table}[H]
+\begin{table}[h]
 \centering
 \begin{tabular}{lrrrrrrr}
 \toprule
@@ -444,7 +369,7 @@ node-level (s) & 2.27 & 1.45 & 1.09 & 1.25 & \textbf{0.98} & 1.06 & 1.44 \\
 
 The best configuration is 16 ranks $\times$ 18 threads (two ranks per socket) with node-level threads: 0.98\,s, 2.3 times faster than pure MPI on the same 288 cores and 140 times faster than one core. Fewer, larger blocks reduce both the number of exchanging pairs and the imbalance, and the halo time falls from about 0.75\,s to 0.05--0.25\,s. The 36 $\times$ 8 split is slower than its neighbours (1.43\,s and 1.25\,s): nine ranks per node cannot divide two sockets of 36 cores, so OpenMPI cannot bind them, and with the interleaved core numbering of these nodes (even cores on one socket, odd on the other) each rank's threads ended up on both sockets. Within a rank, node-level threading wins on every split, because a rank with a larger block still sees the whole batch DAG and the levels are wide enough to keep the threads busy. Very few ranks (4 $\times$ 72) lose again, probably because each rank spans two sockets and part of its memory traffic crosses between them.
 
-\begin{figure}[H]
+\begin{figure}[h]
 \centering
 \includegraphics[width=\linewidth]{figures/x5_hybrid.pdf}
 \caption{Left: speed-up of one rank with OpenMP threads. Right: 288 cores split into ranks $\times$ threads, with both thread strategies.}
@@ -486,7 +411,7 @@ The distributed result is compared with the serial one with the criterion of Sec
 S1--S3 use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on the user's arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
 
 \subsubsection{Subexpression sharing and serial planning}
-\begin{table}[H]
+\begin{table}[htbp]
 \centering\small
 \begin{tabular}{lrrrrr}
 \toprule
@@ -503,7 +428,7 @@ Depth 3 warm start & 29,955 & 125,465 & 32,825 & 73.8\% & 54.4\% \\
 \end{table}
 Depth 1 shares only field leaves in these batches: its operator count is unchanged. The warm-start DAG has 132 leaves and 7,117, 15,273 and 10,303 nodes at levels 1--3. The widest layer is therefore not the number of roots or the peak live set. Python and C++ agree on canonical node sets, levels, subtree sizes, reference counts, accepted inputs and root order for all measured prefixes.
 
-\begin{table}[H]
+\begin{table}[htbp]
 \centering\small
 \begin{tabular}{rrrrrr}
 \toprule
@@ -520,7 +445,7 @@ Expressions & $V_d$ & $E_d$ & Build (s) & Chunk 256 (s) & Greedy (s) \\
 \end{table}
 The largest graph has 44,034 operand references but 44,032 distinct edges, because repeated inputs count twice for lifetime management. Both graph dimensions grow in this experiment; they are not independently controlled. Construction grows approximately with batch size over these four points, while greedy scheduling is more expensive than simple chunk scheduling. These are planner overheads, not C++ factor runtimes, and no same-hardware end-to-end overhead ratio has been measured.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \includegraphics[width=0.96\linewidth]{figures/dag_runtime.png}
 \caption{Planner construction versus vertices and scheduling versus edges, on log--log axes. Mac measurements are not combined with Vanda engine timings.}
@@ -530,7 +455,7 @@ The largest graph has 44,034 operand references but 44,032 distinct edges, becau
 \subsubsection{Peak memory against batch size}
 For equal float32 panels, the model converts a peak live count $L$ into $4LN\lceil T/p\rceil$ bytes, with $T=1461$, $N=5876$ and $p=1$ here. This excludes halos, retained pool buffers, target ranks, operator scratch and communication/PCA workspaces; it is not RSS. Operator-group counts describe scheduling granularity, not measured MPI synchronisations or messages.
 
-\begin{table}[H]
+\begin{table}[htbp]
 \centering\small
 \begin{tabular}{lrrr}
 \toprule
@@ -549,7 +474,7 @@ Greedy & 1,553 & 49.67 & 32,693 \\
 \end{table}
 Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 reduces it by another 77.0\%. Reducing the chunk from 256 to 64 saves only 4.65\% more panels but nearly quadruples groups. Greedy uses the fewest panels and permits on-demand field loading, but its fine-grained execution may reduce parallelism. This is a memory--granularity trade-off, not evidence that greedy minimises runtime.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \includegraphics[width=\linewidth]{figures/dag_memory.png}
 \caption{Simulated memory against batch size (left) and scheduling groups for the largest batch (right), with logarithmic axes. Groups are not MPI message counts.}
@@ -559,7 +484,7 @@ Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 r
 \paragraph{Small engine check (S4).}
 On Vanda CPU node CN-016, the handed-off serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
 
-\begin{table}[H]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{rrrr}
 \toprule
@@ -581,7 +506,7 @@ Real GP traces were unavailable in the supplied directory at measurement time. W
 \subsubsection{Cache policies}
 An entry is a full float32 panel (about 0.032\,GiB); budgets 16, 32, 64 and 128\,GiB hold 500, 1,000, 2,001 and 4,002 entries. Estimated work is the sum of costs of distinct executed operator nodes. The supplied gpushare profile gives nanoseconds per cell; missing rank, z-score and delta costs use std, mean and lag proxies respectively. Window effects are averaged. Saved cost excludes I/O, cache maintenance, RankIC and communication and is not measured time saved on the Mac or Vanda.
 
-\begin{table}[H]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{rrrrr}
 \toprule
@@ -598,7 +523,7 @@ Budget (GiB) & LRU & LFU & Cost-aware & Offline reference \\
 \end{table}
 Cost-aware retention gives larger estimated savings than LRU/LFU at the larger budgets tested. At 128\,GiB, its second and third batches avoid 11.619\% and 9.804\% of their cost, or 10.713\% combined without the cold batch. Two later batches do not estimate steady state. Forced insertion and the batch-boundary update order can cause scan pollution; the experiment does not isolate its effect. There is no basis to claim significant real end-to-end acceleration yet.
 
-\begin{figure}[H]
+\begin{figure}[htbp]
 \centering
 \includegraphics[width=\linewidth]{figures/dag_cache.png}
 \caption{Budget sensitivity of the pruned replay, with and without the cold batch. Budget uses a logarithmic axis; percentages use a linear axis to retain zero values. Offline and online strategies are distinguished.}
@@ -614,9 +539,6 @@ Cost-aware retention gives larger estimated savings than LRU/LFU at the larger b
 \subsection{Conclusions about the data}
 \todo{growing stock universe and load imbalance; distribution of RankIC of the selected factors; effect of float32 on rankings}
 
-\subsection{DAG trade-offs and current limits}
-The first-stage evidence supports batch sharing and a memory--granularity trade-off, with larger modelled savings from cost-aware retention at the larger budgets. It does not establish real evolutionary reuse, distributed cache correctness or cache speed-up. The existing formula-chunk driver validates only one practical subdivision mechanism; same-DAG execution-plan validation and actual cached numerical execution remain future integration tasks.
-
 \subsection{Future work}
 \todo{asynchronous steady-state GP; overlapping CPU and GPU work; evaluating immigrants early instead of waiting for the generation's PCA step; \code{MPI\_Exscan} for ema; weighted date blocks; fusion of element-wise operators}
 
@@ -625,7 +547,7 @@ The first-stage evidence supports batch sharing and a memory--granularity trade-
 \todo{}
 
 \section*{Use of AI tools}
-For the DAG work, an AI assistant helped draft Python analysis tools, synthetic tests, the execution-plan interface, and report text. The author ran the random-batch analyses locally and the small C++ experiment on Vanda; Python/C++ graph checks, reference-count and cache tests, and score comparisons were used to validate the results. Simulation estimates are kept separate from measured timings. \todo{Add AI usage for the other project components.}
+\todo{Describe honestly how AI assistants were used, for example design discussion, code drafting and review, and how the results were verified.}
 
 \appendix
 \section{Code structure, building and running}
@@ -639,12 +561,5 @@ bash scripts/vanda/submit.sh           # experiment jobs
 python python/scripts/plot_vanda.py <csv_dir> <figure_dir>
 \end{lstlisting}
 
-\subsection{DAG analysis tools}
-The added tools are under \code{tools/dag\_analysis}; private inputs and outputs stay outside the repository. \code{dag\_stats.py}, \code{dag\_runtime.py}, \code{memory\_sim.py} and \code{cache\_sim.py} implement S1--S3; \code{run\_s4.sh} and \code{verify\_s4.py} reproduce the handed-off exporter check. That driver is separate from the analysis tools. \code{plan\_contract.py} and \code{s5/} provide the S5 prototype. These tools do not replace the engine's MPI/GPU experiments.
-\begin{lstlisting}
-python3 -m unittest discover -s tools/dag_analysis -p 'test_*.py' -v
-python3 tools/dag_analysis/memory_sim.py /path/batch.json --out ../results/memory
-python3 tools/dag_analysis/plan_contract.py check tools/dag_analysis/s5/example_plan.json
-\end{lstlisting}
-
 \end{document}
+
