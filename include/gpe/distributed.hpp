@@ -57,6 +57,9 @@ struct MpiOptions {
     int H0 = 0;               // redundant-computation budget, see halo_plan.hpp
     bool keep_roots = false;  // return root panels and daily ICs (tests)
     ThreadMode threads = ThreadMode::Operator;
+    // Maximum nodes of one DAG level processed at once (0: the whole level).
+    // Bounds peak memory for large batches; results do not depend on it.
+    int chunk = 0;
     // Reuses panel memory across batches (one GP generation after another);
     // without it each batch starts from an empty pool.
     BufferPool* pool = nullptr;

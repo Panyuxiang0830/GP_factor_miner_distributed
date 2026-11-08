@@ -1,13 +1,14 @@
 # Sourced by the Vanda job scripts (run from the repository root).
 #   GP_DATA  exported panels and expressions (default /scratch/$USER/gp_data)
 #   OUT      CSV results (default /scratch/$USER/gp_runs/<date>)
+#   GP_EXPRS expression batch (default: the selected factor library)
 module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 >/dev/null 2>&1
 
 REPO=$PWD
 BIN=$REPO/build_vanda
 DATA=${GP_DATA:-/scratch/$USER/gp_data}
 PANELS=$DATA/GP_distributed/evolution_full
-EXPRS=$DATA/GP_output_eod/rescreen_rankic_007_corr_075_unlimited/selected_gp_factors.json
+EXPRS=${GP_EXPRS:-$DATA/GP_output_eod/rescreen_rankic_007_corr_075_unlimited/selected_gp_factors.json}
 OUT=${OUT:-/scratch/$USER/gp_runs/$(date +%Y%m%d)}
 mkdir -p "$OUT"
 
@@ -53,11 +54,11 @@ bench() {
         $(pin "$R" "$t" "$h") "$BIN/gpe_bench" "$PANELS" "$EXPRS" "$@" || echo "FAILED: R=$R t=$t hosts=$h $*"
 }
 
-# consistency <ranks> <threads> <hosts> <H0> <exprs> <op|node>
+# consistency <ranks> <threads> <hosts> <H0> <exprs> <op|node> [chunk]
 consistency() {
     local R=$1 t=$2 h=$3
     echo "-- consistency R=$R t=$t hosts=$h H0=$4 exprs=$5 $6"
     mpirun -np "$R" $(placement "$R" "$t" "$h") \
         -x OMP_NUM_THREADS="$t" -x OMP_PLACES -x OMP_PROC_BIND \
-        $(pin "$R" "$t" "$h") "$BIN/test_mpi_consistency" "$PANELS" "$EXPRS" "$4" "$5" "$6" || echo "FAILED: consistency R=$R"
+        $(pin "$R" "$t" "$h") "$BIN/test_mpi_consistency" "$PANELS" "$EXPRS" "$4" "$5" "$6" ${7:+"$7"} || echo "FAILED: consistency R=$R"
 }

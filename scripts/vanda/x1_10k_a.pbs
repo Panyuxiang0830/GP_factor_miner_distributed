@@ -1,0 +1,23 @@
+#!/bin/bash
+# 10,000-expression batch (real GP warm-start batch, depth <= 2):
+# X1 serial, real T and N sweeps and the full batch.
+#PBS -P personal-panyuxiang
+#PBS -N gpe10k_x1a
+#PBS -j oe
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+export GP_EXPRS=/scratch/$USER/gp_data/batch10k_d2_warm.json
+export OUT=/scratch/$USER/gp_runs/10k
+source scripts/vanda/env.sh
+# Configurations that take over half an hour (P or threads <= 4) run once;
+# the rest keep warm-up 1 + 3 repeats.
+ONE="--warmup 0 --repeat 1"
+REP="--warmup 1 --repeat 3"
+B="$ONE --chunk 1000 --csv $OUT/x1_serial.csv"
+bench 1 1 1 $B --label full
+for T in 91 183 365 730; do bench 1 1 1 --dates $T $B --label T_real; done
+for N in 367 734 1469 2938; do bench 1 1 1 --stocks $N $B --label N_real; done
+echo DONE

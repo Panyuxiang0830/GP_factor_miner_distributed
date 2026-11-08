@@ -1,0 +1,35 @@
+#!/bin/bash
+# Pilot for the 10,000-expression batch: rebuild, check that level chunking
+# gives the same result as the serial engine, and measure time and peak memory
+# (max RSS per rank) to size the full experiments.
+#PBS -P personal-panyuxiang
+#PBS -N gpe_pilot10k
+#PBS -j oe
+#PBS -l walltime=03:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=450gb
+#PBS -l place=scatter:excl
+
+cd "$PBS_O_WORKDIR"
+export GP_EXPRS=/scratch/$USER/gp_data/batch10k_d2_warm.json
+export OUT=/scratch/$USER/gp_runs/pilot10k
+source scripts/vanda/env.sh
+
+cmake -S . -B "$BIN" -DGPE_ENABLE_MPI=ON -DGPE_REF_DIR="$DATA/GP_distributed/ref_sample_120x300" >/dev/null
+cmake --build "$BIN" -j 72 2>&1 | tail -2
+(cd "$BIN" && ctest 2>&1 | tail -3)
+
+# Chunked distributed vs serial, on the first 1000 expressions.
+mpirun -np 16 --map-by ppr:16:node:PE=1 --bind-to core -x OMP_NUM_THREADS=1 \
+    "$BIN/test_mpi_consistency" "$PANELS" "$EXPRS" 0 1000 op 300 | tail -3
+mpirun -np 4 --map-by ppr:4:node:PE=4 --bind-to core -x OMP_NUM_THREADS=4 -x OMP_PLACES -x OMP_PROC_BIND \
+    "$BIN/test_mpi_consistency" "$PANELS" "$EXPRS" 0 1000 node 250 | tail -3
+
+M="/usr/bin/time -f MAXRSS_KB=%M"
+P1="--warmup 0 --repeat 1"
+echo "-- serial, 1000 expressions"
+mpirun -np 1 --bind-to core -x OMP_NUM_THREADS=1 $M "$BIN/gpe_bench" "$PANELS" "$EXPRS" $P1 --exprs 1000 --chunk 2000 --csv $OUT/pilot.csv --label serial1000
+echo "-- 72 ranks, all expressions, chunk 2000"
+mpirun -np 72 --map-by ppr:72:node:PE=1 --bind-to core -x OMP_NUM_THREADS=1 $M "$BIN/gpe_bench" "$PANELS" "$EXPRS" $P1 --chunk 2000 --csv $OUT/pilot.csv --label p72 2>&1 | sort -t= -k2 -n | tail -2
+echo "-- 1 rank x 72 threads node, all expressions, chunk 2000"
+mpirun -np 1 --bind-to none -x OMP_NUM_THREADS=72 -x OMP_PLACES -x OMP_PROC_BIND $M "$BIN/gpe_bench" "$PANELS" "$EXPRS" $P1 --threads node --chunk 2000 --csv $OUT/pilot.csv --label t72node
+echo DONE

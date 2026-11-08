@@ -192,77 +192,86 @@ MpiBatchResult evaluate_batch_mpi(const Dag& dag, const PanelSet& data, MPI_Comm
         std::vector<double> ema_in;
         if (!ema_ids.empty()) ema_in = ema_chain(ema_ids, nodes, values, left, right, ema_tag, comm, timing);
 
-        // Leaves are read and output panels taken from the pool before any
-        // operator runs, so that the pool is never used by several threads.
-        std::vector<int> work, exchanged;
-        for (int i : levels[L]) {
-            const Node& n = nodes[i];
-            const int h = rows_before(i);
-            if (n.op == Op::Leaf) {
-                t = MPI_Wtime();
-                values[i] = data.load_field_rows(dag.fields()[n.field], block.t0, block.t1, h);
-                timing.load += MPI_Wtime() - t;
-                continue;
+        // Wide levels are processed in chunks of at most options.chunk nodes:
+        // each chunk is computed, exchanged, scored and released before the
+        // next one takes memory, which bounds the panels alive at once.
+        const size_t width = levels[L].size();
+        const size_t step = options.chunk > 0 ? static_cast<size_t>(options.chunk) : std::max<size_t>(width, 1);
+        for (size_t c0 = 0; c0 < width; c0 += step) {
+            const std::vector<int> chunk(levels[L].begin() + c0, levels[L].begin() + std::min(width, c0 + step));
+            // Leaves are read and output panels taken from the pool before any
+            // operator runs, so that the pool is never used by several threads.
+            std::vector<int> work, exchanged;
+            for (int i : chunk) {
+                const Node& n = nodes[i];
+                const int h = rows_before(i);
+                if (n.op == Op::Leaf) {
+                    t = MPI_Wtime();
+                    values[i] = data.load_field_rows(dag.fields()[n.field], block.t0, block.t1, h);
+                    timing.load += MPI_Wtime() - t;
+                    continue;
+                }
+                values[i].buf = pool.take(static_cast<size_t>(Tl + h) * N);
+                values[i].reset(Tl, N, -h);
+                if (plan[i].redundant) timing.redundant_rows += h;
+                if (plan[i].exchanged()) exchanged.push_back(i);
+                work.push_back(i);
             }
-            values[i].buf = pool.take(static_cast<size_t>(Tl + h) * N);
-            values[i].reset(Tl, N, -h);
-            if (plan[i].redundant) timing.redundant_rows += h;
-            if (plan[i].exchanged()) exchanged.push_back(i);
-            work.push_back(i);
-        }
-        auto compute = [&](int i) {
-            const Node& n = nodes[i];
-            const Panel* b = n.b >= 0 ? &values[n.b] : nullptr;
-            // Redundant nodes also compute their history rows; exchanged ones
-            // compute their own days and receive the rest.
-            const int begin = plan[i].redundant ? -rows_before(i) : 0;
-            EmaState state;
-            const EmaState* ema = nullptr;
-            if (n.op == Op::Ema && left != MPI_PROC_NULL) {
-                size_t e = std::find(ema_ids.begin(), ema_ids.end(), i) - ema_ids.begin();
-                state.y = ema_in.data() + 2 * N * e;
-                state.old_wt = state.y + N;
-                ema = &state;
+            auto compute = [&](int i) {
+                const Node& n = nodes[i];
+                const Panel* b = n.b >= 0 ? &values[n.b] : nullptr;
+                // Redundant nodes also compute their history rows; exchanged ones
+                // compute their own days and receive the rest.
+                const int begin = plan[i].redundant ? -rows_before(i) : 0;
+                EmaState state;
+                const EmaState* ema = nullptr;
+                if (n.op == Op::Ema && left != MPI_PROC_NULL) {
+                    size_t e = std::find(ema_ids.begin(), ema_ids.end(), i) - ema_ids.begin();
+                    state.y = ema_in.data() + 2 * N * e;
+                    state.old_wt = state.y + N;
+                    ema = &state;
+                }
+                apply_op(n.op, n.window, values[n.a], b, values[i], begin, ema);
+            };
+            t = MPI_Wtime();
+            if (by_node) {
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (size_t k = 0; k < work.size(); ++k) compute(work[k]);
+            } else {
+                for (int i : work) compute(i);
             }
-            apply_op(n.op, n.window, values[n.a], b, values[i], begin, ema);
-        };
-        t = MPI_Wtime();
-        if (by_node) {
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t k = 0; k < work.size(); ++k) compute(work[k]);
-        } else {
-            for (int i : work) compute(i);
-        }
-        timing.compute += MPI_Wtime() - t;
-        if (!exchanged.empty()) exchange_halos(exchanged, plan, values, block, rank, P, data.T, halo_tag, comm, timing);
+            timing.compute += MPI_Wtime() - t;
+            if (!exchanged.empty()) exchange_halos(exchanged, plan, values, block, rank, P, data.T, halo_tag, comm, timing);
 
-        // RankIC of the roots of this level (own days only).
-        std::vector<int> done;
-        for (int i : levels[L])
-            if (slot[i] >= 0) done.push_back(i);
-        std::vector<DailyIC> daily(done.size());
-        auto score = [&](size_t k) {
-            daily[k] = daily_rank_ic(values[done[k]], target_rank);
-            summarize_ic(daily[k], block.t0, data.T, K).pack(stats.data() + slot[done[k]] * W);
-        };
-        t = MPI_Wtime();
-        if (by_node) {
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t k = 0; k < done.size(); ++k) score(k);
-        } else {
-            for (size_t k = 0; k < done.size(); ++k) score(k);
-        }
-        timing.metrics += MPI_Wtime() - t;
+            // RankIC of the roots of this level (own days only).
+            std::vector<int> done;
+            for (int i : chunk)
+                if (slot[i] >= 0) done.push_back(i);
+            std::vector<DailyIC> daily(done.size());
+            auto score = [&](size_t k) {
+                daily[k] = daily_rank_ic(values[done[k]], target_rank);
+                summarize_ic(daily[k], block.t0, data.T, K).pack(stats.data() + slot[done[k]] * W);
+            };
+            t = MPI_Wtime();
+            if (by_node) {
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (size_t k = 0; k < done.size(); ++k) score(k);
+            } else {
+                for (size_t k = 0; k < done.size(); ++k) score(k);
+            }
+            timing.metrics += MPI_Wtime() - t;
 
-        if (keep_roots) {
-            for (size_t k = 0; k < done.size(); ++k) result.daily[done[k]] = std::move(daily[k]);
-        } else {
-            for (int i : done)
-                if (pending[i] == 0) release(i);  // not a subtree of a later node
+            if (keep_roots) {
+                for (size_t k = 0; k < done.size(); ++k) result.daily[done[k]] = std::move(daily[k]);
+            } else {
+                for (int i : done)
+                    if (pending[i] == 0) release(i);  // not a subtree of a later node
+            }
+            for (int i : chunk)
+                for (int c : {nodes[i].a, nodes[i].b})
+                    if (c >= 0 && --pending[c] == 0 && !(keep_roots && slot[c] >= 0)) release(c);
+
         }
-        for (int i : levels[L])
-            for (int c : {nodes[i].a, nodes[i].b})
-                if (c >= 0 && --pending[c] == 0 && !(keep_roots && slot[c] >= 0)) release(c);
     }
 
     // Separates waiting for the slowest rank from the reduction itself.

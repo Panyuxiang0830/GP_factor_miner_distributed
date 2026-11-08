@@ -137,7 +137,9 @@ def plot_comm(df, strong, out):
         ax.legend(fontsize=7, loc="center right")
         ax.grid(True, which="both", alpha=0.3)
     axes[0].yaxis.set_minor_formatter(NullFormatter())
-    axes[0].set_yticks([1, 1.25, 1.5, 2, 2.5, 3, 3.5])
+    lo, hi = axes[0].get_ylim()
+    ticks = [1, 1.25, 1.5, 2, 2.5, 3, 3.5, 5, 10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 200]
+    axes[0].set_yticks([y for y in ticks if lo <= y <= hi])
     # Same rank count packed on as few nodes as possible (the strong-scaling
     # runs) and spread over four nodes.
     spread = df[df.label == "spread4"]
@@ -191,6 +193,10 @@ def plot_hybrid(omp, hyb, strong, out):
 def main(csv_dir, out):
     Path(out).mkdir(parents=True, exist_ok=True)
     if (d := read(csv_dir, "x1_serial")) is not None:
+        # A single full-size run ("full") is the end point of all three real
+        # sweeps instead of being repeated in each.
+        full = d[d.label == "full"]
+        d = pd.concat([d] + [full.assign(label=l) for l in ("T_real", "N_real", "batch_real")])
         plot_serial(d, out)
     strong = read(csv_dir, "x2_strong")
     if strong is not None:

@@ -10,6 +10,8 @@
 //     --threads m      op (each operator splits days or stocks over the threads,
 //                      default) or node (the nodes of a level run in parallel)
 //     --exprs n        use only the first n expressions
+//     --chunk k        process at most k nodes of a DAG level at once (default 0:
+//                      whole levels); bounds memory for large batches
 //     --warmup w       untimed runs first (default 1)
 //     --repeat r       timed repetitions (default 3)
 //     --csv file       append one result row to this CSV file
@@ -89,6 +91,7 @@ int main(int argc, char** argv) {
         else if (k == "--threads") mode = v;
         else if (k == "--warmup") warmup = std::stoi(v);
         else if (k == "--exprs") exprs = std::stoul(v);
+        else if (k == "--chunk") options.chunk = std::stoi(v);
         else if (k == "--repeat") repeat = std::stoi(v);
         else if (k == "--csv") csv = v;
         else if (k == "--label") label = v;
