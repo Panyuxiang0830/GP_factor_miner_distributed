@@ -12,6 +12,8 @@
 \usepackage{listings}
 \usepackage{hyperref}
 \usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit}
 
 \newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
 \newcommand{\code}[1]{\texttt{#1}}
@@ -180,14 +182,45 @@ Unlike the real data, the number of stocks per day is constant, so synthetic run
 
 %======================================================================
 \section{Computing platform: Vanda}
-\todo{NUS Vanda cluster: CPU nodes with 2$\times$ Intel Xeon 8452Y (72 cores) and 512\,GB; GPU nodes with NVIDIA A40 (48\,GB); 100\,Gb Ethernet between nodes; PBS queues and limits (free queue 160 cores per job, project queue used for 288 cores); home and scratch file systems; OpenMPI 5.0.8 and GCC 14.3; how ranks and threads are placed and bound.}
+\label{sec:platform}
+All experiments run on the NUS Vanda cluster, which is managed by PBS.
+\begin{itemize}[nosep]
+  \item \textbf{Nodes.} A CPU node has two Intel Xeon Platinum 8452Y processors ($2\times36$ cores) and about 500\,GiB of memory (501\,GiB reported by PBS). GPU nodes have 72 cores and two NVIDIA A40 GPUs with 48\,GB each. The CPU pool also contains A40 nodes and some 64-core nodes, so every job records the CPU model of its hosts; all reported runs used 8452Y nodes.
+  \item \textbf{Queues.} The free queue (\code{cpu\_parallel}) allows at most 160 cores per job, less than three nodes. Runs with up to four whole nodes (288 cores) therefore use the charged \code{batch\_cpu} queue under a project account, which allows up to 720 cores and 10 nodes per job. Each job requests whole nodes (72 cores, 450\,GB) so that no other job shares the memory bandwidth.
+  \item \textbf{File systems.} Home and scratch are NFS shares. The data and the results are on scratch, which is purged after 60 days without access, so results are copied back after each run.
+  \item \textbf{Software.} GCC 14.3, OpenMPI 5.0.8 and CMake 4.0.3 from environment modules; the engine is built on a compute node. This OpenMPI starts its daemons over ssh rather than through PBS, so a launch agent loads the same modules on every node.
+  \item \textbf{Placement.} Ranks are spread evenly over the nodes and each is bound to $t$ consecutive cores (\code{--map-by ppr:$R/h$:node:PE=$t$} \code{--bind-to core}); OpenMP threads are pinned with \code{OMP\_PLACES=cores} and \code{OMP\_PROC\_BIND=close}. OpenMPI refuses to bind one rank to cores of both sockets, so for splits where a rank would straddle them ($t>36$, or 9 ranks of 8 threads per node) the ranks are left unbound and a wrapper pins each rank's threads to its own block of cores. Core numbers alternate between the two sockets (even cores on one, odd on the other), which matters for these splits (Section~\ref{sec:threads}).
+\end{itemize}
 
 %======================================================================
 \section{Parallel design}
 
 \setcounter{subsection}{-1}
 \subsection{Overview, decomposition and data layout}
-\todo{figure of the whole pipeline: Python GP loop $\to$ C++ engine (factor computation and evaluation on CPU with MPI + OpenMP; signatures and similarity on GPU) $\to$ sequential admission. MPI+X: X = OpenMP for factor evaluation, CUDA for the PCA part.}
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, align=center, minimum height=1.0cm, text width=#1, font=\small},
+  box/.default=3.0cm,
+  grp/.style={draw, dashed, rounded corners, inner sep=0.25cm},
+  arr/.style={-{Stealth}, thick}]
+\node[box=3.0cm] (gp) {Python GP loop\\ proposals and\\ gene pools};
+\node[box=2.8cm, right=1.9cm of gp] (dag) {merge the batch into one DAG\\ (Section~\ref{sec:dag})};
+\node[box=3.6cm, right=0.6cm of dag] (fc) {factor computation\\ and RankIC\\ CPU: MPI + OpenMP\\ (Section~\ref{sec:fc})};
+\node[box=3.6cm, below=0.9cm of fc] (pca) {PCA signatures and similarity\\ GPU: MPI + CUDA\\ (Section~\ref{sec:pca})};
+\node[box=3.0cm] (adm) at (gp |- pca) {sequential admission\\ to the archive};
+\node[grp, inner sep=0.2cm, fit=(dag)(fc)(pca), label={[font=\small]above:C++ engine}] {};
+\draw[arr] (gp) -- node[above, font=\scriptsize]{batch} (dag);
+\draw[arr] (dag) -- (fc);
+\draw[arr] (fc) -- node[right, font=\scriptsize, align=left]{scores of\\ valid roots} (pca);
+\draw[arr] (pca) -- node[above, pos=0.7, font=\scriptsize]{candidates, signatures} (adm);
+\draw[arr] (adm) -- node[left, font=\scriptsize]{next generation} (gp);
+\end{tikzpicture}
+\caption{One generation of the miner. The engine receives a whole batch of expressions, evaluates it once as a DAG, and returns scores and signatures; admission stays sequential in Python.}
+\label{fig:pipeline}
+\end{figure}
+Figure~\ref{fig:pipeline} shows one generation. The Python miner proposes a batch of expressions and hands the whole batch to the C++ engine. The engine merges it into one DAG (Section~\ref{sec:dag}), computes every node and the daily RankIC of every root on the CPU (Section~\ref{sec:fc}), and computes the PCA signatures and similarities of the valid candidates on the GPU (Section~\ref{sec:pca}). Admission to the archive compares each candidate with those admitted before it, so it stays sequential. The parallel model is therefore MPI + X: MPI splits the data over nodes, and X is OpenMP for factor computation and CUDA for the PCA part.
+
 
 Each of the $p$ ranks owns a contiguous block of about $T/p$ days for all $N$ stocks. With this choice:
 \begin{itemize}[nosep]
@@ -198,7 +231,24 @@ Each of the $p$ ranks owns a contiguous block of about $T/p$ days for all $N$ st
 We decompose the data rather than the expressions. Each rank evaluates every node of the batch DAG (Section~\ref{sec:dag}) level by level, but only on its own dates, so communication involves only a few boundary rows, never whole panels. Splitting by stock instead would make every cross-sectional rank a global sort; splitting by expression, as the Python version does, makes every process hold all data.
 A panel is stored as a contiguous float32 array in date-major order, together with the index \code{lo}$\le0$ of its first stored row; rows below 0 hold history that precedes the rank's own block.
 
+\subsection{The subexpression DAG and memory}
+\label{sec:dag}
+A batch of expressions is merged into one DAG by \emph{hash-consing}. Before a node is created, the key (operator, window, child ids) is looked up in a hash table. An existing node is reused, so a subexpression shared by several candidates is computed once. Normalisation is applied during construction:
+\begin{itemize}[nosep]
+  \item the children of commutative operators are ordered by id;
+  \item a rank whose child is a rank returns the child;
+  \item equal children of $-$ and $\div$ reject the whole expression, which is rolled back.
+\end{itemize}
+Children are always created before their parents, so the node array is already a topological order. Every rank builds the identical DAG, so node ids agree across ranks and halo messages need no descriptors.
+
+For each node we record its \emph{cumulative lookback} $h(n) = \ell(n) + \max_{c} h(c)$, where $\ell = w-1$ for rolling windows and $\ell = k$ for lag, delta and pct\_change, and its \emph{halo rows} $\max_{\text{parents }q} \ell(q)$. Each node also counts its parents; when all parents are computed, its panel goes back to a buffer pool.
+
+On the $1481$ selected factors, merging all expressions into one DAG reduces $11{,}413$ tree nodes to $4{,}052$ distinct nodes, including leaves.
+\paragraph{Memory model and scheduling.}
+We model the lifetime of materialised panels as a red--blue pebble problem: a computed DAG value occupies limited fast storage, while eviction may require a transfer or recomputation later. This is a modelling framework, not an exact optimal scheduling algorithm. Our first-stage simulator computes each distinct node once and compares (i) level order with roots retained until the end, (ii) level order with roots consumed early, (iii) level order with operator layers split into chunks of $C$ nodes, and (iv) a greedy topological order favouring nodes that immediately release the most input panels. Inputs remain live until their final consumer; repeated operand references, such as $a\times a$, are counted separately. A root that is also another root's input cannot be released after scoring alone. Chunk outputs are allocated together, so allocating a wide layer can determine the peak even with early release. The engine combines (ii) and (iii): roots are scored and released as soon as their chunk is done, and wide levels are processed in chunks (Section~\ref{sec:threads}). Section~\ref{sec:dag-exp} compares the four orders.
+
 \subsection{Factor computation and evaluation}
+\label{sec:fc}
 
 \subsubsection{Operator classes and their parallel axis}
 \label{sec:operators}
@@ -258,7 +308,7 @@ Memory handling went through three problems, each found by timing every operator
   \item \textbf{Page faults on fresh memory.} At first every node allocated a new panel. The operating system only maps physical pages when they are first written, and it zeroes each page at that moment. With 32 threads writing new panels at once, these page faults queued in the kernel and took about 45\% of the compute phase, outside the operators themselves.
   \item \textbf{Fix: a buffer pool.} Instead of returning a released panel to the operating system, the engine keeps the buffer, whose pages are already mapped, in a pool, and the next node that needs a panel takes the smallest pooled buffer that fits. Nothing is copied or moved; the memory simply stays allocated in RAM. The pool lives as long as the engine object, so it carries over from one batch to the next, as in a GP run where the engine is called generation after generation. Only the very first batch still pays for page faults, and the benchmark's warm-up run absorbs that. The pool doubled the single-rank 32-thread speed-up (10.9 to 19.9) and removed run-to-run variation of up to 50\%.
   \item \textbf{Per-thread scratch arrays.} A rolling correlation used to allocate about 13 temporary arrays per stock, and many threads allocating at once contend inside the allocator. Each thread now allocates them once and reuses them for every stock, which cut 32-thread time by another 8\%.
-  \item \textbf{Wide levels.} A batch of 10{,}000 expressions has a level of 8614 nodes. Allocating all of them at once would need the output panels of the whole level in memory. The engine therefore processes a wide level in chunks of at most $k$ nodes (\code{--chunk}): each chunk is allocated, computed, exchanged, scored and released before the next one. The result does not depend on $k$ (checked against the serial engine with chunks of 250 and 300 nodes). With $k=2000$, 72 ranks on one node peak at about 4.9\,GB each, and one rank with 72 threads at 138\,GB.
+  \item \textbf{Wide levels.} A batch of 10{,}000 expressions has a level of 8614 nodes. Allocating all of them at once would need the output panels of the whole level in memory. The engine therefore processes a wide level in chunks of at most $k$ nodes (\code{--chunk}): each chunk is allocated, computed, exchanged, scored and released before the next one. The result does not depend on $k$ (checked against the serial engine with chunks of 250 and 300 nodes). With $k=2000$, 72 ranks on one node peak at about 4.9\,GB each, and one rank with 72 threads at 138\,GB. Section~\ref{sec:dag-exp} shows why chunking is needed: once roots are released early, the widest level sets the peak.
 \end{itemize}
 
 \subsubsection{Communication and load model}
@@ -274,32 +324,11 @@ Per rank, computation shrinks as $1/p$ while the halo volume stays constant and 
 \textbf{Load balance.} Blocks have equal numbers of days, but not equal work. Rolling and element-wise operators process all $N$ columns, but ranking and RankIC sort only the stocks with data, whose number grows from 2636 in 2016 to 4845 in 2021. The last block's cross-sectional work is therefore up to $1.8\times$ the first block's, and the earlier ranks wait for it at every halo exchange and at the final reduction. Synthetic data have a constant number of stocks and isolate this effect.
 
 \subsection{PCA signatures and similarity on the GPU}
+\label{sec:pca}
 \todo{batched sampled ranking; batched power iteration (distributed: $Rv$ is local, $R^\top u$ needs one Allreduce of a length-$N$ vector per iteration, batched over factors); tiled similarity GEMM vs cuBLAS; sequential admission as the serial fraction}
 
 \subsection{Power iteration versus Lanczos}
 \todo{convergence of both depends on the singular-value gap; cost per iteration (one product with $R$ and one with $R^\top$); storage of the Lanczos basis; is four power iterations accurate enough for the admission decision?}
-
-\subsection{The subexpression DAG, memory and caching}
-\label{sec:dag}
-A batch of expressions is merged into one DAG by \emph{hash-consing}. Before a node is created, the key (operator, window, child ids) is looked up in a hash table. An existing node is reused, so a subexpression shared by several candidates is computed once. Normalisation is applied during construction:
-\begin{itemize}[nosep]
-  \item the children of commutative operators are ordered by id;
-  \item a rank whose child is a rank returns the child;
-  \item equal children of $-$ and $\div$ reject the whole expression, which is rolled back.
-\end{itemize}
-Children are always created before their parents, so the node array is already a topological order. Every rank builds the identical DAG, so node ids agree across ranks and halo messages need no descriptors.
-
-For each node we record its \emph{cumulative lookback} $h(n) = \ell(n) + \max_{c} h(c)$, where $\ell = w-1$ for rolling windows and $\ell = k$ for lag, delta and pct\_change, and its \emph{halo rows} $\max_{\text{parents }q} \ell(q)$. Each node also counts its parents; when all parents are computed, its panel goes back to a buffer pool.
-
-On the $1481$ selected factors, merging all expressions into one DAG reduces $11{,}413$ tree nodes to $4{,}052$ distinct nodes, including leaves.
-\paragraph{Memory model and scheduling.}
-We model the lifetime of materialised panels as a red--blue pebble problem: a computed DAG value occupies limited fast storage, while eviction may require a transfer or recomputation later. This is a modelling framework, not an exact optimal scheduling algorithm. Our first-stage simulator computes each distinct node once and compares (i) level order with roots retained until the end, (ii) level order with roots consumed early, (iii) level order with operator layers split into chunks of $C$ nodes, and (iv) a greedy topological order favouring nodes that immediately release the most input panels. Inputs remain live until their final consumer; repeated operand references, such as $a\times a$, are counted separately. A root that is also another root's input cannot be released after scoring alone. Chunk outputs are allocated together, so allocating a wide layer can determine the peak even with early release. The handed-off MPI engine already implements early root processing by default; retained roots are a historical comparison, not a newly removed bottleneck.
-
-\paragraph{Cross-batch cache model.}
-Persistent entries are keyed by the normalised subexpression, rather than batch-local node ids. We compare LRU, LFU (frequency since the current admission), and a cost-aware score equal to independent subtree recomputation cost times frequency. Two replay models distinguish interpretation: a fixed child-first request sequence admits a Belady reference for unweighted misses under equal-size, mandatory-insertion assumptions; a DAG-aware replay uses the batch-start cache snapshot to cut hit subtrees and updates persistent entries at the batch boundary. Shared descendants still needed elsewhere are computed once. Its future-batch-aware reference is an offline heuristic, not an optimal bound. Temporary working memory is outside the persistent-cache budget. Population and gene-pool event hooks are retained, but their policies await real traces. All current replays use full panels at $p=1$; real distributed cache coverage and halo validity remain unimplemented.
-
-\paragraph{Execution-plan proposal.}
-The S5 JSON proposal provides dataset/date/asset/semantic identity, node definitions, stable expression hashes, root-to-input mappings and grouped instructions: load, compute, cache get/put/evict, consume root and release. Root consumers must finish before release; cache ownership is independent from batch handles. Missing or incompatible entries require replanning, not silent use of a pruned dependency. The exporter currently generates no-cache serial plans; a structural checker covers dependencies, references, roots, cache identity and predicted live-panel peak. This is an interface prototype, not a C++ executor or an MPI plan. Byte budgets, halo communication and asynchronous consumers require further integration.
 
 %======================================================================
 \section{Validation}
@@ -321,9 +350,106 @@ Small hand-computed unit tests cover the corner cases that real data rarely hit:
 %======================================================================
 \section{Experiments}
 \label{sec:experiments}
-\paragraph{Workload.} The experiments evaluate one real batch from a run of the Python miner: the 10{,}000 distinct expressions of its depth-2 warm-start batch, which is the batch the engine would receive in that generation. Merged into one DAG they give 12{,}083 nodes in three levels (132 leaves, 3337 and 8614 operator nodes). Almost every non-leaf node is a root that has to be scored, so this batch is evaluation-heavy. Unless stated otherwise each run evaluates the whole batch on the full real data, $T=1461$ days and $N=5876$ stocks.
+\paragraph{Workload.} The factor-computation experiments evaluate one real batch from a run of the Python miner: the 10{,}000 distinct expressions of its depth-2 warm-start batch, which is the batch the engine would receive in that generation. Merged into one DAG they give 12{,}083 nodes in three levels (132 leaves, 3337 and 8614 operator nodes). Almost every non-leaf node is a root that has to be scored, so this batch is evaluation-heavy. Unless stated otherwise each run evaluates the whole batch on the full real data, $T=1461$ days and $N=5876$ stocks.
 
 \paragraph{Timing.} Every run is timed with \code{MPI\_Barrier} followed by \code{MPI\_Wtime}. Each phase (loading, operators, halo exchange, ema scan, RankIC, waiting, reduction) is the maximum over ranks, and the total is the slowest rank's wall time. Most configurations run once to warm up (which also fills the buffer pool, as in a GP run where the engine is called generation after generation) and then three times, and we report the median. The slow ones (one rank, and two or four ranks or threads, 21 to 84 minutes each) run once without warm-up; for them the page faults of the first run are a small part of the time. Wide levels are processed in chunks of 1000 nodes on one node and 2000 nodes on several nodes (Section~\ref{sec:threads}). Loading is reported separately because it depends on the shared file system. All plots use logarithmic axes for time, problem size and core count. Runs used Intel Xeon 8452Y nodes only; each job records the CPU model of its hosts.
+
+\subsection{DAG and memory}
+\label{sec:dag-exp}
+\paragraph{Inputs and measurement scope.}
+S1 and S2 use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on the user's arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
+
+\subsubsection{Subexpression sharing and serial planning}
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+Batch & Expressions & Tree nodes & DAG nodes & Reduction & Operator-only \\
+\midrule
+Depth 1 & 10,000 & 24,157 & 10,000 & 58.6\% & 0.0\% \\
+Depth 2 & 10,000 & 35,022 & 11,591 & 66.9\% & 39.3\% \\
+Depth 3 & 9,991 & 40,942 & 13,135 & 67.9\% & 44.5\% \\
+Depth 3 warm start & 29,955 & 125,465 & 32,825 & 73.8\% & 54.4\% \\
+\bottomrule
+\end{tabular}
+\caption{Random-batch sharing. Tree counts precede normalisation and include leaves; operator-only reduction excludes leaves. Neither reduction is a measured speed-up.}
+\label{tab:dag-sharing}
+\end{table}
+Depth 1 shares only field leaves in these batches: its operator count is unchanged. The warm-start DAG has 132 leaves and 7,117, 15,273 and 10,303 nodes at levels 1--3. The widest layer is therefore not the number of roots or the peak live set. Python and C++ agree on canonical node sets, levels, subtree sizes, reference counts, accepted inputs and root order for all measured prefixes.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{rrrrrr}
+\toprule
+Expressions & $V_d$ & $E_d$ & Build (s) & Chunk 256 (s) & Greedy (s) \\
+\midrule
+1,000 & 2,190 & 2,732 & 0.0532 & 0.00148 & 0.0209 \\
+5,000 & 7,805 & 10,171 & 0.2490 & 0.00533 & 0.1581 \\
+10,000 & 13,210 & 17,377 & 0.4730 & 0.00898 & 0.3205 \\
+29,955 & 32,825 & 44,032 & 1.4021 & 0.02312 & 1.2302 \\
+\bottomrule
+\end{tabular}
+\caption{Serial Python planning on warm-start prefixes: distinct vertices $V_d$ and child--parent edges $E_d$. The last two columns time scheduling only.}
+\label{tab:dag-runtime}
+\end{table}
+The largest graph has 44,034 operand references but 44,032 distinct edges, because repeated inputs count twice for lifetime management. Both graph dimensions grow in this experiment; they are not independently controlled. Construction grows approximately with batch size over these four points, while greedy scheduling is more expensive than simple chunk scheduling. These are planner overheads, not C++ factor runtimes, and no same-hardware end-to-end overhead ratio has been measured.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.96\linewidth]{figures/dag_runtime.png}
+\caption{Planner construction versus vertices and scheduling versus edges, on log--log axes. Mac measurements are not combined with Vanda engine timings.}
+\label{fig:dag-runtime}
+\end{figure}
+
+\subsubsection{Peak memory against batch size}
+For equal float32 panels, the model converts a peak live count $L$ into $4LN\lceil T/p\rceil$ bytes, with $T=1461$, $N=5876$ and $p=1$ here. This excludes halos, retained pool buffers, target ranks, operator scratch and communication/PCA workspaces; it is not RSS. Operator-group counts describe scheduling granularity, not measured MPI synchronisations or messages.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrr}
+\toprule
+Schedule, 29,955 expressions & Peak panels & Panel GiB & Groups (proxy) \\
+\midrule
+Retain roots & 32,290 & 1,032.67 & 3 \\
+Early release & 17,730 & 567.02 & 3 \\
+Chunk 1,024 & 4,850 & 155.11 & 33 \\
+Chunk 256 & 4,086 & 130.67 & 129 \\
+Chunk 64 & 3,896 & 124.60 & 512 \\
+Greedy & 1,553 & 49.67 & 32,693 \\
+\bottomrule
+\end{tabular}
+\caption{Logical live-panel peaks on the random warm-start batch.}
+\label{tab:dag-memory}
+\end{table}
+Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 reduces it by another 77.0\%. Reducing the chunk from 256 to 64 saves only 4.65\% more panels but nearly quadruples groups. Greedy uses the fewest panels and permits on-demand field loading, but its fine-grained execution may reduce parallelism. This is a memory--granularity trade-off, not evidence that greedy minimises runtime.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\linewidth]{figures/dag_memory.png}
+\caption{Simulated memory against batch size (left) and scheduling groups for the largest batch (right), with logarithmic axes. Groups are not MPI message counts.}
+\label{fig:dag-memory}
+\end{figure}
+
+\paragraph{Small engine check (S4).}
+On Vanda CPU node CN-016, the handed-off serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Formula chunk & Median wall time (s) & Range (s) & Median RSS (MiB) \\
+\midrule
+16 & 1.60 & 1.53--1.93 & 25.42 \\
+64 & 1.39 & 1.23--1.58 & 25.42 \\
+200 & 1.29 & 1.26--1.75 & 34.53 \\
+\bottomrule
+\end{tabular}
+\caption{Actual single-node formula-chunk experiment; three separate processes per setting.}
+\label{tab:dag-s4}
+\end{table}
+All nine runs exit successfully. A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. The retained verification record and logs were reviewed; raw score files were not included in the review archive. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not exact S2 scheduling.
+
+\paragraph{Consequences for the engine.} These results fix how the engine evaluates a batch in the experiments that follow. Sharing (Table~\ref{tab:dag-sharing}) is why a whole batch is merged into one DAG before evaluation: the real batch of Section~\ref{sec:experiments} gives 12{,}083 DAG nodes for 10{,}000 expressions. Once roots are released early, the widest level sets the peak (Table~\ref{tab:dag-memory}), so the engine also processes wide levels in chunks (Section~\ref{sec:threads}): the widest level of that batch has 8614 nodes, and the runs below use chunks of 1000 nodes on one node and 2000 on several. Chunking does not change any score (Table~\ref{tab:dag-s4} and Section~\ref{sec:threads}). Its cost is one halo exchange per chunk instead of one per level; we did not compare run times with and without chunking.
 
 \subsection{Factor computation and evaluation}
 
@@ -485,131 +611,6 @@ The distributed result is compared with the serial one with the criterion of Sec
 \subsubsection{Effect on admission decisions}
 \todo{}
 
-\subsection{DAG, memory and caching}
-\label{sec:dag-exp}
-\paragraph{Inputs and measurement scope.}
-S1--S3 use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on the user's arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
-
-\subsubsection{Subexpression sharing and serial planning}
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{lrrrrr}
-\toprule
-Batch & Expressions & Tree nodes & DAG nodes & Reduction & Operator-only \\
-\midrule
-Depth 1 & 10,000 & 24,157 & 10,000 & 58.6\% & 0.0\% \\
-Depth 2 & 10,000 & 35,022 & 11,591 & 66.9\% & 39.3\% \\
-Depth 3 & 9,991 & 40,942 & 13,135 & 67.9\% & 44.5\% \\
-Depth 3 warm start & 29,955 & 125,465 & 32,825 & 73.8\% & 54.4\% \\
-\bottomrule
-\end{tabular}
-\caption{Random-batch sharing. Tree counts precede normalisation and include leaves; operator-only reduction excludes leaves. Neither reduction is a measured speed-up.}
-\label{tab:dag-sharing}
-\end{table}
-Depth 1 shares only field leaves in these batches: its operator count is unchanged. The warm-start DAG has 132 leaves and 7,117, 15,273 and 10,303 nodes at levels 1--3. The widest layer is therefore not the number of roots or the peak live set. Python and C++ agree on canonical node sets, levels, subtree sizes, reference counts, accepted inputs and root order for all measured prefixes.
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{rrrrrr}
-\toprule
-Expressions & $V_d$ & $E_d$ & Build (s) & Chunk 256 (s) & Greedy (s) \\
-\midrule
-1,000 & 2,190 & 2,732 & 0.0532 & 0.00148 & 0.0209 \\
-5,000 & 7,805 & 10,171 & 0.2490 & 0.00533 & 0.1581 \\
-10,000 & 13,210 & 17,377 & 0.4730 & 0.00898 & 0.3205 \\
-29,955 & 32,825 & 44,032 & 1.4021 & 0.02312 & 1.2302 \\
-\bottomrule
-\end{tabular}
-\caption{Serial Python planning on warm-start prefixes: distinct vertices $V_d$ and child--parent edges $E_d$. The last two columns time scheduling only.}
-\label{tab:dag-runtime}
-\end{table}
-The largest graph has 44,034 operand references but 44,032 distinct edges, because repeated inputs count twice for lifetime management. Both graph dimensions grow in this experiment; they are not independently controlled. Construction grows approximately with batch size over these four points, while greedy scheduling is more expensive than simple chunk scheduling. These are planner overheads, not C++ factor runtimes, and no same-hardware end-to-end overhead ratio has been measured.
-
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=0.96\linewidth]{figures/dag_runtime.png}
-\caption{Planner construction versus vertices and scheduling versus edges, on log--log axes. Mac measurements are not combined with Vanda engine timings.}
-\label{fig:dag-runtime}
-\end{figure}
-
-\subsubsection{Peak memory against batch size}
-For equal float32 panels, the model converts a peak live count $L$ into $4LN\lceil T/p\rceil$ bytes, with $T=1461$, $N=5876$ and $p=1$ here. This excludes halos, retained pool buffers, target ranks, operator scratch and communication/PCA workspaces; it is not RSS. Operator-group counts describe scheduling granularity, not measured MPI synchronisations or messages.
-
-\begin{table}[htbp]
-\centering\small
-\begin{tabular}{lrrr}
-\toprule
-Schedule, 29,955 expressions & Peak panels & Panel GiB & Groups (proxy) \\
-\midrule
-Retain roots & 32,290 & 1,032.67 & 3 \\
-Early release & 17,730 & 567.02 & 3 \\
-Chunk 1,024 & 4,850 & 155.11 & 33 \\
-Chunk 256 & 4,086 & 130.67 & 129 \\
-Chunk 64 & 3,896 & 124.60 & 512 \\
-Greedy & 1,553 & 49.67 & 32,693 \\
-\bottomrule
-\end{tabular}
-\caption{Logical live-panel peaks on the random warm-start batch. Persistent cross-batch caching is not enabled.}
-\label{tab:dag-memory}
-\end{table}
-Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 reduces it by another 77.0\%. Reducing the chunk from 256 to 64 saves only 4.65\% more panels but nearly quadruples groups. Greedy uses the fewest panels and permits on-demand field loading, but its fine-grained execution may reduce parallelism. This is a memory--granularity trade-off, not evidence that greedy minimises runtime.
-
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=\linewidth]{figures/dag_memory.png}
-\caption{Simulated memory against batch size (left) and scheduling groups for the largest batch (right), with logarithmic axes. Groups are not MPI message counts.}
-\label{fig:dag-memory}
-\end{figure}
-
-\paragraph{Small engine check (S4).}
-On Vanda CPU node CN-016, the handed-off serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
-
-\begin{table}[htbp]
-\centering
-\begin{tabular}{rrrr}
-\toprule
-Formula chunk & Median wall time (s) & Range (s) & Median RSS (MiB) \\
-\midrule
-16 & 1.60 & 1.53--1.93 & 25.42 \\
-64 & 1.39 & 1.23--1.58 & 25.42 \\
-200 & 1.29 & 1.26--1.75 & 34.53 \\
-\bottomrule
-\end{tabular}
-\caption{Actual single-node formula-chunk experiment; three separate processes per setting.}
-\label{tab:dag-s4}
-\end{table}
-All nine runs exit successfully. A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. The retained verification record and logs were reviewed; raw score files were not included in the review archive. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not exact S2 scheduling or a real cross-batch cache.
-
-\subsubsection{Reuse across generations}
-Real GP traces were unavailable in the supplied directory at measurement time. We therefore replay the three shared-pool random depth-3 batches in order and label them as batches, not generations. Each replay begins with an empty cache, so the first batch saves no computation. No result yet establishes population-aware or gene-pool-pinning performance on evolved populations.
-
-\subsubsection{Cache policies}
-An entry is a full float32 panel (about 0.032\,GiB); budgets 16, 32, 64 and 128\,GiB hold 500, 1,000, 2,001 and 4,002 entries. Estimated work is the sum of costs of distinct executed operator nodes. The supplied gpushare profile gives nanoseconds per cell; missing rank, z-score and delta costs use std, mean and lag proxies respectively. Window effects are averaged. Saved cost excludes I/O, cache maintenance, RankIC and communication and is not measured time saved on the Mac or Vanda.
-
-\begin{table}[htbp]
-\centering
-\begin{tabular}{rrrrr}
-\toprule
-Budget (GiB) & LRU & LFU & Cost-aware & Offline reference \\
-\midrule
-16 & 0.219\% & 0.219\% & 0.543\% & 2.357\% \\
-32 & 0.487\% & 0.489\% & 1.109\% & 4.857\% \\
-64 & 0.974\% & 1.008\% & 3.665\% & 9.960\% \\
-128 & 2.439\% & 2.604\% & 7.139\% & 19.336\% \\
-\bottomrule
-\end{tabular}
-\caption{DAG-pruned replay: weighted operator cost avoided over all three random batches, including cold start. The offline reference uses future batch membership and is not an optimal bound.}
-\label{tab:dag-cache}
-\end{table}
-Cost-aware retention gives larger estimated savings than LRU/LFU at the larger budgets tested. At 128\,GiB, its second and third batches avoid 11.619\% and 9.804\% of their cost, or 10.713\% combined without the cold batch. Two later batches do not estimate steady state. Forced insertion and the batch-boundary update order can cause scan pollution; the experiment does not isolate its effect. There is no basis to claim significant real end-to-end acceleration yet.
-
-\begin{figure}[htbp]
-\centering
-\includegraphics[width=\linewidth]{figures/dag_cache.png}
-\caption{Budget sensitivity of the pruned replay, with and without the cold batch. Budget uses a logarithmic axis; percentages use a linear axis to retain zero values. Offline and online strategies are distinguished.}
-\label{fig:dag-cache}
-\end{figure}
-
 %======================================================================
 \section{Discussion}
 
@@ -620,7 +621,7 @@ Cost-aware retention gives larger estimated savings than LRU/LFU at the larger b
 \todo{growing stock universe and load imbalance; distribution of RankIC of the selected factors; effect of float32 on rankings}
 
 \subsection{Future work}
-\todo{asynchronous steady-state GP; overlapping CPU and GPU work; evaluating immigrants early instead of waiting for the generation's PCA step; \code{MPI\_Exscan} for ema; weighted date blocks; fusion of element-wise operators}
+\todo{asynchronous steady-state GP; overlapping CPU and GPU work; evaluating immigrants early instead of waiting for the generation's PCA step; \code{MPI\_Exscan} for ema; weighted date blocks; fusion of element-wise operators; smaller chunks or a memory-aware order for the 24\,GB GPU}
 
 %======================================================================
 \section{Conclusion}
