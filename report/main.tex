@@ -7,6 +7,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{graphicx}
+\usepackage{float}
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{hyperref}
@@ -208,7 +209,7 @@ A panel is stored as a contiguous float32 array in date-major order, together wi
 \end{itemize}
 In the date-major layout a stock's history is a column with stride $N$ floats ($23.5$\,KB), so reading it touches one cache line per day for only four useful bytes. This is acceptable for two reasons. First, the loop over stocks uses a static schedule, so each thread processes a contiguous range of stocks: the $T$ cache lines loaded for one column ($T\times64$\,B $\approx 93$\,KB for the full period, less per rank) stay in the 2\,MB per-core L2 cache and serve the next 15 columns. Second, the gather is $O(T)$ per column, while the window kernels that follow do considerably more work per element (Kahan compensation, deque updates, sorted windows for the median), so the copy is a small part of the operator time. Storing panels stock-major instead would make the cross-sectional operators and the daily RankIC strided, and those are at least as expensive.
 
-\subsubsection{Reproducing pandas exactly}
+\subsubsection{Calibrating floating-point differences}
 Small differences in floating-point rounding can change which windows look constant, and hence whether a correlation is finite, so we port the pandas~3.0.3 window kernels rather than textbook formulas.
 \begin{itemize}[nosep]
   \item Rolling sums and means use Kahan summation with separate compensations for additions and removals. When the last $n_{obs}$ observations are identical, the repeated value is returned exactly.
@@ -236,12 +237,13 @@ The exponential moving average follows pandas' \code{adjust=False} recursion wit
   y_t = \frac{o\,y_{\text{prev}} + \alpha x_t}{o+\alpha}, \qquad o = (1-\alpha)^{k+1}.
 \end{equation}
 This is an affine function of $y_{\text{prev}}$, so a block of days maps its initial state through an affine map, and affine maps compose associatively. Each rank summarises its block per stock; the states are then passed along the ranks in a chain (rank $r$ receives the state at its first day from rank $r-1$), and each rank runs its block from the correct initial state.
-The chain takes $p-1$ sequential hops per level that contains an ema, each carrying two numbers per stock. Rank $r$ cannot start its ema until all ranks to its left have finished theirs, so the measured scan time includes this waiting: it is 0.13\,s at 72 ranks and 0.58\,s at 288 ranks. An \code{MPI\_Exscan} over the affine maps would need only $O(\log p)$ steps; it is left as future work.
+The chain takes $p-1$ sequential hops per level that contains an ema, each carrying two numbers per stock. Rank $r$ cannot start its ema until all ranks to its left have finished theirs, so the measured scan time includes this waiting: for the 10{,}000-expression batch it is 0.83\,s at 72 ranks and 4.8\,s at 288 ranks, against a total of 143\,s and 75\,s.
 
 \subsubsection{Daily RankIC and fitness}
 Daily RankIC is local to a rank, because a day's cross-section is never split. A root's RankIC is computed as soon as its DAG level is done, and the root's panel is then released like any other node. Each rank keeps only a small summary per root (segment sums and counts), and one \code{MPI\_Allreduce} of all summaries gives the fitness of the whole batch.
 
 \subsubsection{Thread strategies and memory}
+\label{sec:threads}
 Inside a rank we implement two thread strategies, selected at run time:
 \begin{itemize}[nosep]
   \item \textbf{operator-level:} the nodes of a level are computed one after another, and each operator is split over days or stocks as in Section~\ref{sec:operators};
@@ -251,18 +253,19 @@ Operator-level threading parallelises every node, including the narrow top level
 
 Threads only read shared input panels and write their own output panels, so no locks are needed on the data. The buffer pool and the per-operator timers are the only shared mutable state: output buffers are taken from the pool in a serial pass before the parallel loop, and the timers are updated in a critical section. The contention that remains is for memory bandwidth and cache capacity.
 
-Three findings from development, measured on an earlier 32-core development server, shaped the memory handling:
+Memory handling went through three problems, each found by timing every operator separately on an earlier 32-core development server, and a fourth that appeared only with large batches:
 \begin{itemize}[nosep]
-  \item \textbf{First-touch page faults.} Allocating a fresh panel for every node made the kernel zero new pages on first write; with 32 threads faulting at once, about 45\% of the compute phase was not in the operators. Removing the explicit zeroing alone moved the faults into the parallel operators and made 32 threads slower.
-  \item \textbf{Buffer pool.} A released panel goes back to a pool, and new nodes take the smallest pooled buffer that fits. The pool is kept across batches, as in a GP run where the engine is called generation after generation. This doubled the single-rank 32-thread speed-up (10.9 to 19.9) and removed run-to-run variation of up to 50\%.
-  \item \textbf{Per-thread scratch arrays.} A rolling correlation used to allocate about 13 temporary arrays per stock. Each thread now allocates them once and reuses them for every stock, which removed allocator contention and cut 32-thread time by another 8\%.
+  \item \textbf{Page faults on fresh memory.} At first every node allocated a new panel. The operating system only maps physical pages when they are first written, and it zeroes each page at that moment. With 32 threads writing new panels at once, these page faults queued in the kernel and took about 45\% of the compute phase, outside the operators themselves.
+  \item \textbf{Fix: a buffer pool.} Instead of returning a released panel to the operating system, the engine keeps the buffer, whose pages are already mapped, in a pool, and the next node that needs a panel takes the smallest pooled buffer that fits. Nothing is copied or moved; the memory simply stays allocated in RAM. The pool lives as long as the engine object, so it carries over from one batch to the next, as in a GP run where the engine is called generation after generation. Only the very first batch still pays for page faults, and the benchmark's warm-up run absorbs that. The pool doubled the single-rank 32-thread speed-up (10.9 to 19.9) and removed run-to-run variation of up to 50\%.
+  \item \textbf{Per-thread scratch arrays.} A rolling correlation used to allocate about 13 temporary arrays per stock, and many threads allocating at once contend inside the allocator. Each thread now allocates them once and reuses them for every stock, which cut 32-thread time by another 8\%.
+  \item \textbf{Wide levels.} A batch of 10{,}000 expressions has a level of 8614 nodes. Allocating all of them at once would need the output panels of the whole level in memory. The engine therefore processes a wide level in chunks of at most $k$ nodes (\code{--chunk}): each chunk is allocated, computed, exchanged, scored and released before the next one. The result does not depend on $k$ (checked against the serial engine with chunks of 250 and 300 nodes). With $k=2000$, 72 ranks on one node peak at about 4.9\,GB each, and one rank with 72 threads at 138\,GB.
 \end{itemize}
 
 \subsubsection{Communication and load model}
 For $p$ ranks and a batch with exchanged node set $\mathcal{X}$:
 \begin{itemize}[nosep]
-  \item \textbf{Halo volume.} Each rank sends, for each exchanged node $n\in\mathcal{X}$, its last $\mathrm{halo}(n)$ rows of $N$ floats, i.e.\ $4N\sum_{n\in\mathcal{X}}\mathrm{halo}(n)$ bytes per rank, independent of $p$. For the 200-factor batch this is 29 nodes and about 7.1\,MB per rank.
-  \item \textbf{Messages.} One packed message per partner per level. While a block is longer than the longest halo, the only partner is the left neighbour; the measured maximum is 2 messages per rank for the whole batch up to 36 ranks. When $T/p$ drops below the halo, rows come from several ranks, and the maximum rises to 3, 5 and 10 messages at 72, 144 and 288 ranks.
+  \item \textbf{Halo volume.} Each rank sends, for each exchanged node $n\in\mathcal{X}$, its last $\mathrm{halo}(n)$ rows of $N$ floats, i.e.\ $4N\sum_{n\in\mathcal{X}}\mathrm{halo}(n)$ bytes per rank, nearly independent of $p$. For the 10{,}000-expression batch of Section~\ref{sec:experiments} this is 1811 of 12{,}083 nodes and 1.47--1.73\,GB per rank (it grows slightly with $p$ because short blocks forward rows from further left).
+  \item \textbf{Messages.} One packed message per partner per level (per chunk, when a level is processed in chunks, Section~\ref{sec:threads}). While a block is longer than the longest halo, the only partner is the left neighbour; when $T/p$ drops below the halo, rows come from several ranks. For the 10{,}000-expression batch with chunks of 2000 nodes the measured maximum is 2 messages per rank up to 16 ranks and 4, 6, 12 and 24 at 36, 72, 144 and 288 ranks.
   \item \textbf{ema chain.} $p-1$ sequential hops per ema level, two numbers per stock each (Section~\ref{sec:ema}).
   \item \textbf{Fitness.} One \code{MPI\_Allreduce} of a short summary vector per root (segment sums and counts), under 0.5\,ms at 288 ranks.
 \end{itemize}
@@ -294,64 +297,63 @@ On the $1481$ selected factors, merging all expressions into one DAG reduces $11
 %======================================================================
 \section{Validation}
 \label{sec:validation}
-Validation shows that the C++ engine and its parallel versions compute the same results as the original Python miner and as the serial engine.
+A faster engine is only useful if it computes the same numbers. We had a ready-made reference for this. An earlier full run of the original Python miner produced a factor library of 1481 factors, and Python had already computed their values, daily RankIC and fitness. Validation therefore means asking the C++ engine to compute the same things again and comparing them with Python's results item by item.
 
-\paragraph{Parsing and DAG.} We test 1531 expressions: the 1481 selected factors plus crafted cases for every operator and normalisation rule. For every valid expression, the C++ engine reproduces the Python depth and node count, and two expressions share a DAG root exactly when Python gives them the same normalised key.
+\paragraph{Parsing and DAG.} We first checked that C++ reads expressions the way Python does. We parsed all 1481 library expressions plus 50 hand-written ones (at least one for every operator and every normalisation rule), 1531 in total, on both sides. Every valid expression gets the same depth and node count, and two expressions that Python considers equivalent (same normalised key) end up on the same DAG root in C++.
 
-\paragraph{Operators.} We evaluate 88 expressions on a $120\times300$ sample of the real data with all 132 fields: every operator with windows 1, 5 and 20, several nested expressions, and 40 selected factors. The number of cases follows from this design (operator $\times$ window, plus nesting), not from a target count. Each result is compared with the pandas output element by element, using $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and an identical pattern of missing values.
-All 88 cases pass, with identical positions of missing and infinite values. The engine stores every panel in float32, while pandas keeps some intermediates in float64. Where an operator such as a correlation is applied to an intermediate result, this can decide whether a nearly constant window is treated as constant. We therefore port the pandas window kernels exactly (Section~\ref{sec:operators}) and treat windows that are constant within their range consistently, which makes all 88 cases agree. The remaining effect of float32 storage is measured on RankIC below.
+\paragraph{Operators.} Comparing every cell of the full data would be slow, so we cut a sample of 120 days $\times$ 300 stocks from the real data, keeping all 132 fields, and evaluated 88 expressions on it. The first 48 test single operators, each with windows 1, 5 and 20, plus a few nested combinations; the other 40 are taken from the factor library, to check that operators still agree when combined as in real factors. The number of cases follows from this design, not from a target. A cell passes if $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and missing values are in the same places; the absolute term is there because pandas itself computes a few operators in float32.
 
-\paragraph{RankIC, fitness and signatures.} We separate the correctness of each code from the effect of float32 storage:
-\begin{itemize}[nosep]
-  \item \textbf{RankIC code:} given pandas' factor values rounded to float32, the C++ daily RankIC matches pandas in 88/88 cases to $10^{-12}$ (maximum difference $8.9\times10^{-16}$);
-  \item \textbf{fitness code:} given the same daily IC, the fitness matches Python in 88/88 cases (maximum difference $8.3\times10^{-17}$);
-  \item \textbf{end to end:} from raw data, 63/88 cases match exactly; the largest daily IC difference is $1.5\times10^{-4}$ and the largest fitness difference $2.4\times10^{-5}$, and candidate acceptance agrees in 88/88 cases. The differences come from float32 storage, which turns distinct float64 values into ties: rounding pandas' own factor values to float32 reproduces exactly the same differences;
-  \item \textbf{signature code:} given the same float32 values, the C++ signature is bit-identical to Python's in 88/88 cases;
-  \item \textbf{signatures end to end:} on the full data, $1-$similarity between the C++ and Python signatures is at most $6.9\times10^{-6}$ (88/88), and the largest cases are rolling operators whose values differ by float32 rounding.
-\end{itemize}
-Unit tests with hand-computed examples additionally cover ties, perfect positive and negative correlation, constant cross-sections, the segment split, the sign-consistency penalty and the three rejection rules; the ema scan is tested bit-for-bit against the serial ema for several block splits, missing-value patterns and spans.
+With textbook sliding-window formulas only 53 of the 88 cases passed. Every failure came from rounding: a tiny rounding difference decides whether a window counts as constant, and that decides whether a correlation is finite, missing or infinite. After porting the pandas~3.0.3 window kernels line by line (Section~\ref{sec:operators}) and treating windows that are constant within their range consistently, all 88 cases pass, with missing and infinite values in exactly the same places.
 
-\paragraph{Distributed against serial.} The distributed engine must give the same candidate validity as the serial engine and fitness within $10^{-5}$. Panels are not required to be bit-identical: rolling sums and variances (Kahan and Welford) restart at every block boundary, so a cell can differ in the last bits, and a near-zero cell can differ by a large relative amount without changing any ranking. Results for up to 288 ranks and both thread strategies are in Section~\ref{sec:v}.
+\paragraph{RankIC, fitness and signatures.} Here two kinds of difference have to be told apart: a bug in the code, and rounding caused by storing panels in float32. We therefore compared everything twice. First we gave C++ pandas' own factor values, rounded to float32, so both sides had identical input and only the code was tested. The daily RankIC agreed in 88/88 cases (largest difference $8.9\times10^{-16}$), the fitness in 88/88 ($8.3\times10^{-17}$), and the PCA signature was bit-identical to Python's in 88/88. Then we let C++ compute everything from the raw data. 63 of 88 cases matched Python exactly; for the rest the daily IC differed by at most $1.5\times10^{-4}$ and the fitness by at most $2.4\times10^{-5}$, and whether a factor is accepted agreed in all 88. These differences come from float32: two distinct float64 values can round to the same float32 and create a tie in the ranking. When we rounded pandas' own factor values to float32 and recomputed the IC in Python, we got exactly the same differences as C++, so the cause is storage precision, not the code. Signatures were also compared end to end on the full data ($1461\times5876$): $1-$similarity was at most $6.9\times10^{-6}$, tiny next to the 0.9 correlation threshold used for admission.
+
+Small hand-computed unit tests cover the corner cases that real data rarely hit: ties, perfectly positive and negative correlation, constant cross-sections, the segment split, the sign-consistency penalty and the three rejection rules. The ema scan is checked bit for bit against the serial ema for several block splits, missing-value patterns and spans.
+
+\paragraph{Distributed against serial.} The distributed engine is compared with our own serial engine rather than with Python. It must give the same validity for every candidate and fitness within $10^{-5}$. We do not require bit-identical panels: rolling sums and variances restart at every block boundary, so the last bits of a cell can differ, and a cell close to zero can differ by a large relative amount without changing any ranking. In the runs where we counted them (up to 32 ranks), more than 99.998\% of cells were bit-identical. Results for up to 288 ranks and both thread strategies are in Section~\ref{sec:v}.
 
 %======================================================================
 \section{Experiments}
-Every run is timed with \code{MPI\_Barrier} followed by \code{MPI\_Wtime}. Each phase (loading, operators, halo exchange, ema scan, RankIC, waiting, reduction) is the maximum over ranks, and the total is the slowest rank's wall time. Each configuration runs once to warm up (which also fills the buffer pool, as in a GP run where the engine is called generation after generation) and then three times; we report the median. Unless stated otherwise the batch has 200 selected factors (752 DAG nodes) on the full real data, $T=1461$ days and $N=5876$ stocks. Loading is reported separately because it depends on the shared file system. All plots use logarithmic axes for time, problem size and core count. Runs used Intel Xeon 8452Y nodes only; each job records the CPU model of its hosts.
+\label{sec:experiments}
+\paragraph{Workload.} The experiments evaluate one real batch from a run of the Python miner: the 10{,}000 distinct expressions of its depth-2 warm-start batch, which is the batch the engine would receive in that generation. Merged into one DAG they give 12{,}083 nodes in three levels (132 leaves, 3337 and 8614 operator nodes). Almost every non-leaf node is a root that has to be scored, so this batch is evaluation-heavy. Unless stated otherwise each run evaluates the whole batch on the full real data, $T=1461$ days and $N=5876$ stocks.
+
+\paragraph{Timing.} Every run is timed with \code{MPI\_Barrier} followed by \code{MPI\_Wtime}. Each phase (loading, operators, halo exchange, ema scan, RankIC, waiting, reduction) is the maximum over ranks, and the total is the slowest rank's wall time. Most configurations run once to warm up (which also fills the buffer pool, as in a GP run where the engine is called generation after generation) and then three times, and we report the median. The slow ones (one rank, and two or four ranks or threads, 21 to 84 minutes each) run once without warm-up; for them the page faults of the first run are a small part of the time. Wide levels are processed in chunks of 1000 nodes on one node and 2000 nodes on several nodes (Section~\ref{sec:threads}). Loading is reported separately because it depends on the shared file system. All plots use logarithmic axes for time, problem size and core count. Runs used Intel Xeon 8452Y nodes only; each job records the CPU model of its hosts.
 
 \subsection{Factor computation and evaluation}
 
 \subsubsection{Serial run time against problem size}
 \label{sec:x1}
-One rank and one thread. We vary one dimension at a time: the number of days $T$ (prefixes of the real data, 50 factors), the number of stocks $N$ (the first $N$ stocks), and the batch size; synthetic data extend $T$ and $N$ beyond the real data (Figure~\ref{fig:x1}).
+One rank and one thread. We vary one dimension at a time: the number of days $T$ (prefixes of the real data), the number of stocks $N$ (the first $N$ stocks), and the batch size (the first $E$ expressions of the batch). Synthetic data extend $T$ and $N$ beyond the real data; there we use the first 500 expressions, because eight times the days with more expressions does not fit in a node's memory (Figure~\ref{fig:x1}).
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \begin{tabular}{lrrr}
 \toprule
 dimension & range & total time (s) & slope \\
 \midrule
-$T$, real, 50 factors & 91 -- 1461 & 2.34 -- 34.2 & 0.99 \\
-$N$, real, 50 factors & 367 -- 5876 & 2.82 -- 34.1 & 0.93 \\
-$T$, synthetic & 1461 -- 11688 & 64.9 -- 610.7 & 1.10 \\
-$N$, synthetic & 5876 -- 23504 & 64.8 -- 273.1 & 1.05 \\
-batch size, real & 25 -- 800 & 17.1 -- 525.2 & 0.99 \\
+$T$, real, 10{,}000 expressions & 91 -- 1461 & 245 -- 5059 & 1.09 \\
+$N$, real, 10{,}000 expressions & 367 -- 5876 & 376 -- 5059 & 0.95 \\
+$T$, synthetic, 500 expressions & 1461 -- 11688 & 540 -- 4825 & 1.05 \\
+$N$, synthetic, 500 expressions & 5876 -- 23504 & 540 -- 2304 & 1.05 \\
+batch size, real & 625 -- 10{,}000 & 568 -- 5059 & 0.89 \\
 \bottomrule
 \end{tabular}
 \caption{Serial run time. The slope is fitted on log--log axes to the time without loading.}
+\label{tab:x1}
 \end{table}
 
-The run time is close to linear in every dimension, as Section~\ref{sec:cost} predicts: operators are $O(TN)$ per node and RankIC is $O(TN\log N)$, whose $\log N$ factor shows up as the slightly larger slope in $N$ on synthetic data. The synthetic panels are slower per cell than the real ones because only 2\% of their cells are missing, while the real data have many missing stocks in early years. Operators and RankIC take about the same time, so evaluation is not a small add-on to computation. The time is also linear in the batch size: the DAG removes repeated subexpressions, but the remaining nodes cost about the same each.
+The whole batch takes 5059\,s (1.4 hours) on one core, which is why a generation of the Python miner is slow. The run time is close to linear in every dimension, as Section~\ref{sec:cost} predicts: operators are $O(TN)$ per node and RankIC is $O(TN\log N)$, which shows up as the slope slightly above 1 on synthetic data. The slope in $T$ on real data (1.09) is larger because the market grows: the early years, which the short prefixes cover, have fewer listed stocks per day. The slope in batch size is below 1 (0.89) because larger batches share more subexpressions: 625 expressions need 2.1 DAG nodes each, 10{,}000 need 1.2. RankIC takes 70\% of the serial time (3522\,s against 1536\,s for the operators), because 83\% of the nodes of this batch are roots and each root's RankIC sorts every day's cross-section.
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{figures/x1_serial.pdf}
-\caption{Serial run time against $T$, $N$ and batch size, with the operator and RankIC parts.}
+\caption{Serial run time against $T$, $N$ and batch size, with the operator and RankIC parts. Real data: the 10{,}000-expression batch or its prefixes; synthetic data: the first 500 expressions.}
 \label{fig:x1}
 \end{figure}
 
 \subsubsection{Strong scaling (pure MPI)}
-One thread per rank, $H_0=0$, 1 to 72 ranks on one node and 144 and 288 ranks on two and four nodes.
+One thread per rank, $H_0=0$, 1 to 72 ranks on one node and 144 and 288 ranks on two and four nodes (Table~\ref{tab:x2}, Figure~\ref{fig:x2}).
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \small
 \begin{tabular}{lrrrrrrrrr}
@@ -359,18 +361,18 @@ One thread per rank, $H_0=0$, 1 to 72 ranks on one node and 144 and 288 ranks on
 ranks & 1 & 2 & 4 & 8 & 16 & 36 & 72 & 144 & 288 \\
 nodes & 1 & 1 & 1 & 1 & 1 & 1 & 1 & 2 & 4 \\
 \midrule
-time (s) & 136.65 & 74.77 & 40.16 & 21.42 & 11.38 & 6.19 & 3.62 & 2.44 & 2.27 \\
-speed-up & 1 & 1.83 & 3.40 & 6.38 & 12.0 & 22.1 & 37.8 & 55.9 & 60.2 \\
-efficiency & 1 & 0.91 & 0.85 & 0.80 & 0.75 & 0.61 & 0.52 & 0.39 & 0.21 \\
+time (s) & 5060 & 2825 & 1534 & 815.7 & 436.4 & 241.3 & 142.7 & 94.1 & 75.0 \\
+speed-up & 1 & 1.79 & 3.30 & 6.20 & 11.6 & 21.0 & 35.5 & 53.8 & 67.5 \\
+efficiency & 1 & 0.90 & 0.82 & 0.78 & 0.72 & 0.58 & 0.49 & 0.37 & 0.23 \\
 \bottomrule
 \end{tabular}
-\caption{Strong scaling, 200 factors on the real data.}
+\caption{Strong scaling, 10{,}000 expressions on the real data.}
 \label{tab:x2}
 \end{table}
 
-Operators and RankIC keep falling roughly as $1/p$ (at 288 ranks: 1.18\,s and 0.39\,s), but halo exchange plus waiting stays at 1.5--1.9\,s from 16 ranks on (Figure~\ref{fig:x2}). From 144 to 288 ranks the total time barely changes. The Karp--Flatt serial fraction falls from 0.09 at two ranks to about 0.01 and does not grow, so the loss is not a growing serial part but the fixed cost of the level-by-level exchange and of uneven blocks: the dates are split evenly, but later years have more stocks. Per-rank timing to confirm the imbalance is future work.
+The phases scale very differently. RankIC falls from 3519\,s to 18.5\,s at 288 ranks (190 times), because it is purely local. The operators fall from 1539\,s to 66\,s at 72 ranks but only to 52\,s at 288 ranks, and the halo phase stays at 22--24\,s from 16 ranks on. At 288 ranks each block has about 5 days, while the exchanged nodes need up to 89 days of history: each rank receives 1.7\,GB of halo rows, more than its own share of the panels, and the rolling windows restart at every block boundary, so per-rank operator work no longer shrinks with $p$. Waiting is large at every rank count (451\,s of 2825\,s at two ranks), consistent with the uneven blocks of Section~\ref{sec:cost}: the second half of the period has more listed stocks. The Karp--Flatt serial fraction falls from 0.12 at two ranks to 0.011 at 288 and does not grow, so the loss is not a growing serial part but a per-rank cost that does not shrink: halo, boundary restarts and imbalance. Per-rank timing to separate these is future work.
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{figures/x2_strong.pdf}
 \includegraphics[width=0.6\linewidth]{figures/x2_strong_breakdown.pdf}
@@ -379,24 +381,25 @@ Operators and RankIC keep falling roughly as $1/p$ (at 288 ranks: 1.18\,s and 0.
 \end{figure}
 
 \subsubsection{Weak scaling (pure MPI)}
-Synthetic data with 64 days per rank (from $T=64$ at one rank to $T=18432$ at 288 ranks), $N=5876$, 200 factors.
+Synthetic data with 64 days per rank (from $T=64$ at one rank to $T=18432$ at 288 ranks), $N=5876$, the first 1000 expressions of the batch (1956 DAG nodes); with the whole batch, 72 ranks with 64 days each would not fit in one node's memory.
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \begin{tabular}{lrrrrrr}
 \toprule
 ranks & 1 & 2--16 & 36 & 72 & 144 & 288 \\
 \midrule
-time (s) & 9.36 & $\approx$11.0 & 12.69 & 13.19 & 12.97 & 13.60 \\
-efficiency & 1 & $\approx$0.85 & 0.74 & 0.71 & 0.72 & 0.69 \\
+time (s) & 40.4 & $\approx$54.0 & 61.7 & 61.9 & 62.1 & 63.7 \\
+efficiency & 1 & 0.75 & 0.66 & 0.65 & 0.65 & 0.63 \\
 \bottomrule
 \end{tabular}
-\caption{Weak scaling on synthetic data.}
+\caption{Weak scaling on synthetic data, 1000 expressions.}
+\label{tab:x3}
 \end{table}
 
-The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant). The efficiency falls again between 16 and 72 ranks, when one node is filled and its memory bandwidth is shared, and stays at about 0.7 across two and four nodes, so crossing the network adds little (Figure~\ref{fig:x3}). Synthetic data are used here because the real data cannot grow with the number of ranks; their blocks also have equal work, which separates communication from imbalance.
+The drop from one to two ranks is the halo exchange (about 8.5\,s, rising only to 9.9\,s from 36 ranks on) and the matching boundary work. The efficiency falls again between 16 and 36 ranks, when the node fills up and its memory bandwidth is shared, and then stays at 0.63--0.65 across two and four nodes, so crossing the network adds little (Table~\ref{tab:x3}, Figure~\ref{fig:x3}). Synthetic data are used here because the real data cannot grow with the number of ranks; their blocks also have equal work, which separates communication from imbalance.
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=0.45\linewidth]{figures/x3_weak.pdf}
 \includegraphics[width=0.5\linewidth]{figures/x3_weak_breakdown.pdf}
@@ -405,13 +408,13 @@ The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant
 \end{figure}
 
 \subsubsection{Communication}
-\paragraph{Halo exchange versus redundant computation.} With pure MPI, raising $H_0$ from 0 to 89 days cuts the halo data from 7.1--8.0\,MB to 0.7--0.8\,MB and the number of exchanged nodes from 29 to 1, at the cost of 439 redundant rows per rank. The total time changes by less than 2\% at 72, 144 and 288 ranks (Figure~\ref{fig:x4}, left). The halo time is therefore not transfer time: it is time spent waiting for the left neighbour to finish the level. With hybrid splits, $H_0\ge10$ helps 72 ranks $\times$ 4 threads (1.55\,s to 1.38\,s, $-11\%$), does not matter for 16 $\times$ 18, and gives no stable trend for 4 $\times$ 72.
+\paragraph{Halo exchange versus redundant computation.} Raising $H_0$ replaces exchanged nodes by recomputation. With pure MPI, $H_0=10$ changes almost nothing (1811 to 1591 exchanged nodes); $H_0=30$ leaves 715, and $H_0\ge60$ leaves 53 nodes and 40--45\,MB of halo per rank instead of 1.5--1.7\,GB, at the cost of 60{,}944 redundant rows per rank. The total time nevertheless rises: from 142.7 to 159.1\,s at 72 ranks ($+11\%$), from 94.2 to 109.7\,s at 144 ($+16\%$) and from 72.0 to 86.7\,s at 288 ($+20\%$) (Figure~\ref{fig:x4}, left). The halo time also rises (23.7 to 31.1\,s at 72 ranks) although 97\% less data is sent, so it is not transfer time but time spent waiting for the left neighbour to finish the level, which the redundant work makes longer. For this batch exchanging everything ($H_0=0$) is best; with hybrid splits the picture is the same (72 ranks $\times$ 4 threads: 50.8\,s at $H_0=0$, 54\,s at $H_0\ge60$). With fewer ranks per node $H_0$ hardly matters: 16 $\times$ 18 stays at 43.0--43.9\,s (43.1\,s at $H_0=0$), and 4 $\times$ 72 varies between 48.2 and 52.4\,s against 55.0\,s at $H_0=0$, without a trend in $H_0$; with one rank per node there are only three exchanging pairs, so there is little to save.
 
-\paragraph{Shared memory versus the network.} The same number of ranks packed on as few nodes as possible or spread over four nodes: 36 ranks take 6.19\,s on one node and 5.44\,s on four; 72 ranks take 3.62\,s and 3.17\,s; 144 ranks take 2.44\,s on two nodes and 2.41\,s on four. Spreading is faster: the extra network hops cost less than sharing one node's memory bandwidth among more ranks.
+\paragraph{Shared memory versus the network.} The same number of ranks packed on as few nodes as possible or spread over four nodes: 36 ranks take 241.3\,s on one node and 212.3\,s on four; 72 ranks take 142.7\,s and 126.4\,s; 144 ranks take 94.1\,s on two nodes and 94.0\,s on four (Figure~\ref{fig:x4}, right). Spreading is faster: the extra network hops cost less than sharing one node's memory bandwidth among more ranks.
 
-\paragraph{Which parts communicate most.} Per level each rank sends one packed message to each partner that needs its tail rows; over a batch this is a few megabytes, independent of $p$. The ema chain needs $p-1$ sequential hops but carries only one summary per stock. The fitness needs a single \code{MPI\_Allreduce} of the IC summaries, which takes less than a millisecond. The dominant communication cost is the synchronisation of the halo exchange at every level, not its volume.
+\paragraph{Which parts communicate most.} The halo dominates by far: each rank sends 1.5--1.7\,GB per batch, so 288 ranks move about 500\,GB in total, against 6\,GB for four ranks. The ema chain needs $p-1$ sequential hops with two numbers per stock; including the waiting it causes it takes 0.83\,s at 72 ranks and 4.8\,s at 288. The fitness needs a single \code{MPI\_Allreduce} of the IC summaries, under 8\,ms even at 288 ranks.
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{figures/x4_comm.pdf}
 \caption{Left: total time against $H_0$ for pure MPI (solid) and hybrid splits (dotted). Middle: halo plus waiting time. Right: the same rank count packed and spread over four nodes.}
@@ -419,27 +422,27 @@ The drop from one to two ranks is the halo exchange (about 1.1\,s, then constant
 \end{figure}
 
 \subsubsection{MPI + OpenMP}
-\paragraph{One rank.} With one rank and 2 to 72 threads, operator-level threading takes 70.6, 37.5, 19.6, 10.5, 6.13 and 3.82\,s, and node-level threading 68.7, 35.2, 18.4, 10.2, 6.15 and 4.55\,s. Node-level threads are slightly faster up to 16 threads because they avoid opening a parallel region for every operator; at 72 threads they are slower because narrow DAG levels have fewer nodes than threads. On one node, 72 threads (3.82\,s) are as fast as 72 ranks (3.62\,s).
+\paragraph{One rank.} With one rank and 2 to 72 threads, operator-level threading takes 2613, 1349, 690.9, 360.9, 200.2 and 110.3\,s, and node-level threading 2528, 1267, 635.9, 321.9, 166.6 and 89.2\,s (Figure~\ref{fig:x5}, left). Node-level threading is faster at every thread count and reaches a speed-up of 56.7 at 72 threads (operator-level: 45.9). With 3337 and 8614 nodes in the two operator levels there is always enough work for every thread, and no parallel region is opened per operator. On one node, 72 threads (89.2\,s) are 1.6 times faster than 72 ranks (142.7\,s), because they need no halo exchange and no boundary restarts.
 
-\paragraph{288 cores.} We split four nodes into ranks $\times$ threads (Table~\ref{tab:x5}, Figure~\ref{fig:x5}).
+\paragraph{288 cores.} We split four nodes into ranks $\times$ threads (Table~\ref{tab:x5}, Figure~\ref{fig:x5}, right).
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \begin{tabular}{lrrrrrrr}
 \toprule
 ranks $\times$ threads & 288$\times$1 & 144$\times$2 & 72$\times$4 & 36$\times$8 & 16$\times$18 & 8$\times$36 & 4$\times$72 \\
 \midrule
-operator-level (s) & 2.27 & 1.76 & 1.55 & 1.43 & 1.28 & 1.32 & 1.61 \\
-node-level (s) & 2.27 & 1.45 & 1.09 & 1.25 & \textbf{0.98} & 1.06 & 1.44 \\
+operator-level (s) & 75.0 & 61.4 & 50.8 & 47.5 & 43.1 & 43.6 & 55.0 \\
+node-level (s) & 75.0 & 48.9 & 37.7 & 32.8 & 29.3 & 28.1 & \textbf{27.8} \\
 \bottomrule
 \end{tabular}
-\caption{288 cores split into MPI ranks and OpenMP threads.}
+\caption{288 cores split into MPI ranks and OpenMP threads, 10{,}000 expressions.}
 \label{tab:x5}
 \end{table}
 
-The best configuration is 16 ranks $\times$ 18 threads (two ranks per socket) with node-level threads: 0.98\,s, 2.3 times faster than pure MPI on the same 288 cores and 140 times faster than one core. Fewer, larger blocks reduce both the number of exchanging pairs and the imbalance, and the halo time falls from about 0.75\,s to 0.05--0.25\,s. The 36 $\times$ 8 split is slower than its neighbours (1.43\,s and 1.25\,s): nine ranks per node cannot divide two sockets of 36 cores, so OpenMPI cannot bind them, and with the interleaved core numbering of these nodes (even cores on one socket, odd on the other) each rank's threads ended up on both sockets. Within a rank, node-level threading wins on every split, because a rank with a larger block still sees the whole batch DAG and the levels are wide enough to keep the threads busy. Very few ranks (4 $\times$ 72) lose again, probably because each rank spans two sockets and part of its memory traffic crosses between them.
+With node-level threads the time falls steadily as ranks are replaced by threads, and the best split is 4 ranks $\times$ 72 threads (one rank per node): 27.8\,s, 2.7 times faster than pure MPI on the same 288 cores and 182 times faster than one core; 8 $\times$ 36 (28.1\,s) and 16 $\times$ 18 (29.3\,s) are nearly as fast. Each rank still receives about 1.5\,GB of halo, so the total halo traffic is proportional to the number of ranks, and the halo phase falls from 22\,s at 288 ranks to 1.5\,s at four. Operator-level threading is slower on every split; most of the gap is in evaluation, where RankIC stays at about 29\,s on every split against 18\,s with node-level threads. With 72 threads per rank operator-level threading loses again (55.0\,s): each operator opens a parallel region over 72 cores on two sockets.
 
-\begin{figure}[h]
+\begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{figures/x5_hybrid.pdf}
 \caption{Left: speed-up of one rank with OpenMP threads. Right: 288 cores split into ranks $\times$ threads, with both thread strategies.}
@@ -448,7 +451,7 @@ The best configuration is 16 ranks $\times$ 18 threads (two ranks per socket) wi
 
 \subsubsection{Consistency at scale}
 \label{sec:v}
-The distributed result is compared with the serial one with the criterion of Section~\ref{sec:validation} (the same candidate validity and $|\Delta\text{fitness}|\le10^{-5}$). It passes for 16 ranks, 4 ranks $\times$ 4 threads with both thread strategies, 4 ranks with $H_0=30$, 72 ranks on one node, 288 ranks on four nodes, and 16 ranks $\times$ 18 threads with node-level threads on four nodes.
+The distributed result is compared with the serial one with the criterion of Section~\ref{sec:validation} (the same candidate validity and $|\Delta\text{fitness}|\le10^{-5}$). The check keeps every root's result and also runs the serial engine on rank 0, so it uses the first 1000 expressions of the batch. It passes for 72 ranks on one node, 288 ranks on four nodes, and 16 ranks $\times$ 18 threads with node-level threads on four nodes, all with chunked levels, and for 16 ranks and 4 ranks $\times$ 4 threads with chunks of 300 and 250 nodes.
 
 \subsection{PCA signatures and similarity}
 

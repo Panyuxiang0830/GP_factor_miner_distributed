@@ -1,7 +1,7 @@
 // The distributed engine (strategy B) against the serial engine on exported
 // data. Run with any number of ranks:
 //
-//   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json> [H0] [max_expressions] [op|node]
+//   mpirun -np P test_mpi_consistency <panel_dir> <expressions.json> [H0] [max_expressions] [op|node] [chunk]
 //
 // <expressions.json> is a reference.json (cases[].input), a list of
 // expressions, or a list of objects with an "expression" key. H0 is the
@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
     MPI_Comm_size(MPI_COMM_WORLD, &P);
     if (argc < 3) {
         if (rank == 0)
-            std::printf("usage: %s <panel_dir> <expressions.json> [H0] [max_expressions] [op|node]\n", argv[0]);
+            std::printf("usage: %s <panel_dir> <expressions.json> [H0] [max_expressions] [op|node] [chunk]\n", argv[0]);
         MPI_Finalize();
         return 2;
     }
@@ -83,6 +83,7 @@ int main(int argc, char** argv) {
     options.keep_roots = true;
     size_t max_count = argc > 4 ? std::stoul(argv[4]) : 1000000;
     const std::string mode = argc > 5 ? argv[5] : "op";
+    options.chunk = argc > 6 ? std::stoi(argv[6]) : 0;
     options.threads = mode == "node" ? gpe::ThreadMode::Node : gpe::ThreadMode::Operator;
 #ifdef _OPENMP
     omp_set_max_active_levels(1);
