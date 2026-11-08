@@ -25,7 +25,10 @@ src/mpi/       date decomposition, halo exchange, collectives
 tests/         C++ tests
 python/        original Python GP factor miner (gp_factor_miner)
 scripts/       run scripts and PBS job scripts
-docs/          design documents
+dag/           DAG planner tools (part 2)
+pca/           PCA signature and similarity (part 3, reserved)
+docs/          documents: engine/, dag/, pca/, design/ (see docs/README.md)
+report/        project report
 ```
 
 ## Build
@@ -52,4 +55,4 @@ Market data, exported panels and run outputs are **never committed** (see `.giti
 
 ## DAG analysis tools (S1–S5)
 
-See [tools/dag_analysis](tools/dag_analysis/README.md) for DAG statistics, serial planning benchmarks, live-panel scheduling and cross-batch cache simulators, S4 reproduction helpers, and the S5 serial execution-plan proposal. These tools do not change the numerical engine. Private inputs and experiment outputs remain outside the repository.
+See [dag/](dag/README.md) and [docs/dag](docs/dag/README.md) for DAG statistics, serial planning benchmarks, live-panel scheduling and cross-batch cache simulators, S4 reproduction helpers, and the S5 serial execution-plan proposal. These tools do not change the numerical engine. Private inputs and experiment outputs remain outside the repository.

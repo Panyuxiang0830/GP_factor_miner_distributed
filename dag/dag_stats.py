@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'python/src'))
 from gp_factor_miner.expressions import normalize_expression, expression_key
 

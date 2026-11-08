@@ -1,6 +1,6 @@
 # DAG analysis tools — S1–S5
 
-本目录是第一步（随机批量）的工具交付，不包含市场数据、批量表达式或运行结果。因子求值引擎保持不变；规划器尚未接入 C++ 执行。
+代码在仓库根目录的 `dag/`。这是第一步（随机批量）的工具交付，不包含市场数据、批量表达式或运行结果。因子求值引擎保持不变；规划器尚未接入 C++ 执行。
 
 | 任务 | 工具 | 范围 |
 |---|---|---|
@@ -17,7 +17,7 @@ Python 3.10+、NumPy、pandas；C++核对另需 C++17 的 `g++`（Linux/macOS）
 
 ```bash
 python3 -m pip install numpy pandas
-python3 -m unittest discover -s tools/dag_analysis -p 'test_*.py' -v
+python3 -m unittest discover -s dag -p 'test_*.py' -v
 ```
 
 17个测试覆盖重复/交换子表达式、全部算子与C++核对、引用计数和根消费、缓存子树剪枝、共享孩子、短固定序列Belady穷举比较、轨迹顺序和计划失效。测试只用人工合成表达式，不依赖私有fixture。
@@ -38,16 +38,16 @@ export GP_COSTS=/path/to/op_costs.csv
 ### S1：统计及跨语言核对
 
 ```bash
-python3 tools/dag_analysis/dag_stats.py "$GP_BATCH_DIR/d1_seed1.json" --out ../dag_results/d1 --check-cpp
-python3 tools/dag_analysis/dag_stats.py "$GP_BATCH_DIR/d2_seed1.json" --out ../dag_results/d2 --check-cpp
-python3 tools/dag_analysis/dag_stats.py "$GP_BATCH_DIR/d3_pool1_seed1.json" --out ../dag_results/d3 --check-cpp
-python3 tools/dag_analysis/dag_stats.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/warm --check-cpp
+python3 dag/dag_stats.py "$GP_BATCH_DIR/d1_seed1.json" --out ../dag_results/d1 --check-cpp
+python3 dag/dag_stats.py "$GP_BATCH_DIR/d2_seed1.json" --out ../dag_results/d2 --check-cpp
+python3 dag/dag_stats.py "$GP_BATCH_DIR/d3_pool1_seed1.json" --out ../dag_results/d3 --check-cpp
+python3 dag/dag_stats.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/warm --check-cpp
 ```
 
 默认取1k/5k/10k/30k中存在的前缀并包含全批量，重复3次。窗口整数不算节点，叶子算节点；规范化前/后树总量分开保存。节点减少比例不是加速比。Python/C++内部ID不同，核对稳定子表达式集合、根顺序和节点层/树节点数/引用数。
 
 ```bash
-python3 tools/dag_analysis/dag_runtime.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/runtime
+python3 dag/dag_runtime.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/runtime
 ```
 
 计时预热1次、测3次。E只计不同孩子-父节点对；`a*a`有一条不同依赖边、两次操作数引用。Python建图计时包含验证/规范化/邻接表，不是C++引擎计时；调度计时包含逻辑模拟检查，不含算子执行。不同机器数据不要拼成一条性能曲线。
@@ -55,8 +55,8 @@ python3 tools/dag_analysis/dag_runtime.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" 
 ### S2：调度与内存
 
 ```bash
-python3 tools/dag_analysis/memory_sim.py "$GP_BATCH_DIR/d3_pool1_seed1.json" --out ../dag_results/memory_d3
-python3 tools/dag_analysis/memory_sim.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/memory_warm
+python3 dag/memory_sim.py "$GP_BATCH_DIR/d3_pool1_seed1.json" --out ../dag_results/memory_d3
+python3 dag/memory_sim.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" --out ../dag_results/memory_warm
 ```
 
 输出CSV/JSON。`peak_live_panels`为逻辑存活峰值，默认按1461天×5876股票×float32换算GiB。`--ranks P`只换算ceil(T/P)自有日期行，不含halo或真实MPI执行。`operator_groups_proxy`是执行组数，不是实测同步/消息次数。
@@ -66,7 +66,7 @@ python3 tools/dag_analysis/memory_sim.py "$GP_BATCH_DIR/d3_pool1_warm30k.json" -
 ### S3：跨批持久缓存
 
 ```bash
-python3 tools/dag_analysis/cache_sim.py \
+python3 dag/cache_sim.py \
   "$GP_BATCH_DIR/d3_pool1_seed1.json" "$GP_BATCH_DIR/d3_pool1_seed2.json" "$GP_BATCH_DIR/d3_pool1_seed3.json" \
   --costs "$GP_COSTS" --budgets-gib 0,1,4,16 --out ../dag_results/cache
 ```
@@ -85,18 +85,18 @@ python3 tools/dag_analysis/cache_sim.py \
 
 ```bash
 GPE_EXPORT=/path/to/handoff/build_s4/gpe_export \
-  bash tools/dag_analysis/run_s4.sh /path/to/sample_panels "$GP_BATCH_DIR/d3_pool1_seed1.json" ../s4_runs
+  bash dag/run_s4.sh /path/to/sample_panels "$GP_BATCH_DIR/d3_pool1_seed1.json" ../s4_runs
 ```
 
 脚本使用已有 `gpe_export`，200条公式、chunk=16/64/200各3次，记录wall time、RSS、CPU时间和退出码并核对全部评分。`--no-R`关闭矩阵写出，但原驱动仍做签名行预处理。公式子批各自建DAG，与S2同一DAG层内分块不同；此项只验证实际分块内存趋势和评分一致性，不能声称精确验证所有模拟策略。
 
 ### S5：计划格式和检查
 
-见 [接口说明](s5/S5_interface_zh.txt)。示例是人工表达式，数据标识仅作演示：
+见 [接口说明](S5_interface_zh.txt)。示例是人工表达式，数据标识仅作演示：
 
 ```bash
-python3 tools/dag_analysis/plan_contract.py check tools/dag_analysis/s5/example_plan.json
-python3 tools/dag_analysis/plan_contract.py export "$GP_BATCH_DIR/d3_pool1_seed1.json" --context /path/to/actual_context.json --out ../dag_results/plan.json --chunk 256
+python3 dag/plan_contract.py check dag/s5/example_plan.json
+python3 dag/plan_contract.py export "$GP_BATCH_DIR/d3_pool1_seed1.json" --context /path/to/actual_context.json --out ../dag_results/plan.json --chunk 256
 ```
 
 导出的计划含输入表达式，不入库。自动导出目前仅无缓存计划；结构检查器支持cache操作测试。它不执行数值，不校验缓存字节预算，也不实现MPI。接口待引擎负责人确认，实际C++执行接入留待后续。

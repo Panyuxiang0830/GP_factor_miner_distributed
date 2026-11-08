@@ -2,7 +2,7 @@
 # Run on an allocated CPU compute node; outputs are private experiment files.
 set -euo pipefail
 if [[ $# -ne 3 ]]; then
-  echo "usage: bash tools/dag_analysis/run_s4.sh panels batch.json output_dir" >&2
+  echo "usage: bash dag/run_s4.sh panels batch.json output_dir" >&2
   exit 2
 fi
 : "${PBS_JOBID:?Run this script in an allocated PBS compute job}"

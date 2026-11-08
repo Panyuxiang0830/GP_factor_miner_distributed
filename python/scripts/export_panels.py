@@ -4,7 +4,7 @@ Cleaning is delegated to ``gp_factor_miner.data.load_eod_panel_dataset`` so the
 exported values match what the Python GP evaluates (features are only aligned
 and cast to float32; the target is masked to tradable, non-ST rows).
 
-Output layout (see docs/data_format.md)::
+Output layout (see docs/engine/data_format.md)::
 
     <out>/meta.json             T, N, dates, assets, fields, dtype, layout
     <out>/fields/<field>.f32    float32, date-major [T][N], little-endian
