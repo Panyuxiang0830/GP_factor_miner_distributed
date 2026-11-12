@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_gpu_api
+#PBS -j oe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:ngpus=1:mem=24gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+: "${PCA_MANIFEST:?set PCA_MANIFEST}"
+: "${PCA_BASELINE:?set PCA_BASELINE}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON
+cmake --build "$build" -j 2
+export OMP_NUM_THREADS=1
+export PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+ctest --test-dir "$build" --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+"$build/pca_gpu_test" "$PCA_RUN/validation.json"
+provided=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["provided_signatures"])' "$PCA_MANIFEST")
+for device in cpu cuda; do
+    "$build/pca_run" --manifest "$PCA_MANIFEST" --signature-input "$provided" \
+        --device "$device" --out "$PCA_RUN/provided_$device" --count 9388
+done
+mpirun -np 4 --map-by slot --bind-to core "$build/pca_run" --manifest "$PCA_MANIFEST" \
+    --signature-input "$provided" --archive mpi --out "$PCA_RUN/provided_mpi" --count 9388
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$PCA_RUN/provided_cpu" \
+    > "$PCA_RUN/provided_cpu/validation.log" 2>&1
+python3 - "$PCA_RUN" "$PCA_BASELINE" <<'PY'
+import json,pathlib,sys
+import numpy as np
+root=pathlib.Path(sys.argv[1]);reference=json.loads((root/'provided_cpu/decisions.json').read_text())
+keys=json.loads((root/'provided_cpu/archive_keys.json').read_text())
+for device in ('cuda','mpi'):
+    run=root/f'provided_{device}';actual=json.loads((run/'decisions.json').read_text());assert len(actual)==len(reference)
+    assert (run/'signatures.f32').read_bytes()==(root/'provided_cpu/signatures.f32').read_bytes()
+    assert json.loads((run/'archive_keys.json').read_text())==keys
+    for expected,got in zip(reference,actual):
+        for field in ('signature_index','key','action','closest_key','replaced_key'):assert got[field]==expected[field]
+        assert abs(got['similarity']-expected['similarity'])<1e-12
+assert json.loads((root/'provided_cuda/metrics.json').read_text())['gpu_similarity_seconds']>0
+assert json.loads((root/'provided_mpi/metrics.json').read_text())['archive_mode']=='mpi'
+def trace(rows):return {x['signature_index']:(x['action'],x['closest_key'],x['replaced_key']) for x in rows}
+baseline=pathlib.Path(sys.argv[2]);a=trace(reference);b=trace(json.loads((baseline.parent/'decisions.json').read_text()));union=a.keys()|b.keys()
+x=np.fromfile(root/'provided_cpu/signatures.f32',dtype='<f4').reshape(-1,293).astype(float)
+y=np.fromfile(baseline,dtype='<f4').reshape(x.shape).astype(float)
+cos=np.abs(np.sum(x*y,axis=1)/(np.linalg.norm(x,axis=1)*np.linalg.norm(y,axis=1)))
+baseline_keys=set(json.loads((baseline.parent/'archive_keys.json').read_text()))
+(root/'PROVIDED_REFERENCE.json').write_text(json.dumps(dict(verified=True,candidates=len(reference),
+    cpu_cuda_mpi_exact_decisions=True,provided_vs_exported_R_changed_actions=sum(a.get(i,('skip',))[0]!=b.get(i,('skip',))[0] for i in union),
+    provided_vs_exported_R_changed_tuples=sum(a.get(i)!=b.get(i) for i in union),
+    provided_vs_exported_R_archive_key_difference=len(set(keys)^baseline_keys),
+    max_signature_cosine_error_from_R_export=float(max(0,np.max(1-cos)))),indent=2)+'\n')
+PY
+touch "$PCA_RUN/SUCCESS"

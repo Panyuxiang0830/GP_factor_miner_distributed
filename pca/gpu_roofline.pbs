@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_gpu_roofline
+#PBS -j oe
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+nvidia-smi -q > "$PCA_RUN/nvidia-smi.txt"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON
+cmake --build "$build" -j 4
+export OMP_NUM_THREADS=1
+"$build/pca_gpu_test" "$PCA_RUN/kernel_validation.json"
+for precision in float double; do
+    for B in 8 32 64; do
+        for repeat in 0 1 2 3; do
+            "$build/pca_gpu_bench" "$precision" "$B" "$PCA_RUN/${precision}_B${B}_r${repeat}.json"
+        done
+    done
+done
+touch "$PCA_RUN/SUCCESS"

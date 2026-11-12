@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_study
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=8:mem=24gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_MANIFEST:?set PCA_MANIFEST}"
+: "${PCA_RUN:?set PCA_RUN}"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=OFF
+cmake --build "$build" -j 4
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+if [ "${PCA_SYNTHETIC:-0}" = 1 ]; then
+    python3 pca/synthetic.py --out "${PCA_RUN}_input" --rows 64 --cols 128 --factors 24
+    PCA_MANIFEST="${PCA_RUN}_input/manifest.json"
+fi
+python3 pca/study.py --manifest "$PCA_MANIFEST" \
+    --library "$build/libpca_api.so" --out "$PCA_RUN" \
+    --count "${PCA_COUNT:-32}" --workers "${PCA_WORKERS:-8}" --maxsteps 10 --seeds 3

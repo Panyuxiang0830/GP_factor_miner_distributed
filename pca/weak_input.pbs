@@ -1,0 +1,11 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_weak_input
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=12gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN to a new input directory}"
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/synthetic.py --out "$PCA_RUN" --rows 293 --cols 5876 --factors 9216

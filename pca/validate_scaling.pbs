@@ -1,0 +1,13 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_scaling_check
+#PBS -j oe
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mem=8gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/validate_scaling.py --runs pca/runs/scaling_1node_01 pca/runs/scaling_4node_01 \
+    --oracle pca/runs/sensitivity_full_01/seed0_power_k04.json \
+    --baseline pca/runs/scaling_1node_01/strong_date_p1_t1_r0/signatures.f32 --out "$PCA_RUN"
