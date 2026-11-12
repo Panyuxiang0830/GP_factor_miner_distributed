@@ -108,6 +108,10 @@ def main():
             '原 Python GP 的可选 batch_backend 与原 EOD CLI 的 --cpp-* 参数已接入本实现；默认原后端保持不变。')
         text=text.replace('源码位于仓库 pca/。',
             '数值与衔接实现位于仓库 pca/，原 Python 的 hierarchical_engine.py 和 hierarchical_cli.py 增加可选后端接口。')
+        text=text.replace('新增源码、CMake 和 PBS 脚本位于 pca，原有代码不改写；',
+            '新增数值源码、CMake 和 PBS 脚本位于 pca；原 hierarchical_engine.py 与 hierarchical_cli.py 增加可选后端接口。')
+        text=text.replace('原项目的构建命令不会自动把本独立实现接入 GP。复现入口为 final_report.pbs 和 assemble_report.py。',
+            '启用实际 GP 后端需编译 pca_engine_bridge 和 pca_run，并传入原 CLI 的 --cpp-* 参数，或使用 run_gp.py；编译及作业命令见 GP_INTEGRATION.md。历史独立实验复现入口为 final_report.pbs 和 assemble_report.py。')
         rows=[]
         for label,run in (('CPU/MPI',live),('CUDA',live_gpu)):
             if run:rows.append(dict(backend=label,T=run['T'],N=run['N'],fields=len(run['fields']),ranks=run['ranks'],generations=run['generation_events'],archive=run['archive_size'],wall_seconds=round(run['evolution_wall_seconds'],3)))
