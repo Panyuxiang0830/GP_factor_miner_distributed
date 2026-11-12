@@ -18,6 +18,8 @@ if [ "${PCA_SYNTHETIC:-0}" = 1 ]; then
     python3 pca/synthetic.py --out "${PCA_RUN}_input" --rows 64 --cols 128 --factors 24
     PCA_MANIFEST="${PCA_RUN}_input/manifest.json"
 fi
+replay_options=()
+if [ "${PCA_NUMERICAL_ONLY:-0}" = 1 ]; then replay_options+=(--numerical-only); fi
 python3 pca/study.py --manifest "$PCA_MANIFEST" \
     --library "$build/libpca_api.so" --out "$PCA_RUN" \
-    --count "${PCA_COUNT:-32}" --workers "${PCA_WORKERS:-8}" --maxsteps 10 --seeds 3
+    --count "${PCA_COUNT:-32}" --workers "${PCA_WORKERS:-8}" --maxsteps 10 --seeds 3 "${replay_options[@]}"

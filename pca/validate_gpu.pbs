@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -q batch_gpu
+#PBS -q auto_free
 #PBS -N pca_gpu_check
 #PBS -j oe
 #PBS -l walltime=00:45:00

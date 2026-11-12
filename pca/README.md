@@ -74,7 +74,7 @@ python3 pca/validate.py --manifest pca/runs/real_input/manifest.json \
 
 ## 实验与复现
 
-P0–P6 脚本、验证范围和报告入口见 [EXPERIMENTS.md](EXPERIMENTS.md)。完整报告汇总只接受已齐备且通过验证的运行，不以脚本存在或成功提交作业代替完成。
+P0–P6 脚本、验证范围和报告入口见 [EXPERIMENTS.md](EXPERIMENTS.md)，完整阶段依赖与整代参数见 [REPRODUCE.md](REPRODUCE.md)。完整报告汇总只接受已齐备且通过验证的运行，不以脚本存在或成功提交作业代替完成。
 
 所有行情、因子表达式、manifest、运行输出、图表和报告保留在私有且被忽略的 runs，不提交到公开仓库。仓库仅包含源码、人工合成测试生成器、作业脚本和说明。
 

@@ -82,6 +82,8 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--maxsteps", type=int, default=10)
     parser.add_argument("--seeds", type=int, default=3)
+    parser.add_argument("--numerical-only", action="store_true",
+                        help="write the verified numerical checkpoint; replay QD separately with sensitivity.py")
     args = parser.parse_args()
     if args.out.exists() or not args.out.resolve().is_relative_to((Path(__file__).resolve().parent / "runs").resolve()):
         parser.error("--out must be new and inside runs/")
@@ -111,6 +113,13 @@ def main():
                 print(f"SVD and C++ sweeps: {completed}/{len(rows)}", flush=True)
     np.save(args.out / "sigma2_over_sigma1.npy", ratios)
     np.save(args.out / "svd_seconds.npy", svd_seconds)
+    numerical = dict(verified=bool(complete.all()), factors=len(rows), seeds=args.seeds,
+                     methods=["power", "lanczos"], maxsteps=args.maxsteps,
+                     scope="numerical checkpoint; QD replay has separate evidence")
+    (args.out / "NUMERICAL_SUCCESS.json").write_text(json.dumps(numerical, indent=2) + "\n")
+    if args.numerical_only:
+        print("Numerical checkpoint complete; run sensitivity.py for QD trajectories", flush=True)
+        return
     baseline, baseline_keys = replay(rows, signatures[:, 0, 0, 3])
     decisions = []
     for seed in range(args.seeds):
