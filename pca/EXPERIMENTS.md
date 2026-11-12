@@ -11,8 +11,11 @@
 | P0 边界语义 | adversarial.pbs | 0.90 附近、并列、同 key、严格质量阈值、无效签名 |
 | 提供签名重放 | gpu_api_test.pbs | 原始百分位 GPU 接口，以及 CPU/CUDA/MPI 准入重放 |
 | P1 串行规模 | serial_scale.pbs | 合成输入分别改变 B、m、n、k；不是重新排名同一真实批次 |
+| P1 真实输入规模 | real_size.pbs | 固定真实因子面板，改变抽样日、股票前缀、B、k，各配置重新排名 |
 | P2 数值研究 | study.pbs / sensitivity.pbs | 精确 SVD、两算法、多个起点、预算与顺序 QD 轨迹 |
 | P2 同精度成本 | iteration_cost.pbs | 矩阵乘次数、通信载荷、归约次数和耗时 |
+| P2 整代同精度成本 | matched_full.pbs | 全部真实 R 执行，单列预算未达标者，在共同认证集合比较成本 |
+| RankIC 共用接口 | rankic_interface.pbs | FP64 百分位与原引擎逐值一致，实际 daily_rank_ic 消费接口一致 |
 | P3 强扩展／混合 | scaling.pbs | date／transpose／factor，1/2/4 节点，各预热及三次计时 |
 | 含排名扩展 | raw_scaling.pbs | 合成抽样数值先排名，单列排名、求解和重分布成本 |
 | P4 弱扩展 | weak_input.pbs / weak.pbs | 固定每 rank 完整矩阵等价工作量，同一输入序列前缀 |
@@ -25,7 +28,9 @@
 
 原始导出输入由 `prepare.py` 生成 manifest；大矩阵不复制。已有排名 R 不再次排名，原始抽样数值才使用 `--rank-input 1`。合成受控谱、合成弱扩展与真实提案是不同输入，不混称真实 GP 进化结果。
 
-与交接文字的范围差异也应保留：P1 的 m/n 扩展采用独立合成矩阵维度，不是同一真实因子的重采样／股票子集重新排名；同精度 MPI 时间和通信比较为前 8 个真实因子的代表实验，不作为整代同精度加速结论。GPU 实现幂迭代，Lanczos 位于 CPU/MPI。RankIC 的 GPU 百分位复用接口已经提供，跨模块调用的确认与联调仍需另行完成。
+原有 serial_scale.pbs 的合成维度实验与 iteration_cost.pbs 的前 8 个真实因子实验继续保留。新增真实规模实验固定完整股票池上计算的因子值，再对子集重新排名；不重新计算截面因子公式或 RankIC。整代同精度实验由精确 SVD 离线确定步数，上限内未达标者仍执行并单列；速度只比较两算法共同认证的同一集合。两种方法均逐因子归约，与生产 power 的批量归约分开解释。GPU 实现幂迭代，Lanczos 位于 CPU/MPI。
+
+RankIC 的 GPU 百分位复用提供 FP32 和兼容原引擎的 FP64 输出，调用契约与实际消费者验证见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)。自动接入上游调用链与 RankIC 负责人的采用确认仍属于集成工作。
 
 `report.py` 可生成部分已完成研究的图；`assemble_report.py` 是整套实验的严格汇总门槛，使用该套脚本约定的目录和配置名，要求指定的验证标记、重复次数和完整规模齐备。它不是接受任意小规模 smoke 输出的通用报告工具。默认目录名可在其 CLI 帮助中查看。
 
@@ -33,7 +38,9 @@
 python3 pca/assemble_report.py --runs pca/runs \
   --out pca/runs/report_01 \
   --scaling-validation scaling_validation_local_01 \
-  --synthetic-validation synthetic_validation_01
+  --synthetic-validation synthetic_validation_01 \
+  --real-size "$PWD/pca/runs/real_sizes_01" \
+  --matched-full "$PWD/pca/runs/matched_full_01" --require-completion
 ```
 
 只在证据完整时调用。`paper_sections.py` 据相同证据按 report/main_zh.tex 的 PCA 章节组织补稿；生成的报告与图仍只写入私有 runs。源仓库不包含实验结果或论文补稿。

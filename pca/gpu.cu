@@ -227,3 +227,36 @@ std::vector<float> gpu_similarity(const std::vector<float>& left, int L,
     timing.download += event.stop(); return result;
 }
 }  // namespace pca
+
+// Optional RankIC interoperability entrypoint. Existing PCA kernels and their
+// callers above remain unchanged. An average rank is q/(2*valid), with integer
+// q. For valid<=8192, the FP32 rounding error multiplied by 2*valid is <1/2,
+// so q is recovered exactly. Divide its exact half-integer value in FP64 to
+// match the CPU rank_rows_pct arithmetic, without another sorting kernel.
+namespace pca {
+namespace {
+__global__ void recover_rank64(const float* coarse,double* output,int n) {
+    size_t base=size_t(blockIdx.x)*n;int count=0;
+    for(int j=threadIdx.x;j<n;j+=blockDim.x)count+=!isnan(coarse[base+j]);
+    int valid=sum_block(count);
+    for(int j=threadIdx.x;j<n;j+=blockDim.x){
+        float x=coarse[base+j];
+        if(isnan(x))output[base+j]=nan("");
+        else {double q=floor(double(x)*(2*valid)+.5);output[base+j]=__ddiv_rn(.5*q,double(valid));}
+    }
+}
+}
+std::vector<double> gpu_percentile_rows_f64(const std::vector<float>& input,int rows,int stocks,GpuTiming& timing) {
+    if(rows<0||stocks<1||stocks>8192||input.size()!=size_t(rows)*stocks)throw std::invalid_argument("invalid GPU ranking shape");
+    if(!rows)return {};
+    int padded=1;while(padded<stocks)padded*=2;
+    size_t shared=size_t(padded)*(sizeof(float)+sizeof(int));
+    check(cudaFuncSetAttribute(rank_rows_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,int(shared)));
+    Device<float> in(input.size()),coarse(input.size());Device<double> out(input.size());Event event;event.start();
+    check(cudaMemcpy(in.data,input.data(),input.size()*sizeof(float),cudaMemcpyHostToDevice));timing.upload+=event.stop();event.start();
+    rank_rows_kernel<<<rows,256,shared>>>(in.data,coarse.data,stocks,padded,false);
+    recover_rank64<<<rows,256>>>(coarse.data,out.data,stocks);timing.ranking+=event.stop();event.start();
+    std::vector<double> result(input.size());check(cudaMemcpy(result.data(),out.data,result.size()*sizeof(double),cudaMemcpyDeviceToHost));
+    timing.download+=event.stop();return result;
+}
+}

@@ -19,6 +19,10 @@ std::vector<float> gpu_rank_rows(const std::vector<float>& panels, int rows, int
 // no fill and no row centering. Sampling/masking remain the caller's job.
 std::vector<float> gpu_percentile_rows(const std::vector<float>& panels, int rows, int stocks,
                                       GpuTiming& timing);
+// Same shared sort, FP64 output for the engine's rank_rows_pct/RankIC contract.
+// Recovers exact half-integer ordinal ranks before double division (n<=8192).
+std::vector<double> gpu_percentile_rows_f64(const std::vector<float>& panels, int rows, int stocks,
+                                          GpuTiming& timing);
 // Center + normalize signatures on CPU; GPU performs only the tiled product.
 std::vector<float> gpu_similarity(const std::vector<float>& left, int L,
                                 const std::vector<float>& right, int A, int dimension,

@@ -69,7 +69,34 @@ PCA_BASELINE="$PCA_RUNS/scaling_1node_01/strong_date_p1_t1_r1/signatures.f32"
 
 每项都须设置对应 PCA_RUN。完整精度实验可以直接执行 precision_full.pbs；precision_finish.pbs 只用于复用已完成 GPU 数值结果的恢复场景，不是每次必需阶段。GPU 经 auto_free 或 auto 路由，不直接提交 from_route_only 的执行队列。单／双卡是 GPU 扩展，288 核是另一组 CPU 实验。
 
-## 5. 独立验收与报告
+## 5. 真实规模与整代同精度补充
+
+本阶段依赖第 2 节的完整数值检查点。准备命令读取现有 manifest、SVD 研究及原始 scores，从中生成私有候选与步数计划；行情与导出 R 仍从原位置只读。将下面两个占位路径替换为已交接的 scores.jsonl 和原始行情字段目录（包含 meta.json 及字段文件）。
+
+```bash
+python3 pca/prepare_completion.py --manifest "$PCA_REAL" \
+  --study "$PCA_RUNS/study_full_01" \
+  --scores /path/to/export/scores.jsonl --panel-dir /path/to/panels \
+  --out "$PCA_RUNS/completion_plan_01" --count 9388 --target 1e-6
+qsub -v PCA_SOURCE="$PCA_RUNS/completion_plan_01/real_source.json",PCA_RUN="$PCA_RUNS/real_sizes_01" pca/real_size.pbs
+qsub -v PCA_PLAN="$PCA_RUNS/completion_plan_01/accuracy_plan.json",PCA_RUN="$PCA_RUNS/matched_full_01" pca/matched_full.pbs
+```
+
+两项作业互不依赖。真实规模实验由引擎计算 128 个固定因子面板，19 个配置分别改变 B、采样日数 m、股票数 n、步数 k；每次都对所选股票重新排名。因子在完整股票池求值后固定，不在新股票池重新求值含截面算子的公式。准入使用原 scores，不重算质量。八线程生成面板的时间单列，PCA 计时使用一线程。每配置验证全量顺序 QD 与三次重复，前两个原始面板另做 pandas 排名和独立签名核对。
+
+整代成本作业执行全部输入。两算法各自选择串行研究中首次达标的步数，十步未达标者仍以十步执行并单列；MPI 结果与相同步数串行签名比较，以误差上界认证精度。仅在两算法共同认证的同一集合比较成本。该作业是离线预算实验，两算法均逐因子归约、不计算残差诊断；不等同于生产驱动的批量 power 归约。
+
+matched_full.pbs 预留 16 个 CPU 核，实际启动 8 ranks、每 rank 一线程。全集 FP32 缓存约需 64.7 GB，Vanda 可能按核数改写内存；作业先记录并检查实际分配资源，内存不足则退出。记录中的预留核数和活跃 ranks 要分别报告。真实规模和整代作业只有独立验证通过后才写 SUCCESS。
+
+真实规模实验成功后，还可用其原始面板验证 RankIC 共用接口：
+
+```bash
+qsub -v PCA_REAL_SIZE="$PCA_RUNS/real_sizes_01",PCA_RUN="$PCA_RUNS/rankic_interface_01" pca/rankic_interface.pbs
+```
+
+不设置 PCA_REAL_SIZE 时执行合成边界检查；该作业验证 FP64 GPU 百分位与原引擎排名和实际 daily_rank_ic 消费者的一致性，不自动修改主 GP 后端。
+
+## 6. 独立验收与报告
 
 | 验收 | 前置 | 输出名 |
 | --- | --- | --- |
@@ -80,3 +107,16 @@ PCA_BASELINE="$PCA_RUNS/scaling_1node_01/strong_date_p1_t1_r1/signatures.f32"
 每项还须设置 PCA_RUN。合成验收核对全量顺序 QD、三次重复和布局一致性，数值独立重算为每组前 8 个因子；不把抽查写成全部数值逐项验证。
 
 全部前置成功后，以新的 PCA_RUN 调用 final_report.pbs。它检查既定目录、计时重复、配置数及验证标记，写出完整报告、图表与 EVIDENCE.json；缺证据会报错。代码目录中没有实际结果，交付验收应在服务器上检查运行与报告，而不是只查看 GitHub 文件列表。
+
+final_report.pbs 保留基础实验的入口。包含本次两项补充的严格报告应在加载科学计算和 matplotlib 模块的计算节点上执行：
+
+```bash
+python3 pca/assemble_report.py --runs "$PCA_RUNS" \
+  --out "$PCA_RUNS/report_completed_01" \
+  --scaling-validation scaling_validation_local_01 \
+  --synthetic-validation synthetic_validation_01 \
+  --real-size "$PCA_RUNS/real_sizes_01" \
+  --matched-full "$PCA_RUNS/matched_full_01" --require-completion
+```
+
+上述门槛要求交接的完整维度、9388 个因子、8 MPI ranks、19 个真实规模配置及双方成功标记；适用于本交接数据集。报告包含 completion_sections.md、两项新图及 CSV，只有补充验证完整才标记 completion_supplement_verified。迁移时可将 --runs 指向既有私有证据根；底层 report.py 的 --runs-root 同样允许显式指定根目录，输出仍须为其新的子目录。

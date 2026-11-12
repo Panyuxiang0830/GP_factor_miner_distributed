@@ -26,8 +26,10 @@ def main():
     parser.add_argument("--scaling", type=Path, nargs="*", default=[])
     parser.add_argument("--roofline", type=Path)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--runs-root",type=Path,default=Path(__file__).resolve().parent/"runs",
+                        help="private results root; allows reporting an existing evidence tree after source migration")
     args = parser.parse_args()
-    if args.out.exists() or not args.out.resolve().is_relative_to((Path(__file__).resolve().parent / "runs").resolve()):
+    if args.out.exists() or not args.out.resolve().is_relative_to(args.runs_root.resolve()):
         parser.error("output must be new and inside runs/")
     summary = json.loads(((args.sensitivity or args.study) / "summary.json").read_text())
     if not summary["completed"]:

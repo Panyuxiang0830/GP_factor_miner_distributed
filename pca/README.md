@@ -26,6 +26,8 @@ OMP_NUM_THREADS=2 ctest --test-dir pca/build --output-on-failure
 
 默认生产程序不链接 BLAS/LAPACK/cuBLAS/cuSOLVER。`-DPCA_CUBLAS_REFERENCE=ON` 仅为 CUDA 构建增加独立的 `pca_cublas_reference` 可执行文件；它不改变生产目标的链接依赖。
 
+真实因子面板规模实验使用 `-DPCA_ENGINE_BENCH=ON`，仅为实验目标链接现有因子引擎；该选项与 CUDA 同时开启时还构建 `pca_rankic_test`。RankIC 共用 GPU 排名的输入、精度与验证见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)。
+
 ## 无行情数据的小规模检查
 
 提供 CPU 和单 GPU 的完整模块检查，自动生成小合成输入，检查三种布局、CPU 新排名、Python 准入、Lanczos、MPI 档案，以及 GPU 精度和 CUDA-aware MPI。GPU 检查另验证独立 cuBLAS 参照与生产程序的链接分离。

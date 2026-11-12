@@ -55,7 +55,12 @@ def main():
     parser.add_argument("--scaling-validation",default="scaling_validation_01")
     parser.add_argument("--synthetic-validation",default="synthetic_validation_01")
     parser.add_argument("--cublas-reference",default="cublas_reference_01")
+    parser.add_argument("--real-size",type=Path,help="verified real-panel size experiment")
+    parser.add_argument("--matched-full",type=Path,help="verified whole-generation MPI accuracy-cost experiment")
+    parser.add_argument("--require-completion",action="store_true",help="require both real-input and whole-generation supplements")
     args=parser.parse_args();root=args.runs.resolve();out=args.out.resolve()
+    if bool(args.real_size)!=bool(args.matched_full) or (args.require_completion and not args.real_size):
+        parser.error("provide both --real-size and --matched-full for the completion supplement")
     if out.exists() or not out.is_relative_to(root):parser.error("output must be new and inside runs/")
     required=["serial_sizes_01","archive_sizes_01","gpu_two_01","gpu_roofline_01","iteration_cost_01","gpu_api_01",args.adversarial,args.cublas_reference]
     required += [f"{kind}_{n}node_01" for kind in ("scaling","weak","raw_scaling") for n in (1,2,4)]
@@ -84,7 +89,7 @@ def main():
     assert sensitivity["completed"] and sensitivity["factors"]==9388 and len(sensitivity["decision_sensitivity"])==60
     subprocess.run([sys.executable,str(Path(__file__).with_name("report.py")),"--study",str(root/"study_full_01"),
         "--sensitivity",str(root/"sensitivity_full_01"),"--scaling",*[str(root/f"scaling_{n}node_01") for n in (1,2,4)],
-        "--roofline",str(root/"gpu_roofline_01"),"--out",str(out)],check=True)
+        "--roofline",str(root/"gpu_roofline_01"),"--out",str(out),"--runs-root",str(root)],check=True)
 
     serial=measured(root/"serial_sizes_01",r"([mBnk]\d+)_r([123])");assert len(serial)==19
     series={k:[] for k in "Bmnk"};slopes={};size_rows=[]
@@ -323,11 +328,14 @@ def main():
         "![本批 RankIC](rankic_distributions.png)\n"+mdtable(rankic_rows,["population","count","median","p25","p75"]),
         "\n## 复现与边界\n源码、构建命令和实验脚本见 README/WALKTHROUGH。数据、公式、日志、CSV 和图只放在忽略的 runs，不修改共享输入。流水线从抽样因子值或 R 到签名和档案结束，不改写 GP 选择/变异或交易回测。真实提案的基因池随机生成，不能据此声称投资有效。AI 使用声明：使用 OpenAI Codex 协助实现、编排和初稿；数值均来自实际运行。"]
     with (out/"report.md").open("a") as handle:handle.write("\n\n".join(sections)+"\n")
-    (out/"EVIDENCE.json").write_text(json.dumps(dict(completed=True,source_runs=str(root),numerical_study="study_full_01",qd_replay="sensitivity_full_01",
+    (out/"EVIDENCE.json").write_text(json.dumps(dict(completed=not bool(args.real_size),source_runs=str(root),numerical_study="study_full_01",qd_replay="sensitivity_full_01",
         strong_configurations=len(strong),hybrid_configurations=len(hybrid),weak_configurations=len(weak),raw_configurations=len(raw_rows),
         serial_configurations=len(serial),archive_configurations=len(archive),precision_run=args.precision,adversarial_run=args.adversarial,
         scaling_validation=args.scaling_validation,synthetic_validation=args.synthetic_validation,
         paper_sections="pdf_sections.md",paper_structure_reference="report/main_zh.tex",cublas_reference_run=args.cublas_reference),indent=2)+"\n")
+    if args.real_size:
+        from completion_report import append_completion
+        append_completion(out,args.real_size,args.matched_full)
     print(f"Full report assembled: {out}")
 
 

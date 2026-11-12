@@ -23,6 +23,8 @@ CPU 将本地抽样行放进 `pca::Matrix`，所有 rank 使用同一初始右�
 
 GPU `gpu_rank_rows` 将缺失值填 0.5 并去均值，供 PCA 使用；`gpu_percentile_rows` 保留 NaN、不填充、不去均值，供 RankIC 调用方复用。采样和成对有效值掩码由调用方负责。输入是连续 `[行][股票]` 的 FP32；当前排序最多 8192 列。`gpu_power` 的 `DeviceReduce` 回调接收显存指针，使用前须确认 CUDA-aware MPI 支持。
 
+原引擎 `rank_rows_pct` 返回 double，需逐值兼容时使用 `gpu_percentile_rows_f64`。该入口复用相同排序 kernel，在 GPU 上恢复精确平均排名后做 FP64 除法，再返回主机 double 数组，可直接交给原有 `daily_rank_ic` 的目标排名参数。详见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)；提供可调用接口与消费者验证，不表示主 GP 已自动切换后端。
+
 ## 签名和准入
 
 签名求解用 `u=normalize(Rv)`、`v=normalize(Rᵀu)` 交替更新，最后再求 `normalize(Rv)`；符号固定后转 FP32。Lanczos 通过左右基和小双对角矩阵得到近似主方向。NumPy 精确 SVD 只用于验证。
