@@ -7,6 +7,7 @@
 | 范围 | 脚本 | 核对内容 |
 | --- | --- | --- |
 | 模块无数据检查 | smoke.pbs / smoke_gpu.pbs | 新目录、Python 参考、CPU/MPI/GPU 与独立 cuBLAS 链接分离 |
+| 当前接口最终验收 | delivery_cpu.pbs / delivery_gpu.pbs | 初始档案、跨批接续、完整快照、独立数值参考、验收失败反例 |
 | P0 真实小样本 | validate_cpu.pbs / validate_gpu.pbs | 同输入签名、Python 准入、重复和精确 SVD 抽查 |
 | P0 边界语义 | adversarial.pbs | 0.90 附近、并列、同 key、严格质量阈值、无效签名 |
 | 提供签名重放 | gpu_api_test.pbs | 原始百分位 GPU 接口，以及 CPU/CUDA/MPI 准入重放 |
@@ -21,6 +22,7 @@
 | P4 弱扩展 | weak_input.pbs / weak.pbs | 固定每 rank 完整矩阵等价工作量，同一输入序列前缀 |
 | P5 GPU kernel | gpu_roofline.pbs | 排名、批量 GEMV、分块相似度与名义 roofline |
 | P5 单／双 GPU | validate_gpu_mpi.pbs | CUDA-aware MPI 显存归约，预热与重复计时 |
+| P5 跨节点 GPU | cross_node_gpu.pbs | 两节点各一卡，实际主机去重、Python 对照和重复验证；单独执行 |
 | P5 精度 | precision_full.pbs / precision_finish.pbs | FP32/FP64、同输入 Python 准入、CPU double 排名转置 |
 | 独立库参照 | cublas_reference.pbs | 相同显存输入、严格 FP32，GEMM 与 GEMM+abs 分开计时 |
 | P6 档案规模 | archive_scale.pbs | 集中与 MPI 分片档案，相似度／准入／通信分别记录 |
@@ -46,3 +48,5 @@ python3 pca/assemble_report.py --runs pca/runs \
 只在证据完整时调用。`paper_sections.py` 据相同证据按 report/main_zh.tex 的 PCA 章节组织补稿；生成的报告与图仍只写入私有 runs。源仓库不包含实验结果或论文补稿。
 
 性能每组预热一次、测量三次并取中位数；准确性与性能计时分开。GPU roofline 的字节量为名义下界，不能当作 profiler 实测 DRAM 流量。独立 kernel 加速不等于完整 GP 加速。完整 GP 的接口联调及同批次端到端测量仍需另行完成。
+
+当前验证器分别记录同预算数值、SVD 收敛、准入、最终快照和输入身份检查。已有结果可以作为历史证据保留，但不能在未重验时宣称由新版验证器生成。完整接口和私有交付包入口见 [DELIVERY.md](DELIVERY.md)。

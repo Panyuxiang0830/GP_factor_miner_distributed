@@ -33,6 +33,8 @@ qsub -v PCA_MANIFEST="$PCA_REAL",PCA_STUDY="$PCA_RUNS/study_full_01",PCA_RUN="$P
 
 受控谱实验单独运行：PCA_SYNTHETIC=1、PCA_COUNT=24、PCA_RUN=study_synthetic_01，仍传 PCA_MANIFEST 以满足 PBS 入口，脚本会生成并改用自己的合成 manifest。它与弱扩展输入不同。
 
+新 study 同时生成 INPUT.json 绑定 manifest 和初始向量。复用没有该文件的历史研究时，prepare_completion.py 必须显式指定 --allow-legacy-study，并人工核对输入。历史结果不重写成新验收产生的结果。
+
 ## 3. CPU 规模、强扩展、混合与弱扩展
 
 serial_scale.pbs → serial_sizes_01；archive_scale.pbs → archive_sizes_01；iteration_cost.pbs 以真实 PCA_REAL 为输入 → iteration_cost_01。后者是前 8 个真实因子、8 ranks 的同精度代表实验。
@@ -120,3 +122,7 @@ python3 pca/assemble_report.py --runs "$PCA_RUNS" \
 ```
 
 上述门槛要求交接的完整维度、9388 个因子、8 MPI ranks、19 个真实规模配置及双方成功标记；适用于本交接数据集。报告包含 completion_sections.md、两项新图及 CSV，只有补充验证完整才标记 completion_supplement_verified。迁移时可将 --runs 指向既有私有证据根；底层 report.py 的 --runs-root 同样允许显式指定根目录，输出仍须为其新的子目录。
+
+## 7. 当前接口验收与交付
+
+在基础实验之外，用 delivery_cpu.pbs / delivery_gpu.pbs 验证历史档案、连续批次及验收失败反例，然后按 [DELIVERY.md](DELIVERY.md) 打包当前源码和报告。跨节点 GPU 使用单独的 cross_node_gpu.pbs，须根据真实执行状态记录；现有同节点双卡结果不构成跨节点证据。自动 GP 集成与 GPU Lanczos 不属于本版本已完成的交付范围。

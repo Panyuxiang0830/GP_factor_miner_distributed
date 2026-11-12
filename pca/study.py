@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from archive_io import fingerprint
 
 for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[key] = "1"
@@ -56,6 +57,8 @@ def evaluate(task):
                 output, stats, elapsed = cpp_solve(library, R, initial, k, method)
                 signatures[seed, method, k-1] = output
                 vector = output.astype(float)
+                if not np.isfinite(vector).all() or not np.linalg.norm(vector)>0 or not np.isfinite(stats).all():
+                    raise ValueError('nonfinite/zero numerical study output')
                 error = max(0., 1 - abs(np.dot(U[:, 0], vector) / np.linalg.norm(vector)))
                 metrics[seed, method, k-1] = error, stats[2], stats[3], stats[4], elapsed, stats[0]
     gap = float(singular[1] / singular[0]) if len(singular) > 1 else 0.
@@ -95,6 +98,10 @@ def main():
     initials = [np.fromfile(manifest["initial"], dtype="<f8")]
     initials += [np.random.default_rng(seed).normal(size=n) for seed in range(1, args.seeds)]
     args.out.mkdir(parents=True)
+    provenance=dict(version=1,manifest_hash_fnv1a64=fingerprint(args.manifest),
+        initial_hash_fnv1a64=fingerprint(manifest['initial']),factors=len(rows),rows=m,cols=n,
+        seeds=args.seeds,maxsteps=args.maxsteps,methods=['power','lanczos'])
+    (args.out/'INPUT.json').write_text(json.dumps(provenance,indent=2)+'\n')
     np.save(args.out / "initials.npy", np.asarray(initials))
     signatures = np.lib.format.open_memmap(args.out / "signatures.npy", mode="w+", dtype=np.float32,
                                           shape=(len(rows), args.seeds, 2, args.maxsteps, m))

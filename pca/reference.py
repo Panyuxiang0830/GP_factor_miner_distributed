@@ -22,3 +22,32 @@ def power_signature(matrix, initial, iterations):
     if signature[np.argmax(np.abs(signature))] < 0:
         signature *= -1
     return signature.astype(np.float32)
+
+
+def lanczos_signature(matrix,initial,steps):
+    """Independent NumPy Golub--Kahan reference at the same finite budget."""
+    R=np.asarray(matrix,dtype=float)
+    if not np.isfinite(R).all() or not np.any(R):raise ValueError('R must be finite and nonzero')
+    v=np.asarray(initial,dtype=float).copy();length=np.linalg.norm(v)
+    if not length>0 or not np.isfinite(length):raise ValueError('invalid initial vector')
+    v/=length;p=R@v;a=np.linalg.norm(p)
+    if not a>0:raise ValueError('zero initial left direction')
+    U=[p/a];V=[v];alpha=[a];beta=[]
+    def reorth(x,basis):
+        Q=np.asarray(basis)
+        for _ in range(2):x=x-Q.T@(Q@x)
+        return x
+    for _ in range(steps-1):
+        q=reorth(R.T@U[-1]-alpha[-1]*V[-1],V);b=np.linalg.norm(q)
+        if b<=1e-13*a:break
+        v=q/b;p=reorth(R@v-b*U[-1],U);a=np.linalg.norm(p);beta.append(b)
+        if a<=1e-13*b:break
+        U.append(p/a);V.append(v);alpha.append(a)
+    k=len(U);B=np.zeros((k,k+(len(beta)==k)))
+    for i in range(k):
+        B[i,i]=alpha[i]
+        if i<len(beta):B[i,i+1]=beta[i]
+    left,_,_=np.linalg.svd(B,full_matrices=False)
+    s=np.asarray(U).T@left[:,0];s/=np.linalg.norm(s)
+    if s[np.argmax(np.abs(s))]<0:s=-s
+    return s.astype(np.float32)

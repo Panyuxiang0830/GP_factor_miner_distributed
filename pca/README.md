@@ -67,12 +67,15 @@ python3 pca/validate.py --manifest pca/runs/real_input/manifest.json \
 | `--rank-input 1` | 输入是未排名抽样值，先排名；现成 R 不应再次排名 |
 | `--signature-input file` | 用提供的签名单独重放准入 |
 | `--archive mpi` | 档案签名分片，MAXLOC 选择全局最近记录 |
+| `--archive-input file` | 从已有完整档案快照继续；不指定时从空档案开始 |
 | `--device cuda --precision float/double` | GPU 批量幂迭代；CUDA 尚未实现 Lanczos |
 | `--device cuda --layout date --cuda-aware 1` | 直接对显存地址进行 MPI 归约 |
 
 准入质量为 abs RankIC，相似度阈值 0.90，替换要求严格大于旧质量加 0.002。同块内修改立即可见，完全并列按 key 字典序选择较大者。详情与接口见 WALKTHROUGH。
 
-运行输出为 signatures.f32、decisions.json、archive_keys.json 和 metrics.json；验证另写 validation.json。总计时包括循环内签名写入，不含 MPI 启动、GPU 初始化及最终 JSON 序列化，阶段存在嵌套，不能直接相加。
+运行输出含 signatures.f32、decisions.json、archive_keys.json、metrics.json，以及可供下一批接续的 archive.json / archive_signatures.f32。provenance.json 记录实际输入身份，验证另写 validation.json。总计时包括循环内签名写入，不含 MPI 启动、GPU 初始化及最终快照／JSON 序列化，阶段存在嵌套，不能直接相加。
+
+历史档案格式、分层验证字段、CPU/GPU 最终小规模验收与论文交付包见 [DELIVERY.md](DELIVERY.md)。同预算实现一致性与精确 SVD 收敛是不同检查，不能把有限步算法尚未收敛一概判为实现错误。
 
 ## 实验与复现
 

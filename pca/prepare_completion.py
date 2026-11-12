@@ -11,6 +11,7 @@ import numpy as np
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'python/src'))
 from gp_factor_miner.expressions import expression_key
+from archive_io import fingerprint
 
 
 def main():
@@ -23,10 +24,17 @@ def main():
     p.add_argument('--count',type=int)
     p.add_argument('--candidates',type=int,default=512)
     p.add_argument('--target',type=float,default=1e-6)
+    p.add_argument('--allow-legacy-study',action='store_true',help='explicitly accept an audited historical checkpoint without INPUT.json')
     a=p.parse_args();out=a.out.resolve()
     if out.exists() or not out.is_relative_to((Path(__file__).resolve().parent/'runs').resolve()):p.error('new output under pca/runs required')
     manifest=json.loads(a.manifest.read_text())
+    provenance_path=a.study/'INPUT.json'
+    if provenance_path.exists():
+        provenance=json.loads(provenance_path.read_text())
+        if provenance['manifest_hash_fnv1a64']!=fingerprint(a.manifest) or provenance['initial_hash_fnv1a64']!=fingerprint(manifest['initial']):p.error('numerical study input provenance mismatch')
+    elif not a.allow_legacy_study:p.error('study lacks INPUT.json; --allow-legacy-study is only for audited historical checkpoints')
     metrics=np.load(a.study/'metrics.npy',mmap_mode='r');sig=np.load(a.study/'signatures.npy',mmap_mode='r')
+    if not np.isfinite(metrics).all():p.error('nonfinite numerical study')
     complete=np.load(a.study/'completed.npy')
     count=a.count or len(manifest['records']);m,n=manifest['rows'],manifest['cols']
     if not(0<count<=len(manifest['records']) and len(complete)==len(manifest['records']) and complete.all()):p.error('complete same-input numerical study required')
@@ -44,6 +52,9 @@ def main():
     (out/'real_candidates.json').write_text(json.dumps(candidates,ensure_ascii=False)+'\n')
     plan=dict(manifest=str(a.manifest.resolve()),rows=m,cols=n,count=count,target=a.target,
               max_steps=metrics.shape[3],seed=0,methods={},budget_source='first serial SVD-validated step within target; max budget for censored factors')
+    plan['provenance_checked']=provenance_path.exists()
+    plan['manifest_hash_fnv1a64']=fingerprint(a.manifest)
+    plan['initial_hash_fnv1a64']=fingerprint(manifest['initial'])
     for method,name in enumerate(('power','lanczos')):
         errors=np.asarray(metrics[:count,0,method,:,0]);passed=errors<=a.target
         eligible=passed.any(axis=1)

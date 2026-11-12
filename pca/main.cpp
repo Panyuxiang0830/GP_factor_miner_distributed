@@ -1,6 +1,8 @@
 #include "core.hpp"
 #include "gpe/json.hpp"
 #include "json_output.hpp"
+#include "archive_io.hpp"
+#include <set>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -163,8 +165,10 @@ std::vector<pca::Matrix> transpose_to_factors(const std::vector<pca::Matrix>& lo
 
 int run(int argc, char** argv) {
     std::map<std::string, std::string> args;
+    const std::set<std::string> known{"--manifest","--out","--method","--layout","--archive","--steps","--chunk","--rank-input","--count","--init","--signature-input","--device","--precision","--cuda-aware","--archive-input"};
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 == argc) throw std::invalid_argument("options require values");
+        if(!known.count(argv[i])||args.count(argv[i]))throw std::invalid_argument("unknown/duplicate option: "+std::string(argv[i]));
         args[argv[i]] = argv[i + 1];
     }
     auto option = [&](const std::string& key, const std::string& fallback) {
@@ -187,7 +191,11 @@ int run(int argc, char** argv) {
     const auto& entries = input.at("records").array;
     int count = std::min(int(entries.size()), std::stoi(option("--count", std::to_string(entries.size()))));
     if (m < 2 || n < 1 || count < 1) throw std::invalid_argument("invalid shape/count");
-    auto initial = read_binary<double>(option("--init", input.at("initial").string), 0, n);
+    std::string initial_path=option("--init", input.at("initial").string);
+    if(std::filesystem::file_size(initial_path)!=size_t(n)*sizeof(double))throw std::invalid_argument("initial vector size mismatch");
+    auto initial = read_binary<double>(initial_path, 0, n);
+    double initial_norm=0;for(double x:initial){if(!std::isfinite(x))throw std::invalid_argument("nonfinite initial vector");initial_norm+=x*x;}
+    if(!(initial_norm>0)||!std::isfinite(initial_norm))throw std::invalid_argument("invalid initial norm");
     std::string supplied = option("--signature-input", "");
     std::string device = option("--device", "cpu"), precision = option("--precision", "double");
     if (device != "cpu" && device != "cuda") throw std::invalid_argument("unknown device");
@@ -213,9 +221,26 @@ int run(int argc, char** argv) {
 #else
     if (device == "cuda") throw std::runtime_error("rebuild with -DPCA_CUDA=ON");
 #endif
+    std::string archive_input=option("--archive-input", "");
+    std::vector<pca::Record> seeded;
+    if(!archive_input.empty()&&(rank==0||archive_mode=="mpi"))seeded=pca::load_archive(archive_input,m);
+    size_t initial_archive_size=seeded.size();
+    Json provenance=object();put(provenance,"version",1);
+    put(provenance,"manifest_hash_fnv1a64",pca::file_fingerprint(manifest));
+    put(provenance,"initial_hash_fnv1a64",pca::file_fingerprint(initial_path));
+    put(provenance,"initial",std::filesystem::absolute(initial_path).string());
+    put(provenance,"archive_input",archive_input.empty()?"":std::filesystem::absolute(archive_input).string());
+    put(provenance,"archive_hash_fnv1a64",archive_input.empty()?"":pca::file_fingerprint(archive_input));
+    if(!archive_input.empty()){
+        auto meta=gpe::parse_json_file(archive_input);auto binary=std::filesystem::path(archive_input).parent_path()/meta.at("signatures").string;
+        put(provenance,"archive_signatures_hash_fnv1a64",pca::file_fingerprint(binary.string()));
+    }
+    put(provenance,"signature_input",supplied.empty()?"":std::filesystem::absolute(supplied).string());
+    put(provenance,"method",method);put(provenance,"steps",k);put(provenance,"rank_input",rank_input?1:0);put(provenance,"factors",count);
     if (rank == 0) {
         if (std::filesystem::exists(out)) throw std::runtime_error("refusing to overwrite " + out);
         std::filesystem::create_directories(out);
+        write(out+"/provenance.json",provenance);
     }
 #ifdef PCA_MPI
     MPI_Barrier(MPI_COMM_WORLD);
@@ -228,6 +253,13 @@ int run(int argc, char** argv) {
 #ifdef PCA_MPI
     pca::MpiArchive distributed_archive(MPI_COMM_WORLD);
 #endif
+    for(const auto& record:seeded){
+#ifdef PCA_MPI
+        if(archive_mode=="mpi")distributed_archive.seed(record);else
+#endif
+        archive.records[record.key]=record;
+    }
+    seeded.clear();seeded.shrink_to_fit();
 #ifdef PCA_CUDA
     if (device == "cuda") archive.product = [&](const std::vector<float>& x, int L,
         const std::vector<float>& y, int A, int d) { return pca::gpu_similarity(x, L, y, A, d, gpu); };
@@ -385,6 +417,11 @@ int run(int argc, char** argv) {
         }
     }
     double total = max_rank(seconds(total_start));
+    std::vector<pca::Record> snapshot;
+#ifdef PCA_MPI
+    if(archive_mode=="mpi")snapshot=distributed_archive.snapshot(m);else
+#endif
+    if(!rank)for(const auto& item:archive.records)snapshot.push_back(item.second);
     Json metrics = object();
     for (auto phase : std::vector<std::pair<std::string,double>>{
              {"load_seconds", load_time}, {"ranking_seconds", ranking_time}, {"solve_seconds", solve_time}, {"transpose_seconds", transpose_time},
@@ -394,6 +431,7 @@ int run(int argc, char** argv) {
     put(metrics, "factors", count); put(metrics, "rows", m); put(metrics, "cols", n); put(metrics, "steps", k);
     put(metrics, "method", method); put(metrics, "layout", layout); put(metrics, "chunk", chunk);
     put(metrics, "archive_mode", archive_mode);
+    put(metrics,"initial_archive_size",double(initial_archive_size));
     put(metrics, "rank_input", rank_input ? 1 : 0);
 #ifdef PCA_MPI
     if (archive_mode == "mpi") {
@@ -431,6 +469,7 @@ int run(int argc, char** argv) {
         }
 #endif
         put(metrics, "archive_size", double(archive_size));
+        pca::save_archive(out+"/archive.json",snapshot,m);
         write(out + "/metrics.json", metrics); write(out + "/decisions.json", decisions_json); write(out + "/archive_keys.json", keys);
     }
     return 0;

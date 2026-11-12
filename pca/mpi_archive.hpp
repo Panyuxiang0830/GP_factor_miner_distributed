@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 
 namespace pca {
 // Signature storage is sharded; small key/quality metadata is replicated.
@@ -31,6 +32,29 @@ public:
     long long coarse_pairs = 0, refined_pairs = 0;
     explicit MpiArchive(MPI_Comm comm) : comm_(comm) { MPI_Comm_rank(comm_, &rank_); MPI_Comm_size(comm_, &ranks_); }
     void seed(const Record& record) { store(record); }
+    // Collective export. Only rank 0 receives signatures; metadata stays replicated.
+    std::vector<Record> snapshot(int dimension) const {
+        std::vector<std::string> keys;for(const auto& q:qualities)keys.push_back(q.first);
+        std::vector<int> indices;std::vector<float> values;
+        for(const auto& item:local_){
+            if(item.second.signature.size()!=size_t(dimension))throw std::invalid_argument("archive dimension mismatch");
+            indices.push_back(int(std::lower_bound(keys.begin(),keys.end(),item.first)-keys.begin()));
+            values.insert(values.end(),item.second.signature.begin(),item.second.signature.end());
+        }
+        if(values.size()>size_t(std::numeric_limits<int>::max())||keys.size()*size_t(dimension)>size_t(std::numeric_limits<int>::max()))throw std::runtime_error("archive snapshot exceeds MPI count range");
+        int count=int(indices.size());std::vector<int> counts(ranks_),offset(ranks_),floats(ranks_),foffset(ranks_);
+        MPI_Gather(&count,1,MPI_INT,counts.data(),1,MPI_INT,0,comm_);
+        if(!rank_)for(int r=0,pos=0;r<ranks_;++r){offset[r]=pos;foffset[r]=pos*dimension;floats[r]=counts[r]*dimension;pos+=counts[r];}
+        std::vector<int> all_indices(rank_?0:keys.size());std::vector<float> all_values(rank_?0:keys.size()*size_t(dimension));
+        MPI_Gatherv(indices.data(),count,MPI_INT,all_indices.data(),counts.data(),offset.data(),MPI_INT,0,comm_);
+        MPI_Gatherv(values.data(),int(values.size()),MPI_FLOAT,all_values.data(),floats.data(),foffset.data(),MPI_FLOAT,0,comm_);
+        std::vector<Record> answer;
+        if(!rank_){
+            answer.resize(keys.size());
+            for(size_t i=0;i<keys.size();++i){int j=all_indices[i];answer[j]={keys[j],qualities.at(keys[j]),{all_values.begin()+i*dimension,all_values.begin()+(i+1)*dimension}};}
+        }
+        return answer;
+    }
     std::vector<Decision> consider(const std::vector<Record>& candidates) {
         using Clock = std::chrono::steady_clock;
         auto seconds = [](Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); };

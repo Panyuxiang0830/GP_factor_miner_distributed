@@ -13,6 +13,7 @@ for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[name] = "1"
 import numpy as np
 from study import replay
+from archive_io import fingerprint
 
 ROWS = None
 SIGNATURES = None
@@ -48,8 +49,14 @@ def main():
     if not completed.all() or len(completed) != signatures.shape[0] or not (args.study / "sigma2_over_sigma1.npy").exists():
         raise ValueError("the numerical sweep checkpoint is not complete")
     count, seeds, methods, steps, dimension = signatures.shape
+    source=args.study/'INPUT.json'
+    if source.exists():
+        provenance=json.loads(source.read_text());manifest=json.loads(args.manifest.read_text())
+        if provenance['manifest_hash_fnv1a64']!=fingerprint(args.manifest) or provenance['initial_hash_fnv1a64']!=fingerprint(manifest['initial']):
+            raise ValueError('numerical checkpoint input provenance mismatch')
     if methods != 2 or steps < 4 or args.workers < 1 or metrics.shape != (count,seeds,methods,steps,6):
         raise ValueError("invalid checkpoint shape/workers")
+    if not np.isfinite(metrics).all():raise ValueError('nonfinite numerical checkpoint')
     args.out.mkdir(parents=True)
     cases = [(s,m,k) for s in range(seeds) for m in range(2) for k in range(steps)]
     results = {}

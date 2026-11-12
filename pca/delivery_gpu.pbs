@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -q auto
+#PBS -N pca_delivery_gpu
+#PBS -j oe
+#PBS -l walltime=00:10:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:ngpus=1:mem=16gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set new private run}"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_BUILD_REUSE:-${PCA_RUN}_build}"
+if [[ -n "${PCA_BUILD_REUSE:-}" ]]; then
+    sha256sum -c "$build/SOURCES.sha256"
+else
+    cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON
+    cmake --build "$build" -j 2 --target pca_run pca_gpu_test
+fi
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+"$build/pca_gpu_test" "${PCA_RUN}_kernel.json"
+PCA_MPI_BIN=$(command -v mpirun)
+PCA_MPI_LIBS=$LD_LIBRARY_PATH
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+export LD_LIBRARY_PATH="$PCA_MPI_LIBS:${LD_LIBRARY_PATH:-}"
+python3 pca/delivery_check.py --binary "$build/pca_run" --out "$PCA_RUN" --mpiexec "$PCA_MPI_BIN" --cuda

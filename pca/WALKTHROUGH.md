@@ -42,3 +42,5 @@ date 每轮跨日期归约；transpose 先交换完整矩阵再本地迭代；fa
 日期布局的 power 已按批归约，Lanczos 当前逐因子归约，因此较少步数不保证较少 Allreduce。数值诊断额外做两次矩阵乘。各 rank 的阶段最大值可能来自不同进程，而且通信嵌套在求解／转置中，不可相加代替总时间。
 
 查看结果时先检查验证标记，再看 metrics、逐候选 decisions 与最终 archive_keys；不能仅凭程序退出或文件夹存在判断正确性。所有输出留在 runs，不上传到公开仓库。
+
+继续历史批次时传 --archive-input archive.json。集中档案和 MPI 分片档案都读取同一组 key、质量与签名，运行后导出完整快照；下一批应显式引用该快照，并保持抽样日期与算法约定一致。验证器自动读取 provenance 中的实际初始档案，不会把历史批次当成空库重放。字段和最终验收见 [DELIVERY.md](DELIVERY.md)。

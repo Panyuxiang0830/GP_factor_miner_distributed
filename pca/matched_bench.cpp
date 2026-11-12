@@ -1,5 +1,6 @@
 #include "benchmark_io.hpp"
 #include "core.hpp"
+#include "archive_io.hpp"
 #include <mpi.h>
 #include <algorithm>
 #include <array>
@@ -15,6 +16,8 @@ int main(int argc,char**argv){
     try{
         auto args=options(argc,argv);auto plan=gpe::parse_json_file(args.at("--plan"));
         auto manifest=gpe::parse_json_file(plan.at("manifest").string);
+        if(plan.has("manifest_hash_fnv1a64")&&plan.at("manifest_hash_fnv1a64").string!=pca::file_fingerprint(plan.at("manifest").string))throw std::runtime_error("accuracy plan manifest changed");
+        if(plan.has("initial_hash_fnv1a64")&&plan.at("initial_hash_fnv1a64").string!=pca::file_fingerprint(manifest.at("initial").string))throw std::runtime_error("accuracy plan initial vector changed");
         int m=int(plan.at("rows").number),n=int(plan.at("cols").number),B=int(plan.at("count").number);
         double target=plan.at("target").number;int maxk=int(plan.at("max_steps").number);
         if(P>m||B<1||B>int(manifest.at("records").array.size()))throw std::runtime_error("invalid shape/ranks");

@@ -1,0 +1,51 @@
+#!/bin/bash
+# Prepared cross-node acceptance. Submit separately when this allocation is authorized.
+#PBS -q auto
+#PBS -N pca_cross_node_gpu
+#PBS -j oe
+#PBS -l walltime=00:20:00
+#PBS -l select=2:ncpus=4:mpiprocs=1:ngpus=1:mem=16gb
+#PBS -l place=scatter
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set new private output}"
+: "${PCA_MANIFEST:?set real input manifest}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+mpirun -np 2 --map-by ppr:1:node --bind-to core hostname > "$PCA_RUN/mpi_hosts.txt"
+test "$(sort -u "$PCA_RUN/mpi_hosts.txt" | wc -l)" -eq 2
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON
+cmake --build "$build" -j 2 --target pca_run
+for ranks in 1 2; do
+    for repeat in 0 1 2 3; do
+        mpirun -np "$ranks" --map-by ppr:1:node --bind-to core "$build/pca_run" \
+            --manifest "$PCA_MANIFEST" --out "$PCA_RUN/p${ranks}_r${repeat}" \
+            --device cuda --precision float --layout date --cuda-aware 1 \
+            --count "${PCA_COUNT:-40}" --chunk 16
+    done
+done
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+for ranks in 1 2; do
+    python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$PCA_RUN/p${ranks}_r1"
+done
+python3 - "$PCA_RUN" <<'PY'
+from pathlib import Path
+import json,sys
+p=Path(sys.argv[1]);hosts=set((p/'mpi_hosts.txt').read_text().split());assert len(hosts)==2
+for rank in (1,2):
+    assert json.loads((p/f'p{rank}_r1/validation.json').read_text())['passed']
+    for r in (2,3):
+        for name in ('signatures.f32','decisions.json','archive_keys.json'):
+            assert (p/f'p{rank}_r1'/name).read_bytes()==(p/f'p{rank}_r{r}'/name).read_bytes()
+a=json.loads((p/'p1_r1/decisions.json').read_text());b=json.loads((p/'p2_r1/decisions.json').read_text())
+for x,y in zip(a,b):
+    for k in ('key','action','closest_key','replaced_key'):assert x[k]==y[k]
+assert len(a)==len(b)
+assert (p/'p1_r1/archive_keys.json').read_bytes()==(p/'p2_r1/archive_keys.json').read_bytes()
+m=json.loads((p/'p2_r1/metrics.json').read_text());assert m['ranks']==2 and m['cuda_aware']==1
+(p/'SUCCESS.json').write_text(json.dumps(dict(verified=True,nodes=2,gpus=2,hosts=sorted(hosts),factors=m['factors'],cuda_aware=True,one_two_gpu_decisions_equal=True),indent=2)+'\n')
+(p/'SUCCESS').touch()
+PY
