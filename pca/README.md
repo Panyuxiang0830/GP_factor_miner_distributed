@@ -10,7 +10,7 @@
   → 按候选顺序更新 QD 档案
 ```
 
-这是可独立运行的模块，原 GP 引擎尚未自动调用该实现。与上游批次接口对接的约定见 [WALKTHROUGH.md](WALKTHROUGH.md)。本目录不依赖旧的 pca_workflow/、pca_step1/ 或已移除的 gpe_export 目标。
+既可独立运行，也可通过原 GP 的可选 batch_backend 自动调用。实际 C++ 引擎、PCA、准入和下一代衔接见 [GP_INTEGRATION.md](GP_INTEGRATION.md)；原 EOD CLI 可通过 --cpp-* 参数启用。默认原 Python 后端保持不变。本目录不依赖旧的 pca_workflow/、pca_step1/ 或已移除的 gpe_export 目标。
 
 ## 编译
 

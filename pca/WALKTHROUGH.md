@@ -19,7 +19,7 @@ R 的行是抽样日期，列是股票；常用维度为 293×5876。现成 R �
 
 上游按原始全局交易日分块，本驱动则按已抽样的 R 行分块，两者的边界不一定相同。接入时应先在本 rank 的自有日期内按 `t % sample_step == 0` 选行，排除 halo，再按股票行排名并逐行去均值。新版主工程没有旧的 `gpe::signature_rows`，不要依赖该已移除接口。
 
-CPU 将本地抽样行放进 `pca::Matrix`，所有 rank 使用同一初始右向量；将 `MPI_Allreduce` 包装成 `pca::Sum`，传给 `pca::solve`。按全局日期顺序汇集局部签名后统一调用 `pca::finish`，不在各 rank 独立固定符号。因子引擎可能分块打分并释放根面板，应在释放前抽样，或明确保留对应输入。本模块尚未修改该调用链。
+CPU 将本地抽样行放进 `pca::Matrix`，所有 rank 使用同一初始右向量；将 `MPI_Allreduce` 包装成 `pca::Sum`，传给 `pca::solve`。按全局日期顺序汇集局部签名后统一调用 `pca::finish`，不在各 rank 独立固定符号。实际接入由 engine_bridge.cpp 使用上游 keep_roots 保留有界表达式子批，再抽取自有日期；Python 可选后端、原 CLI 与检查点契约见 [GP_INTEGRATION.md](GP_INTEGRATION.md)。
 
 GPU `gpu_rank_rows` 将缺失值填 0.5 并去均值，供 PCA 使用；`gpu_percentile_rows` 保留 NaN、不填充、不去均值，供 RankIC 调用方复用。采样和成对有效值掩码由调用方负责。输入是连续 `[行][股票]` 的 FP32；当前排序最多 8192 列。`gpu_power` 的 `DeviceReduce` 回调接收显存指针，使用前须确认 CUDA-aware MPI 支持。
 

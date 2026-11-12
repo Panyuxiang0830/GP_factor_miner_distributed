@@ -1,6 +1,6 @@
 # 独立 PCA 模块的交付接口
 
-该版本从原始抽样值或已排名 R 生成签名，按给定候选顺序更新 QD，支持空档案或已有档案，输出可用于下一批的完整快照。原 Python GP 不会自动切换到此实现。GPU Lanczos 不在本次范围。
+该版本从原始抽样值或已排名 R 生成签名，按给定候选顺序更新 QD，支持空档案或已有档案，输出可用于下一批的完整快照。原 Python GP 可通过显式 batch_backend 或 EOD CLI 的 --cpp-* 参数启用实际引擎衔接，见 [GP_INTEGRATION.md](GP_INTEGRATION.md)。GPU Lanczos 不在本次范围。
 
 ## 1. 历史档案与连续批次
 
@@ -60,6 +60,8 @@ python3 pca/package_delivery.py --report /path/to/private/report_completed \
 ```
 
 它合并真实规模与整代成本章节，消除旧正文与追加说明混用；同时保留表格、图、验证摘要、新版全文 LaTeX 副本和完整仓库源码归档。--pandoc /path/to/pandoc 可生成 LaTeX 正文片段；安装 Markdown 与 WeasyPrint 后使用 --pdf 生成阅读 PDF。全文 LaTeX 是否实际编译、跨节点 GPU 是否验证、自动 GP 是否接入分别记录，不能用“打包成功”替代这些状态。
+
+完整衔接版须另提供 --integration-cpu、--integration-gpu 和 --live-gp，分别指向 bridge_check.py 的 CPU/GPU 验收和 run_gp.py 的真实行情运行目录；三项必须一起提供。--live-gp-gpu 增加真实 GPU 进化证据，--cli-check 增加 cli_bridge_check.py 的原 CLI、样本外筛选及恢复证据，--cross-node 增加跨节点 GPU 验证。打包前须提交源码，避免源码归档与记录的提交版本不同；运行结果仍保留在忽略的私有目录。
 
 GPU 运行验证尚在等待资源时，只能显式使用 --pending-gpu --cuda-build /path/to/verified/build 生成候选包；它要求独立的 COMPILE_CHECK.json，并将 current_gpu_interface_verified 和 independent_module_verified 保持为 false。候选包不替代通过当前 GPU 回归后的正式接口验收包。
 

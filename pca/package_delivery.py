@@ -25,9 +25,12 @@ def main():
     stage=p.add_mutually_exclusive_group(required=True);stage.add_argument('--gpu-check',type=Path);stage.add_argument('--pending-gpu',action='store_true')
     p.add_argument('--cuda-build',type=Path,help='verified compile evidence; required for a pending-GPU candidate')
     p.add_argument('--cross-node',type=Path);p.add_argument('--out',type=Path,required=True)
+    p.add_argument('--integration-cpu',type=Path);p.add_argument('--integration-gpu',type=Path)
+    p.add_argument('--live-gp',type=Path);p.add_argument('--live-gp-gpu',type=Path);p.add_argument('--cli-check',type=Path)
     p.add_argument('--pdf',action='store_true');p.add_argument('--pandoc');a=p.parse_args()
     repo=Path(__file__).resolve().parents[1];out=a.out.resolve();report=a.report.resolve()
     if out.exists() or not out.is_relative_to((repo/'pca/runs').resolve()):p.error('new private pca/runs output required')
+    if subprocess.check_output(['git','-C',str(repo),'status','--porcelain'],text=True):p.error('commit source changes before packaging a reproducible source version')
     evidence=load(report/'EVIDENCE.json');cpu=load(a.cpu_check/'SUCCESS.json');gpu=load(a.gpu_check/'SUCCESS.json') if a.gpu_check else None
     assert evidence['completed'] and evidence['completion_supplement_verified']
     for check in (cpu,)+( (gpu,) if gpu else () ):
@@ -37,16 +40,34 @@ def main():
     if a.pending_gpu:assert compile_check and compile_check['verified'] and compile_check['cuda_compiled'] and not compile_check['gpu_runtime_tested']
     cross=load(a.cross_node/'SUCCESS.json') if a.cross_node else None
     if cross:assert cross['verified'] and cross['nodes']==2 and cross['gpus']==2
+    integration_paths=(a.integration_cpu,a.integration_gpu,a.live_gp)
+    if any(integration_paths) and not all(integration_paths):p.error('provide integration CPU, GPU and real GP evidence together')
+    integrated=all(integration_paths)
+    integrated_cpu=load(a.integration_cpu/'SUCCESS.json') if integrated else None
+    integrated_gpu=load(a.integration_gpu/'SUCCESS.json') if integrated else None
+    live=load(a.live_gp/'SUCCESS.json') if integrated else None
+    live_gpu=load(a.live_gp_gpu/'SUCCESS.json') if a.live_gp_gpu else None
+    cli=load(a.cli_check/'SUCCESS.json') if a.cli_check else None
+    if integrated:
+        for check in (integrated_cpu,integrated_gpu):
+            assert check['verified'] and check['live_cpp_engine'] and check['live_cpp_pca'] and check['live_cpp_qd']
+            assert check['stages']==[1,2,3] and check['checkpoint_resume_exact'] and check['python_numerical_fallback_disabled']
+        assert integrated_gpu['device']=='cuda' and live['completed'] and live['generation_events']>0
+    if live_gpu:assert integrated and live_gpu['completed'] and live_gpu['device']=='cuda'
+    if cli:assert integrated and cli['verified'] and cli['original_cli'] and cli['original_oos_screening'] and cli['completed_resume']
     out.mkdir();(out/'figures').mkdir();(out/'latex').mkdir();(out/'evidence').mkdir()
     for source in report.iterdir():
         if source.suffix in ('.png','.csv'):shutil.copy2(source,out/'figures'/source.name)
     for name,parent in (('cpu_acceptance',a.cpu_check),)+( (('gpu_acceptance',a.gpu_check),) if gpu else () ):
         shutil.copy2(parent/'SUCCESS.json',out/'evidence'/(name+'.json'))
     if a.cuda_build:shutil.copy2(a.cuda_build/'COMPILE_CHECK.json',out/'evidence/cuda_compile.json')
+    for label,parent in (('cross_node',a.cross_node),('integration_cpu',a.integration_cpu),('integration_gpu',a.integration_gpu),('live_gp',a.live_gp),('live_gp_gpu',a.live_gp_gpu),('original_cli',a.cli_check)):
+        if parent:shutil.copy2(parent/'SUCCESS.json',out/'evidence'/(label+'.json'))
     shutil.copy2(report/'EVIDENCE.json',out/'evidence/experiments.json')
     # Keep the old report as historical evidence, and produce one consolidated manuscript.
     text=(report/'pdf_sections.md').read_text().split('# 严格交接补充：')[0]
     text=re.sub(r'^>.*\n\n','',text)
+    text=text.replace('完整实验及限制另见 report.md、EVIDENCE.json。','完整实验依据见 evidence/experiments.json；验收范围见 DELIVERY_STATUS.json。')
     supplement=(report/'completion_sections.md').read_text()
     real=supplement.split('## P1：',1)[1].split('## P2：',1)[0].split('\n',1)[1].strip()
     replacement='## 6.3.1 串行代价与 CPU 扩展\n\n'+real+'\n\n'
@@ -78,6 +99,30 @@ def main():
 
 原 Python GP 尚未自动切换至本实现；RankIC 接口已有消费者验证，正式采用由对应负责人协调。GPU Lanczos 不在本次范围。全组作者信息、原 1481 个进化因子的统计和最终全文格式需与组员整合。本包提供对应新版全文源文件的副本，不覆盖上游原稿。
 '''
+    if integrated:
+        text=text.replace('当前交付是独立 PCA/准入子流水线，尚不构成整代 GP 与新 GPU 实现已联调的证据。',
+            '本版本既提供独立 PCA/准入模块，也将其接入原 Python 分层 GP；实际 C++ 引擎、PCA、QD 与下一代的闭环证据见第 6.5 节，验证规模与完整生产预算明确区分。')
+        text=text.replace('仍需与最新因子引擎在批次接口联调，核对全局日期、halo 排除、key 与返回顺序。',
+            '已有实际引擎接口联调，核对全局日期抽样、halo 排除、key 和返回顺序，并验证中断恢复；完整生产预算的重复性能测量仍可进一步开展。')
+        text=text.replace('原 Python GP 尚未自动切换至本实现；',
+            '原 Python GP 的可选 batch_backend 与原 EOD CLI 的 --cpp-* 参数已接入本实现；默认原后端保持不变。')
+        text=text.replace('源码位于仓库 pca/。',
+            '数值与衔接实现位于仓库 pca/，原 Python 的 hierarchical_engine.py 和 hierarchical_cli.py 增加可选后端接口。')
+        rows=[]
+        for label,run in (('CPU/MPI',live),('CUDA',live_gpu)):
+            if run:rows.append(dict(backend=label,T=run['T'],N=run['N'],fields=len(run['fields']),ranks=run['ranks'],generations=run['generation_events'],archive=run['archive_size'],wall_seconds=round(run['evolution_wall_seconds'],3)))
+        body='''## 6.5 实际 GP 衔接与完整闭环
+
+原 Python GP 仍负责分层提案、父代选择、交叉、变异、缓存和检查点。启用可选后端后，一个进度块交给原 C++ MPI 引擎计算 DAG、RankIC 与适应度；按全局日期抽取自有行、排除 halo 后执行 PCA，再将同序结果交回 Python。准入另调用 C++ 顺序档案，并将完整新档案逐项同步给原对象，继续生成下一代。无需预先导出 R，也不把整代完整因子值写入磁盘。
+
+合成闭环验收实际完成深度 1、2、3 及下一代；将旧 Python 评估、PCA、准入入口设为调用即失败，证明没有隐蔽回退。固定表达式与 Python 参考核对；中断后恢复与未中断结果一致，后端或数据身份改变时拒绝恢复。CPU/MPI 和 GPU 分别通过。
+
+真实行情字段上的小规模实际进化如下。单次墙钟包含 MPI 子进程启动、原 Python 控制和检查点，不能作为完整生产规模的重复加速基准：
+
+'''+table(rows,('backend','T','N','fields','ranks','generations','archive','wall_seconds'))
+        if cli:body+='\n\n原 EOD 命令行还通过了带 C++ 后端的完整运行和已完成检查点恢复，输出三个深度基因池、QD 档案、原样本外 RankIC 筛选、相关性筛选和最终因子文件。筛选阶段沿用原 Python 实现，不将它描述为已全部迁移到 CUDA。'
+        body+='\n\n目前为有界子批与进度块级的进程调用，启动、数据准备及 I/O 会限制小批次效率。不同 MPI 规模或精度可能放大细小评分排序差异，因此固定候选顺序的 QD 一致性与跨配置整次进化集合相同分别检查，不作普遍等价保证。正式人口和代数预算需在对应资源配置下另做性能测量。\n\n'
+        text=text.replace('## 7.1 ',body+'## 7.1 ',1)
     for image in re.findall(r'!\[[^]]*\]\(([^)]+)\)',text):
         assert (out/'figures'/image).exists(),image
         text=text.replace(']('+image+')','](figures/'+image+')')
@@ -102,11 +147,13 @@ def main():
         (out/'pca_paper.html').write_text(html);HTML(string=html,base_url=str(out)).write_pdf(out/'pca_paper.pdf')
     status=dict(independent_module_verified=bool(gpu),cpu_interface_verified=True,current_gpu_interface_verified=bool(gpu),cuda_compiled=bool(compile_check) or bool(gpu),
         source_commit=commit,cpu_acceptance=str(a.cpu_check.resolve()),gpu_acceptance=str(a.gpu_check.resolve()) if a.gpu_check else None,
-        historical_experiments=str(report),cross_node_gpu_verified=bool(cross),automatic_gp_integration=False,gpu_lanczos_in_scope=False,
+        historical_experiments=str(report),cross_node_gpu_verified=bool(cross),automatic_gp_integration=integrated,
+        original_cli_verified=bool(cli),original_oos_pipeline_verified=bool(cli),real_gpu_gp_verified=bool(live_gpu),
+        full_production_budget_measured=False,gpu_lanczos_in_scope=False,
         latest_latex_available=True,full_latex_compiled=False)
     (out/'DELIVERY_STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
     (out/'README.md').write_text('# PCA 模块交付包\n\n先读 pca_paper.md 或 pca_paper.pdf；源码为 source.tar.gz，需在完整仓库布局中编译。\n\n'
-        '实验数字来自已完成私有报告；新接口验收见 evidence/。当前 GPU 接口及跨节点状态分别见 DELIVERY_STATUS.json，未提供运行证据时保持未完成。完整 GP 自动集成与全组最终合稿另行协作。\n\n'
+        '实验数字来自已完成私有报告；独立接口、跨节点、GP 闭环、原 EOD CLI 和真实数据验证分别见 evidence/ 与 DELIVERY_STATUS.json，未提供运行证据时保持未完成。完整生产预算的性能测量与全组最终合稿另行协作。\n\n'
         'upstream_main_zh.tex 是现有新版源文件副本；latex/pca_sections.tex 可供合并，未宣称已编译最终全文。数据、表达式和本包均不上传公开仓库。\n')
     hashes={str(x.relative_to(out)):sha(x) for x in out.rglob('*') if x.is_file()}
     (out/'MANIFEST_SHA256.json').write_text(json.dumps(hashes,indent=2)+'\n');print('Delivery package written:',out)

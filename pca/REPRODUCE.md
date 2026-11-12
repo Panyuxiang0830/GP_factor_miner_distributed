@@ -125,4 +125,4 @@ python3 pca/assemble_report.py --runs "$PCA_RUNS" \
 
 ## 7. 当前接口验收与交付
 
-在基础实验之外，用 delivery_cpu.pbs / delivery_gpu.pbs 验证历史档案、连续批次及验收失败反例，然后按 [DELIVERY.md](DELIVERY.md) 打包当前源码和报告。跨节点 GPU 使用单独的 cross_node_gpu.pbs，须根据真实执行状态记录；现有同节点双卡结果不构成跨节点证据。自动 GP 集成与 GPU Lanczos 不属于本版本已完成的交付范围。
+在基础实验之外，用 delivery_cpu.pbs / delivery_gpu.pbs 验证历史档案、连续批次及验收失败反例，然后按 [DELIVERY.md](DELIVERY.md) 打包当前源码和报告。跨节点 GPU 使用单独的 cross_node_gpu.pbs，须根据真实执行状态记录；现有同节点双卡结果不构成跨节点证据。实际 GP 自动衔接、原 EOD CLI 和闭环验收见 [GP_INTEGRATION.md](GP_INTEGRATION.md)；GPU Lanczos 不在本次范围。

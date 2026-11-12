@@ -8,6 +8,9 @@
 | --- | --- | --- |
 | 模块无数据检查 | smoke.pbs / smoke_gpu.pbs | 新目录、Python 参考、CPU/MPI/GPU 与独立 cuBLAS 链接分离 |
 | 当前接口最终验收 | delivery_cpu.pbs / delivery_gpu.pbs | 初始档案、跨批接续、完整快照、独立数值参考、验收失败反例 |
+| 原 GP 实际闭环 | bridge_cpu.pbs / bridge_gpu.pbs | 真实 MPI 引擎→PCA→QD→原 Python 下一代、禁止旧数值回退、检查点恢复 |
+| 原 EOD CLI 完整流程 | cli_bridge_check.py | 旧命令行的可选 C++ 后端、三个深度、原样本外筛选和输出 |
+| 真实字段 GP | live_gp.pbs | 指定字段、人口和代数下的实际闭环；配置规模与完整预算区分 |
 | P0 真实小样本 | validate_cpu.pbs / validate_gpu.pbs | 同输入签名、Python 准入、重复和精确 SVD 抽查 |
 | P0 边界语义 | adversarial.pbs | 0.90 附近、并列、同 key、严格质量阈值、无效签名 |
 | 提供签名重放 | gpu_api_test.pbs | 原始百分位 GPU 接口，以及 CPU/CUDA/MPI 准入重放 |
@@ -47,6 +50,6 @@ python3 pca/assemble_report.py --runs pca/runs \
 
 只在证据完整时调用。`paper_sections.py` 据相同证据按 report/main_zh.tex 的 PCA 章节组织补稿；生成的报告与图仍只写入私有 runs。源仓库不包含实验结果或论文补稿。
 
-性能每组预热一次、测量三次并取中位数；准确性与性能计时分开。GPU roofline 的字节量为名义下界，不能当作 profiler 实测 DRAM 流量。独立 kernel 加速不等于完整 GP 加速。完整 GP 的接口联调及同批次端到端测量仍需另行完成。
+基础性能实验每组预热一次、测量三次并取中位数；准确性与性能计时分开。GPU roofline 的字节量为名义下界，不能当作 profiler 实测 DRAM 流量。独立 kernel 加速不等于完整 GP 加速。新 GP 闭环主要验证接口、控制流和恢复，不把其单次小规模墙钟当作完整生产预算的重复性能基准。
 
 当前验证器分别记录同预算数值、SVD 收敛、准入、最终快照和输入身份检查。已有结果可以作为历史证据保留，但不能在未重验时宣称由新版验证器生成。完整接口和私有交付包入口见 [DELIVERY.md](DELIVERY.md)。
