@@ -29,6 +29,9 @@ def main():
     p.add_argument('--live-gp',type=Path);p.add_argument('--live-gp-gpu',type=Path);p.add_argument('--cli-check',type=Path)
     p.add_argument('--preflight',type=Path,help='completed full-dimension CPU/GPU evolution evidence')
     p.add_argument('--lean',action='store_true',help='retain report, referenced figures, evidence, source and optional LaTeX only')
+    p.add_argument('--manuscript',type=Path,help='private edited Markdown manuscript; existing evidence checks still apply')
+    p.add_argument('--evolution-only',action='store_true',help='declare real OOS evaluation outside this delivery scope')
+    p.add_argument('--production-planned',action='store_true',help='record a planned, not yet measured production run; submits no jobs')
     p.add_argument('--pdf',action='store_true');p.add_argument('--pandoc');a=p.parse_args()
     repo=Path(__file__).resolve().parents[1];out=a.out.resolve();report=a.report.resolve()
     if out.exists() or not out.is_relative_to((repo/'pca/runs').resolve()):p.error('new private pca/runs output required')
@@ -155,9 +158,17 @@ def main():
             body+=f"\n\n本次最终成员集合{'相同' if comparison['same_keys'] else '存在差异'}，共同成员 {comparison['common']} 个。共同成员质量最大绝对差 {comparison['max_quality_difference_on_common']:.6g}，FP32 签名分量最大绝对差 {comparison['max_signature_absolute_difference_on_common']:.6g}；不声称评分或签名逐位相同，也不将本次成员相同推广为所有进化配置等价。详细证据及其原始源码版本见 evidence/full_dimension_gp.json。"
             body+='\n\n当前共享输入只有进化期字段和收益标签，缺少真实 2022 年字段及标签。原 EOD CLI 的样本外流程在合成数据上已验证；真实样本外 RankIC、相关性终筛及最终因子表现尚未完成。完整生产预算按用户决定暂不运行，GPU Lanczos 不在本次范围。\n\n'
         text=text.replace('## 7.1 ',body+'## 7.1 ',1)
-    for image in re.findall(r'!\[[^]]*\]\(([^)]+)\)',text):
-        assert (out/'figures'/image).exists(),image
-        text=text.replace(']('+image+')','](figures/'+image+')')
+    if a.manuscript:text=a.manuscript.read_text()
+    if a.evolution_only:
+        text=text.replace('当前共享输入只有进化期字段和收益标签，缺少真实 2022 年字段及标签。原 EOD CLI 的样本外流程在合成数据上已验证；真实样本外 RankIC、相关性终筛及最终因子表现尚未完成。',
+            '本次工作使用现有进化期数据，2022 年样本外评估不在交付范围内。原 EOD CLI 的合成样本外检查用于验证接口，不作为真实样本外表现的证据。')
+    if a.production_planned:
+        text=text.replace('完整生产预算按用户决定暂不运行','正式规模运行计划在配置比较后开展，目前尚无正式运行结果')
+    for source in set(re.findall(r'!\[[^]]*\]\(([^)]+)\)',text)):
+        path=Path(source)
+        if path.is_absolute() or path.parent not in (Path('.'),Path('figures')):p.error('figure references must name files inside figures/')
+        assert (out/'figures'/path.name).exists(),source
+        text=text.replace(']('+source+')','](figures/'+path.name+')')
     if a.pending_gpu:text='> 交付候选：当前 CPU/MPI 接口验收与 CUDA 编译通过，新增 GPU 接口运行验证仍在排队；历史 GPU 性能结果保留，不等于本次接口已实测。跨节点状态另列。\n\n'+text
     (out/'pca_paper.md').write_text(text)
     if not a.lean:shutil.copy2(repo/'report/main_zh.tex',out/'upstream_main_zh.tex')
@@ -181,8 +192,9 @@ def main():
         import markdown
         from weasyprint import HTML
         font=Path('/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf')
-        css='@font-face{font-family:Chinese;src:url("'+font.as_uri()+'")} @page{size:A4;margin:18mm} body{font-family:"DejaVu Sans",Chinese;font-size:10pt;line-height:1.5} img{max-width:100%} table{width:100%;border-collapse:collapse;font-size:7pt} td,th{border:1px solid #bcc;padding:3px;overflow-wrap:anywhere} tr{break-inside:avoid} h1,h2{break-after:avoid} p{overflow-wrap:anywhere}'
+        css='@font-face{font-family:Chinese;src:url("'+font.as_uri()+'")} @page{size:A4;margin:18mm;@bottom-right{content:counter(page);font-family:"DejaVu Sans";font-size:8pt;color:#666}} body{font-family:"DejaVu Sans",Chinese;font-size:10pt;line-height:1.6;color:#202020} h1{font-size:18pt} h2{font-size:13pt;margin-top:7mm} h3{font-size:11pt;margin-top:5mm} img{max-width:100%;max-height:180mm;object-fit:contain} figure{margin:4mm 0 6mm;break-inside:avoid;text-align:center} figcaption{font-size:8pt;color:#555;margin-top:2mm} table{width:100%;border-collapse:collapse;font-size:7.5pt} th{background:#f1f3f5} td,th{border:1px solid #bcc;padding:4px;overflow-wrap:anywhere} tr{break-inside:avoid} h1,h2,h3{break-after:avoid} p{overflow-wrap:anywhere}'
         html='<meta charset="utf-8"><style>'+css+'</style>'+markdown.markdown(text,extensions=['tables','fenced_code'])
+        html=re.sub(r'<p>(<img[^>]*alt="([^"]*)"[^>]*?/?>)</p>',r'<figure>\1<figcaption>\2</figcaption></figure>',html)
         if not a.lean:(out/'pca_paper.html').write_text(html)
         HTML(string=html,base_url=str(out)).write_pdf(out/'pca_paper.pdf')
     status=dict(independent_module_verified=bool(gpu),cpu_interface_verified=True,current_gpu_interface_verified=bool(gpu),cuda_compiled=bool(compile_check) or bool(gpu),
@@ -191,7 +203,9 @@ def main():
         original_cli_verified=bool(cli),original_oos_pipeline_verified=bool(cli),real_gpu_gp_verified=bool(live_gpu),
         original_oos_validation_scope='synthetic CLI fixture' if cli else None,
         full_dimension_gp_verified=bool(preflight),preflight_source_commit=preflight['source_commit'] if preflight else None,
-        real_2022_oos_verified=False,full_production_run_deferred=True,lean_package=a.lean,
+        real_2022_oos_verified=False,real_2022_oos_in_scope=not a.evolution_only,
+        full_production_run_deferred=not a.production_planned,full_production_run_planned=a.production_planned,lean_package=a.lean,
+        editorial_manuscript_sha256=sha(a.manuscript) if a.manuscript else None,
         full_production_budget_measured=False,gpu_lanczos_in_scope=False,
         latest_latex_available=True,full_latex_compiled=False)
     (out/'DELIVERY_STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
@@ -199,7 +213,10 @@ def main():
         '实验数字来自已完成私有报告；独立接口、跨节点、GP 闭环、原 EOD CLI 和真实数据验证分别见 evidence/ 与 DELIVERY_STATUS.json，未提供运行证据时保持未完成。完整生产预算的性能测量与全组最终合稿另行协作。\n\n'
         +('' if a.lean else 'upstream_main_zh.tex 是现有新版源文件副本；')+
         ('latex/pca_sections.tex 可供论文合并，未宣称已编译最终全文。\n\n' if a.pandoc else '')+
-        '本包保留当前报告及其插图、必要证据和源码，历史日志、构建产物、行情、公式及中间文件仍在原私有运行目录。真实 2022 样本外筛选尚缺数据，完整生产预算暂不运行。数据、表达式和本包均不上传公开仓库。\n')
+        '本包保留当前报告及其插图、必要证据和源码，历史日志、构建产物、行情、公式及中间文件仍在原私有运行目录。'+
+        ('2022 年样本外评估不在本次范围内。' if a.evolution_only else '真实 2022 样本外筛选尚未验证。')+
+        ('正式规模运行已列入计划，尚未产生结果。' if a.production_planned else '完整生产预算暂不运行。')+
+        '数据、表达式和本包均不上传公开仓库。\n')
     hashes={str(x.relative_to(out)):sha(x) for x in out.rglob('*') if x.is_file()}
     (out/'MANIFEST_SHA256.json').write_text(json.dumps(hashes,indent=2)+'\n');print('Delivery package written:',out)
 
