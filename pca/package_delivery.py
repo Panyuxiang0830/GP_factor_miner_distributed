@@ -19,6 +19,27 @@ def table(rows,fields):
         ['| '+' | '.join(str(row[x]) for x in fields)+' |' for row in rows])
 
 
+def render_display_math(text):
+    """Render Markdown display formulas to embedded SVG for the reading PDF.
+
+    The Markdown and Pandoc/LaTeX sources retain their original formulas.
+    Matplotlib is needed only when a PDF manuscript contains display math.
+    """
+    pattern=r'(?ms)^\$\$[ \t]*\n(.*?)\n\$\$[ \t]*$'
+    if not re.search(pattern,text):return text
+    import base64
+    import io
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.mathtext import math_to_image
+    def render(match):
+        buffer=io.BytesIO()
+        math_to_image('$'+match.group(1).strip()+'$',buffer,
+                      prop=FontProperties(size=12),format='svg')
+        encoded=base64.b64encode(buffer.getvalue()).decode('ascii')
+        return '<div class="equation"><img alt="equation" src="data:image/svg+xml;base64,'+encoded+'" /></div>'
+    return re.sub(pattern,render,text)
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--report',type=Path,required=True)
     p.add_argument('--cpu-check',type=Path,required=True)
@@ -193,7 +214,8 @@ def main():
         from weasyprint import HTML
         font=Path('/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf')
         css='@font-face{font-family:Chinese;src:url("'+font.as_uri()+'")} @page{size:A4;margin:18mm;@bottom-right{content:counter(page);font-family:"DejaVu Sans";font-size:8pt;color:#666}} body{font-family:"DejaVu Sans",Chinese;font-size:10pt;line-height:1.6;color:#202020} h1{font-size:18pt} h2{font-size:13pt;margin-top:7mm} h3{font-size:11pt;margin-top:5mm} img{max-width:100%;max-height:180mm;object-fit:contain} figure{margin:4mm 0 6mm;break-inside:avoid;text-align:center} figcaption{font-size:8pt;color:#555;margin-top:2mm} table{width:100%;border-collapse:collapse;font-size:7.5pt} th{background:#f1f3f5} td,th{border:1px solid #bcc;padding:4px;overflow-wrap:anywhere} tr{break-inside:avoid} h1,h2,h3{break-after:avoid} p{overflow-wrap:anywhere}'
-        html='<meta charset="utf-8"><style>'+css+'</style>'+markdown.markdown(text,extensions=['tables','fenced_code'])
+        css+='.equation{margin:4mm 0;text-align:center;break-inside:avoid}.equation img{vertical-align:middle}'
+        html='<meta charset="utf-8"><style>'+css+'</style>'+markdown.markdown(render_display_math(text),extensions=['tables','fenced_code'])
         html=re.sub(r'<p>(<img[^>]*alt="([^"]*)"[^>]*?/?>)</p>',r'<figure>\1<figcaption>\2</figcaption></figure>',html)
         if not a.lean:(out/'pca_paper.html').write_text(html)
         HTML(string=html,base_url=str(out)).write_pdf(out/'pca_paper.pdf')

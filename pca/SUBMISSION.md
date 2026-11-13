@@ -13,7 +13,7 @@
 
 ## 主报告
 
-服务器上的当前报告目录为 `pca/runs/final_submission_02/`，相对于当前 Git 仓库根目录。它在上一版实验记录基础上重写了正文和表头，保留原表格数据与插图；`final_submission_01/` 保留为历史版本。
+服务器上的当前报告目录为 `pca/runs/final_submission_03/`，相对于当前 Git 仓库根目录。正文参照 report/main_zh.tex 的讲解方式，补充术语、PCA 所求目标、幂迭代与 Lanczos 的定义和区别，并按方法、验证和实验的逻辑重新组织。原有 8 张实验表的数据及 15 幅实验图保持不变；前两版报告保留为历史版本。
 
 - **主报告：`pca_paper.pdf`**。
 - 可编辑正文：`pca_paper.md`；必要插图位于 `figures/`。

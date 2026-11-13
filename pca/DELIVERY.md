@@ -69,6 +69,8 @@ python3 pca/package_delivery.py --report /path/to/private/report_completed \
 
 正文编辑后，可用 --manuscript /path/to/private/manuscript.md 打包修订稿，验收证据仍按上述参数核对，状态文件另存正文哈希。图片可用文件名或 figures/ 下的相对路径引用。--evolution-only 表示真实样本外评估不在范围内；--production-planned 表示正式规模运行已列入计划但尚未实测。这两项只记录范围和状态，不提交计算作业。正文修订应核对原表格数据和插图，并保留旧报告。
 
+正文可用独占两行的 $$ 包围显示公式，语法限于 Matplotlib mathtext 支持的 LaTeX 子集。Markdown 与 LaTeX 片段保留公式源码，阅读 PDF 用 Matplotlib mathtext 渲染为内嵌矢量图，因此该类 PDF 还需要 Matplotlib。公式排版依赖不参与 GP 数值计算；不含公式的旧正文无需安装此依赖。
+
 GPU 运行验证尚在等待资源时，只能显式使用 --pending-gpu --cuda-build /path/to/verified/build 生成候选包；它要求独立的 COMPILE_CHECK.json，并将 current_gpu_interface_verified 和 independent_module_verified 保持为 false。候选包不替代通过当前 GPU 回归后的正式接口验收包。
 
 所有行情、公式、日志、实验结果、报告和交付包均留在私有 runs；公开分支仅上传源码、作业脚本和说明。旧报告和原 PDF 保留，最终论文还需与组员统一作者、编号、交叉引用及全组结论。
