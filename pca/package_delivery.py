@@ -27,6 +27,8 @@ def main():
     p.add_argument('--cross-node',type=Path);p.add_argument('--out',type=Path,required=True)
     p.add_argument('--integration-cpu',type=Path);p.add_argument('--integration-gpu',type=Path)
     p.add_argument('--live-gp',type=Path);p.add_argument('--live-gp-gpu',type=Path);p.add_argument('--cli-check',type=Path)
+    p.add_argument('--preflight',type=Path,help='completed full-dimension CPU/GPU evolution evidence')
+    p.add_argument('--lean',action='store_true',help='retain report, referenced figures, evidence, source and optional LaTeX only')
     p.add_argument('--pdf',action='store_true');p.add_argument('--pandoc');a=p.parse_args()
     repo=Path(__file__).resolve().parents[1];out=a.out.resolve();report=a.report.resolve()
     if out.exists() or not out.is_relative_to((repo/'pca/runs').resolve()):p.error('new private pca/runs output required')
@@ -55,6 +57,17 @@ def main():
         assert integrated_gpu['device']=='cuda' and live['completed'] and live['generation_events']>0
     if live_gpu:assert integrated and live_gpu['completed'] and live_gpu['device']=='cuda'
     if cli:assert integrated and cli['verified'] and cli['original_cli'] and cli['original_oos_screening'] and cli['completed_resume']
+    preflight=load(a.preflight/'FINAL_RESULTS.json') if a.preflight else None
+    if preflight:
+        assert integrated and preflight['all_evolution_checks_completed'] and preflight['verified_full_dimension_evolution']
+        assert preflight['real_oos_pipeline_completed'] is False and preflight['production_run_submitted'] is False
+        for label in ('cpu','gpu'):
+            check=preflight['jobs'][label];run=check['result']
+            assert check['verified_completed'] and check['job_state']=='F' and check['Exit_status']=='0'
+            assert run['completed'] and run['generation_events']==3 and [s['depth'] for s in run['stages']]==[1,2,3]
+            assert run['T']==1461 and run['N']==5876 and len(run['fields'])==132
+        for name,digest in load(a.preflight/'MANIFEST_SHA256.json').items():
+            assert sha(a.preflight/name)==digest,'preflight evidence changed: '+name
     out.mkdir();(out/'figures').mkdir();(out/'latex').mkdir();(out/'evidence').mkdir()
     for source in report.iterdir():
         if source.suffix in ('.png','.csv'):shutil.copy2(source,out/'figures'/source.name)
@@ -64,6 +77,7 @@ def main():
     for label,parent in (('cross_node',a.cross_node),('integration_cpu',a.integration_cpu),('integration_gpu',a.integration_gpu),('live_gp',a.live_gp),('live_gp_gpu',a.live_gp_gpu),('original_cli',a.cli_check)):
         if parent:shutil.copy2(parent/'SUCCESS.json',out/'evidence'/(label+'.json'))
     shutil.copy2(report/'EVIDENCE.json',out/'evidence/experiments.json')
+    if a.preflight:shutil.copy2(a.preflight/'FINAL_RESULTS.json',out/'evidence/full_dimension_gp.json')
     # Keep the old report as historical evidence, and produce one consolidated manuscript.
     text=(report/'pdf_sections.md').read_text().split('# 严格交接补充：')[0]
     text=re.sub(r'^>.*\n\n','',text)
@@ -126,13 +140,34 @@ def main():
 '''+table(rows,('backend','T','N','fields','ranks','generations','archive','wall_seconds'))
         if cli:body+='\n\n原 EOD 命令行还通过了带 C++ 后端的完整运行和已完成检查点恢复，输出三个深度基因池、QD 档案、原样本外 RankIC 筛选、相关性筛选和最终因子文件。筛选阶段沿用原 Python 实现，不将它描述为已全部迁移到 CUDA。'
         body+='\n\n目前为有界子批与进度块级的进程调用，启动、数据准备及 I/O 会限制小批次效率。不同 MPI 规模或精度可能放大细小评分排序差异，因此固定候选顺序的 QD 一致性与跨配置整次进化集合相同分别检查，不作普遍等价保证。正式人口和代数预算需在对应资源配置下另做性能测量。\n\n'
+        if preflight:
+            measured=[]
+            for label in ('cpu','gpu'):
+                job=preflight['jobs'][label];run=job['result']
+                measured.append(dict(backend=label,ranks=job['ranks'],threads=job['threads'],setup_seconds=round(run['setup_seconds'],3),gp_seconds=round(run['evolution_wall_seconds'],3),evaluated=run['evaluated'],archive=run['archive_size']))
+            comparison=preflight['comparison']
+            body+='''## 6.5.1 全部真实字段、完整数据维度的预演
+
+另使用 2016—2021 年完整进化期：1461 天、5876 股票、全部 132 字段。人口 64，热启动倍数 3，基因池 32，三个深度各 1 代，窗口 1/5/10/15/20/30/60；每五天抽样，四步幂迭代、double。两作业及自动汇总均成功结束。这是完整数据维度的缩小进化预算预演，不是人口 10000、每深度 10 代的正式运行。
+
+'''+table(measured,('backend','ranks','threads','setup_seconds','gp_seconds','evaluated','archive'))
+            body+='\n\nGPU 复用经数据身份核对的 CPU 字段分析结果，GP 墙钟另行计时，包含子进程启动、引擎、PCA、QD、原 Python 控制与检查点。CPU 配置为 16 个单线程 MPI ranks；CUDA 配置为一个 MPI rank、16 个 CPU 线程和一张 A40，站点实际预留 36 CPU 与 240 GB。因子引擎和 RankIC 仍在 CPU，CUDA 负责抽样排名、PCA 和相似度。两种并行配置不同，不能将总作业时长之比称为纯 GPU 算法加速比。'
+            body+=f"\n\n本次最终成员集合{'相同' if comparison['same_keys'] else '存在差异'}，共同成员 {comparison['common']} 个。共同成员质量最大绝对差 {comparison['max_quality_difference_on_common']:.6g}，FP32 签名分量最大绝对差 {comparison['max_signature_absolute_difference_on_common']:.6g}；不声称评分或签名逐位相同，也不将本次成员相同推广为所有进化配置等价。详细证据及其原始源码版本见 evidence/full_dimension_gp.json。"
+            body+='\n\n当前共享输入只有进化期字段和收益标签，缺少真实 2022 年字段及标签。原 EOD CLI 的样本外流程在合成数据上已验证；真实样本外 RankIC、相关性终筛及最终因子表现尚未完成。完整生产预算按用户决定暂不运行，GPU Lanczos 不在本次范围。\n\n'
         text=text.replace('## 7.1 ',body+'## 7.1 ',1)
     for image in re.findall(r'!\[[^]]*\]\(([^)]+)\)',text):
         assert (out/'figures'/image).exists(),image
         text=text.replace(']('+image+')','](figures/'+image+')')
     if a.pending_gpu:text='> 交付候选：当前 CPU/MPI 接口验收与 CUDA 编译通过，新增 GPU 接口运行验证仍在排队；历史 GPU 性能结果保留，不等于本次接口已实测。跨节点状态另列。\n\n'+text
     (out/'pca_paper.md').write_text(text)
-    shutil.copy2(repo/'report/main_zh.tex',out/'upstream_main_zh.tex')
+    if not a.lean:shutil.copy2(repo/'report/main_zh.tex',out/'upstream_main_zh.tex')
+    if a.lean:
+        text=text.replace('本包提供对应新版全文源文件的副本，不覆盖上游原稿。',
+            '原全文源文件随 source.tar.gz 保留在 report/main_zh.tex；本报告及 LaTeX 片段供合稿，不覆盖上游原稿。')
+        (out/'pca_paper.md').write_text(text)
+        referenced=set(re.findall(r'!\[[^]]*\]\((figures/[^)]+)\)',text))
+        for path in (out/'figures').iterdir():
+            if str(path.relative_to(out)) not in referenced:path.unlink()
     # A source archive is private too; only repository source, never ignored runs/builds.
     names=subprocess.check_output(['git','-C',str(repo),'ls-files','--cached','--others','--exclude-standard','-z']).decode().split('\0')
     sources=[name for name in names if name and (repo/name).is_file() and '.git' not in Path(name).parts]
@@ -148,17 +183,23 @@ def main():
         font=Path('/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf')
         css='@font-face{font-family:Chinese;src:url("'+font.as_uri()+'")} @page{size:A4;margin:18mm} body{font-family:"DejaVu Sans",Chinese;font-size:10pt;line-height:1.5} img{max-width:100%} table{width:100%;border-collapse:collapse;font-size:7pt} td,th{border:1px solid #bcc;padding:3px;overflow-wrap:anywhere} tr{break-inside:avoid} h1,h2{break-after:avoid} p{overflow-wrap:anywhere}'
         html='<meta charset="utf-8"><style>'+css+'</style>'+markdown.markdown(text,extensions=['tables','fenced_code'])
-        (out/'pca_paper.html').write_text(html);HTML(string=html,base_url=str(out)).write_pdf(out/'pca_paper.pdf')
+        if not a.lean:(out/'pca_paper.html').write_text(html)
+        HTML(string=html,base_url=str(out)).write_pdf(out/'pca_paper.pdf')
     status=dict(independent_module_verified=bool(gpu),cpu_interface_verified=True,current_gpu_interface_verified=bool(gpu),cuda_compiled=bool(compile_check) or bool(gpu),
         source_commit=commit,cpu_acceptance=str(a.cpu_check.resolve()),gpu_acceptance=str(a.gpu_check.resolve()) if a.gpu_check else None,
         historical_experiments=str(report),cross_node_gpu_verified=bool(cross),automatic_gp_integration=integrated,
         original_cli_verified=bool(cli),original_oos_pipeline_verified=bool(cli),real_gpu_gp_verified=bool(live_gpu),
+        original_oos_validation_scope='synthetic CLI fixture' if cli else None,
+        full_dimension_gp_verified=bool(preflight),preflight_source_commit=preflight['source_commit'] if preflight else None,
+        real_2022_oos_verified=False,full_production_run_deferred=True,lean_package=a.lean,
         full_production_budget_measured=False,gpu_lanczos_in_scope=False,
         latest_latex_available=True,full_latex_compiled=False)
     (out/'DELIVERY_STATUS.json').write_text(json.dumps(status,indent=2)+'\n')
-    (out/'README.md').write_text('# PCA 模块交付包\n\n先读 pca_paper.md 或 pca_paper.pdf；源码为 source.tar.gz，需在完整仓库布局中编译。\n\n'
+    (out/'README.md').write_text('# PCA 模块最终交付包\n\n主报告为 [pca_paper.pdf](pca_paper.pdf)，可编辑正文为 [pca_paper.md](pca_paper.md)。源码为 source.tar.gz，需在完整仓库布局中编译。\n\n'
         '实验数字来自已完成私有报告；独立接口、跨节点、GP 闭环、原 EOD CLI 和真实数据验证分别见 evidence/ 与 DELIVERY_STATUS.json，未提供运行证据时保持未完成。完整生产预算的性能测量与全组最终合稿另行协作。\n\n'
-        'upstream_main_zh.tex 是现有新版源文件副本；latex/pca_sections.tex 可供合并，未宣称已编译最终全文。数据、表达式和本包均不上传公开仓库。\n')
+        +('' if a.lean else 'upstream_main_zh.tex 是现有新版源文件副本；')+
+        ('latex/pca_sections.tex 可供论文合并，未宣称已编译最终全文。\n\n' if a.pandoc else '')+
+        '本包保留当前报告及其插图、必要证据和源码，历史日志、构建产物、行情、公式及中间文件仍在原私有运行目录。真实 2022 样本外筛选尚缺数据，完整生产预算暂不运行。数据、表达式和本包均不上传公开仓库。\n')
     hashes={str(x.relative_to(out)):sha(x) for x in out.rglob('*') if x.is_file()}
     (out/'MANIFEST_SHA256.json').write_text(json.dumps(hashes,indent=2)+'\n');print('Delivery package written:',out)
 

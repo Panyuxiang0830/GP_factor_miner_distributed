@@ -2,6 +2,8 @@
 
 本目录实现项目第③部分，任务见 [docs/pca/task.md](../docs/pca/task.md)。生产数值计算使用手写 C++17、OpenMP、MPI 和 CUDA；Python 用于输入准备、独立验证和实验分析。
 
+交付内容、阅读顺序、主报告位置和当前边界见 [SUBMISSION.md](SUBMISSION.md)。
+
 ```text
 抽样因子值（可选排名）或已排名矩阵 R
   → 幂迭代 / Golub–Kahan Lanczos
@@ -26,7 +28,7 @@ OMP_NUM_THREADS=2 ctest --test-dir pca/build --output-on-failure
 
 默认生产程序不链接 BLAS/LAPACK/cuBLAS/cuSOLVER。`-DPCA_CUBLAS_REFERENCE=ON` 仅为 CUDA 构建增加独立的 `pca_cublas_reference` 可执行文件；它不改变生产目标的链接依赖。
 
-真实因子面板规模实验使用 `-DPCA_ENGINE_BENCH=ON`，仅为实验目标链接现有因子引擎；该选项与 CUDA 同时开启时还构建 `pca_rankic_test`。RankIC 共用 GPU 排名的输入、精度与验证见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)。
+实际 GP 引擎桥接和真实因子面板规模实验使用 `-DPCA_ENGINE_BENCH=ON`，为这些目标链接现有因子引擎；该选项与 CUDA 同时开启时还构建 `pca_rankic_test`。RankIC 共用 GPU 排名的输入、精度与验证见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)。
 
 ## 无行情数据的小规模检查
 
