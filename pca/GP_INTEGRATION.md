@@ -54,9 +54,31 @@ python3 pca/run_gp.py --panel-dir /path/to/evolution/panels \
 
 该入口默认是小规模配置，完成深度 1、2、3 各阶段及指定代数，输出原 GP 检查点、进度、完整 QD 档案、调用计时和 SUCCESS。它只使用指定进化期字段，不凭空生成样本外筛选数据。--resume 要求参数、数据与后端身份一致。
 
-正式规模可显式使用 --population 10000 --generations 10 --gene-pool 2000 --warm-start-multiplier 3 --progress-chunk 1000 --windows 1 5 10 15 20 30 60；需另行申请适当计算资源和运行时间。小规模闭环通过不等于该完整预算已经实测。
+### 正式规模
 
-集群入口为 live_gp.pbs，参数见脚本的 PCA_PANEL_DIR、PCA_ENGINE_BINARY、PCA_BINARY、PCA_RANKS、PCA_DEVICE 等变量。父 Python 进程从计算节点启动 MPI 子批，不能从登录节点运行大规模 GP。OpenMP 线程数通过 OMP_NUM_THREADS 设置，绑定时为每 rank 分配相应 PE。
+种群 10000、每个深度 10 代、基因池 2000、热启动倍数 3、进度块 1000 和窗口集合，均来自原项目的 [HierarchicalGPConfig](../python/src/gp_factor_miner/hierarchical_config.py)。原报告 [main_zh.tex](../report/main_zh.tex) 的“分层生成”部分也规定了前三项。新入口为便于检查，默认使用小规模；正式运行必须显式传入下面这些参数。
+
+完成第 2 节编译后，在完整仓库根目录、已分配的计算节点中执行以下 CPU 命令。把 --panel-dir 改成已有进化期字段目录；本例使用 16 个单线程 MPI 进程，需申请相应 CPU 和足够内存，或按实际资源修改 --ranks。这个进程数是运行示例，不是已测得的最优正式配置。
+
+```bash
+python3 pca/run_gp.py \
+  --panel-dir /path/to/evolution/panels \
+  --engine-binary "$PWD/pca/build_live/pca_engine_bridge" \
+  --pca-binary "$PWD/pca/build_live/pca_run" \
+  --out pca/runs/gp_production_01 \
+  --device cpu --ranks 16 --threads 1 \
+  --population 10000 --generations 10 --gene-pool 2000 \
+  --warm-start-multiplier 3 --progress-chunk 1000 \
+  --windows 1 5 10 15 20 30 60 \
+  --sample-step 5 --steps 4 --precision double --method power \
+  --engine-chunk 16 --dag-chunk 32 --H0 0 --seed 2026
+```
+
+该命令依次运行深度 1、2、3，每个深度 10 代，基因池和父代池上限均为 2000；使用全部导出字段、日期和股票，只进行进化期流程。输出目录必须是新的 pca/runs 子目录；完成后检查 SUCCESS.json 的 completed、stages 和实际规模。恢复时使用同一命令和原目录追加 --resume，数据、二进制与参数须保持一致。
+
+若使用 GPU，需按第 2 节构建 CUDA 版本，替换两条二进制路径、设置 --device cuda，并按已分配卡数设置 MPI 进程数；MPI 还须支持 CUDA-aware 通信。小规模闭环已验证，但上述正式预算尚未完成实测，运行时间与资源需另行确定。
+
+live_gp.pbs 是小规模集群入口，默认窗口为 1/2/3，不能原样当成上述正式配置。正式运行可把上面的完整命令放入接手人自己的 PBS 作业脚本，按实际队列设置资源和时限。Vanda 多节点运行需加载一致的 MPI 环境，并按脚本设置 PRTE_MCA_prte_launch_agent；相关示例见 live_gp.pbs 和 scripts/vanda/prted.sh。父 Python 进程从计算节点启动 MPI 子批，不能从登录节点运行大规模 GP。OpenMP 线程数通过 OMP_NUM_THREADS 设置，绑定时为每 rank 分配相应 PE。
 
 ## 5. 检查点与验收
 
