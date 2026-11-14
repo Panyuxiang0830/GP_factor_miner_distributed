@@ -1,29 +1,29 @@
-# 原 GP 与 C++/MPI/CUDA 的实际衔接
+# Integrating the original GP with C++/MPI/CUDA
 
-本入口直接运行原项目的 run_hierarchical_evolution，不另写选择、交叉或变异算法。原程序新增可选 batch_backend，默认 None 时保持原数值路径；启用 CppGPBackend 后，进化期的批量因子求值、RankIC 与适应度交给已有 MPI 引擎，签名和准入交给 pca 模块，结果返回原 Python 程序继续下一代。
+This entry point calls the original `run_hierarchical_evolution`; it does not replace selection, crossover, or mutation. The original engine accepts an optional `batch_backend`. With the default `None`, it uses its original numerical path. With `CppGPBackend`, the existing MPI engine evaluates factors, RankIC, and fitness during evolution, while the PCA module computes signatures and handles admission. Results return to the original Python loop for the next generation.
 
-## 1. 数据经过哪些步骤
+## 1. Data flow
 
-1. Python 按原有分层 GP 策略生成表达式，并使用原缓存、父代选择、交叉和变异。
-2. 一个 GP 进度块作为一个 MPI 请求，C++ 按 engine_chunk 将其分为有界的表达式批次，构建 DAG 并调用 gpe::evaluate_batch_mpi。复用上游的 halo、ema、RankIC 和适应度实现，不重新实现因子算子。
-3. 引擎暂时保留本批根面板。每个 rank 只从自己拥有的日期中按全局 t % sample_step == 0 抽样，排除负索引 halo。抽样行构成 R；CPU 在本地排名，CUDA 将同批因子行合并排名。幂迭代的范数与右向量由 MPI 归约；CUDA 直接使用显存指针。签名按全局日期顺序汇集、统一符号。
-4. 返回与请求同序的 Candidate 和 FP32 签名。原 Python 程序按自己的适应度排序与家族/父代规则确定准入顺序；不能按 MPI 返回速度重排。
-5. C++ QD 读取 Python 当前档案快照，按给定顺序准入，返回逐候选决定和完整新档案。Python 检查完整 key、质量和签名后更新原 archive 对象，继续生成下一代。
+1. Python proposes expressions using the original hierarchical strategy, cache, parent selection, crossover, and mutation.
+2. Each GP progress chunk becomes one MPI request. C++ divides it into bounded `engine_chunk` batches, builds a DAG, and calls `gpe::evaluate_batch_mpi`. It reuses the upstream halo, ema, RankIC, and fitness implementations rather than reimplementing factor operators.
+3. The engine temporarily retains the current batch's root panels. Each rank samples only its owned dates using global `t % sample_step == 0`, excluding negative-index halo rows. Sampled rows form R. CPU ranking is local; CUDA ranks the batch's factor rows together. MPI reduces the power-iteration norms and right vectors; CUDA uses device pointers directly. Signatures are gathered in global date order and assigned a consistent sign.
+4. The backend returns `Candidate` records and FP32 signatures in request order. The original Python code determines admission order using its fitness sorting and family/parent rules; MPI completion order must not reorder candidates.
+5. C++ QD reads the current Python archive snapshot, processes candidates in the specified order, and returns per-candidate decisions plus a complete new archive. Python checks every key, quality, and signature before updating the original archive object and generating the next population.
 
-这里不需要先手工导出 R，也不保存整代全量因子值。引擎只保留有界表达式子批的根面板；其内存仍受 engine_chunk、dag_chunk、股票数和日期块大小影响。
+There is no manual R export or full-generation factor-panel dump. The engine retains only a bounded expression batch's root panels. Its memory use still depends on `engine_chunk`, `dag_chunk`, stock count, and the date partition.
 
-## 2. 编译
+## 2. Build
 
 ```bash
 cmake -S pca -B pca/build_live -DPCA_MPI=ON -DPCA_ENGINE_BENCH=ON
 cmake --build pca/build_live -j 4 --target pca_engine_bridge pca_run
 ```
 
-CUDA 使用独立目录并加 -DPCA_CUDA=ON。生产不链接 BLAS、cuBLAS 或 cuSOLVER；NumPy 只用于原 Python GP 的控制/准备、数据一致性检查和独立验证。GPU Lanczos 不在本次范围，CPU 后端可选 Lanczos。
+For CUDA, use a separate directory and add `-DPCA_CUDA=ON`. Production targets do not link BLAS, cuBLAS, or cuSOLVER. NumPy supports the original Python GP's control/preparation, data-consistency checks, and independent validation. GPU Lanczos is outside the current scope; the CPU backend supports Lanczos.
 
-## 3. 使用现有 EOD 命令行
+## 3. Use the existing EOD CLI
 
-原命令行新增以下可选参数；三项路径必须一起给出：
+The original CLI accepts the following optional arguments. Supply all three backend paths together:
 
 ```bash
 python3 -m gp_factor_miner.hierarchical_cli \
@@ -35,15 +35,15 @@ python3 -m gp_factor_miner.hierarchical_cli \
   --cpp-ranks 4 --cpp-device cpu
 ```
 
-Python 环境需能导入 python/src/gp_factor_miner。提供 --cpp-device cuda 时须申请 GPU，并使用 CUDA 构建；建议每张卡一个 MPI rank。--cpp-mpiexec 可指定 MPI 启动器绝对路径，--cpp-precision 选择 float/double。原 CLI 的样本外 RankIC、相关性筛选和输出文件沿用原实现；本后端加速进化期，不宣称已经把后续研究流程全部移到 GPU。
+The Python environment must be able to import `python/src/gp_factor_miner`. `--cpp-device cuda` requires a GPU allocation and CUDA binaries; use one MPI rank per GPU. `--cpp-mpiexec` sets an absolute MPI launcher path, and `--cpp-precision` selects float/double. The original out-of-sample RankIC screening, correlation filtering, and outputs retain their existing implementation. This backend accelerates evolution; it does not move the entire downstream research pipeline to the GPU.
 
---smoke 启用后，以指定 C++ 导出目录中的日期、股票顺序确定进化期的小样本，最多 256 天、512 只股票；原筛选期保留相同股票。启动时逐项核对 Python 与导出数据的坐标和数值，不允许同维度但不同日期/股票的数据混用。导出目录必须由相同清洗流程生成。
+With `--smoke`, the C++ export's dates and stock order define a small evolution subset of at most 256 dates and 512 stocks; screening keeps the same stocks. Startup checks coordinates and values against the Python data, rejecting inputs with matching dimensions but different dates or stocks. Both inputs must come from the same cleaning pipeline.
 
-不提供这些 --cpp-* 参数时，原 CLI 保持原 Python 后端。源码包需要完整仓库目录结构，不能只复制 gp_bridge.py 单文件。
+Without `--cpp-*` arguments, the CLI uses its original Python backend. Keep the complete repository layout; copying `gp_bridge.py` alone is insufficient.
 
-## 4. 直接从已有二进制字段目录启动
+## 4. Run directly from exported binary fields
 
-没有原 EOD pickle 时，也可使用现有字段导出，仍调用相同的三层 GP：
+An existing field export can run the same three-stage GP without the original EOD pickle:
 
 ```bash
 python3 pca/run_gp.py --panel-dir /path/to/evolution/panels \
@@ -52,13 +52,13 @@ python3 pca/run_gp.py --panel-dir /path/to/evolution/panels \
   --population 24 --generations 1 --gene-pool 12 --windows 1 2 3
 ```
 
-该入口默认是小规模配置，完成深度 1、2、3 各阶段及指定代数，输出原 GP 检查点、进度、完整 QD 档案、调用计时和 SUCCESS。它只使用指定进化期字段，不凭空生成样本外筛选数据。--resume 要求参数、数据与后端身份一致。
+This entry point defaults to a small configuration. It runs depths 1, 2, and 3 for the requested number of generations, writing original GP checkpoints, progress, the complete QD archive, call timing, and `SUCCESS`. It uses only the supplied evolution-period fields and does not generate out-of-sample data. `--resume` requires unchanged parameters, data, and backend identity.
 
-### 正式规模
+### Production configuration
 
-种群 10000、每个深度 10 代、基因池 2000、热启动倍数 3、进度块 1000 和窗口集合，均来自原项目的 [HierarchicalGPConfig](../python/src/gp_factor_miner/hierarchical_config.py)。原报告 [main_zh.tex](../report/main_zh.tex) 的“分层生成”部分也规定了前三项。新入口为便于检查，默认使用小规模；正式运行必须显式传入下面这些参数。
+Population 10000, 10 generations per depth, gene pool 2000, warm-start multiplier 3, progress chunk 1000, and the window set come from the original [HierarchicalGPConfig](../python/src/gp_factor_miner/hierarchical_config.py). The stage-generation section of [main_zh.tex](../report/main_zh.tex) also specifies the first three settings. The new entry point defaults to a small run for validation; pass the following settings explicitly for the production budget.
 
-完成第 2 节编译后，在完整仓库根目录、已分配的计算节点中执行以下 CPU 命令。把 --panel-dir 改成已有进化期字段目录；本例使用 16 个单线程 MPI 进程，需申请相应 CPU 和足够内存，或按实际资源修改 --ranks。这个进程数是运行示例，不是已测得的最优正式配置。
+After building as described in Section 2, run this CPU command from the repository root on allocated compute nodes. Replace `--panel-dir` with the existing evolution-period field directory. This example uses 16 single-threaded MPI processes; request the corresponding CPUs and enough memory, or adjust `--ranks` to the actual allocation. The process count is an example, not a measured optimum for production.
 
 ```bash
 python3 pca/run_gp.py \
@@ -74,22 +74,22 @@ python3 pca/run_gp.py \
   --engine-chunk 16 --dag-chunk 32 --H0 0 --seed 2026
 ```
 
-该命令依次运行深度 1、2、3，每个深度 10 代，基因池和父代池上限均为 2000；使用全部导出字段、日期和股票，只进行进化期流程。输出目录必须是新的 pca/runs 子目录；完成后检查 SUCCESS.json 的 completed、stages 和实际规模。恢复时使用同一命令和原目录追加 --resume，数据、二进制与参数须保持一致。
+The command runs depths 1, 2, and 3 sequentially, with 10 generations per depth and gene/parent pool limits of 2000. It uses all exported fields, dates, and stocks, and runs evolution only. The output must be a new child of `pca/runs`. After completion, check `completed`, `stages`, and the recorded dimensions in `SUCCESS.json`. To resume, use the same command and output directory with `--resume`; keep the data, binaries, and parameters unchanged.
 
-若使用 GPU，需按第 2 节构建 CUDA 版本，替换两条二进制路径、设置 --device cuda，并按已分配卡数设置 MPI 进程数；MPI 还须支持 CUDA-aware 通信。小规模闭环已验证，但上述正式预算尚未完成实测，运行时间与资源需另行确定。
+For GPUs, build the CUDA version from Section 2, replace both binary paths, set `--device cuda`, and match MPI ranks to the allocated GPU count. MPI must support CUDA-aware communication. The small full-loop run has been validated; the production budget above has not completed measurement, so runtime and resources still need to be determined.
 
-live_gp.pbs 是小规模集群入口，默认窗口为 1/2/3，不能原样当成上述正式配置。正式运行可把上面的完整命令放入接手人自己的 PBS 作业脚本，按实际队列设置资源和时限。Vanda 多节点运行需加载一致的 MPI 环境，并按脚本设置 PRTE_MCA_prte_launch_agent；相关示例见 live_gp.pbs 和 scripts/vanda/prted.sh。父 Python 进程从计算节点启动 MPI 子批，不能从登录节点运行大规模 GP。OpenMP 线程数通过 OMP_NUM_THREADS 设置，绑定时为每 rank 分配相应 PE。
+`live_gp.pbs` is a small cluster entry point with default windows 1/2/3; it is not the production configuration above. For production, place the complete command in the receiving researcher's PBS script and set resources and walltime for the chosen queue. Vanda multi-node runs need a consistent MPI environment and `PRTE_MCA_prte_launch_agent`; see `live_gp.pbs` and `scripts/vanda/prted.sh`. Start the parent Python process and its MPI batches on compute nodes, not login nodes. `OMP_NUM_THREADS` sets threads per rank; allocate the corresponding PE when binding ranks.
 
-## 5. 检查点与验收
+## 5. Checkpoints and acceptance
 
-原 GP 的 V4 检查点额外记录 batch_backend_identity，包括输入导出、矩阵坐标、文件大小与时间戳、可执行文件哈希、MPI rank 数、精度、方法及分块配置。未启用后端的旧检查点仍兼容；不能把它直接当成新后端的中间状态。不同数据或后端恢复时明确报错，不静默退回 Python 计算。
+Original GP V4 checkpoints also record `batch_backend_identity`: input export, matrix coordinates, file sizes and timestamps, executable hashes, MPI rank count, precision, method, and chunking. Legacy checkpoints without the backend remain compatible with the original path; they cannot be treated as intermediate states of the new backend. Resuming with different data or a different backend raises an error instead of silently falling back to Python computation.
 
-bridge_check.py 检查固定表达式的 Python/C++ 评分与签名、带历史档案的准入、三阶段完整进化、中断恢复和后端身份拒绝。闭环时将原 Python 评估/PCA/QD 入口设为调用即失败，确认不存在隐蔽回退。bridge_cpu.pbs 与 bridge_gpu.pbs 分别在计算节点运行。
+`bridge_check.py` checks fixed-expression Python/C++ scores and signatures, admission into a nonempty archive, complete three-stage evolution, interruption/resume, and rejection of a mismatched backend identity. During the full-loop test, original Python evaluation/PCA/QD entry points raise if called, ruling out hidden fallback. `bridge_cpu.pbs` and `bridge_gpu.pbs` run these checks on compute nodes.
 
-cli_bridge_check.py 验证原 EOD CLI、三个深度的 GP、原样本外筛选和最终选因子文件，另核对已完成运行恢复。跨节点 GPU 另由 cross_node_gpu.pbs 提供实际不同主机上的显存通信证据。
+`cli_bridge_check.py` checks the original EOD CLI, three-depth GP, original out-of-sample screening, final factor outputs, and resumption of a completed run. `cross_node_gpu.pbs` separately verifies device-memory communication between different hosts.
 
-## 6. 性能解释
+## 6. Interpreting performance
 
-一个 MPI 子进程处理一个 GP 进度块，不是每个因子启动一个进程。为先保证可靠衔接，评估与 QD 目前分别调用可执行文件；小批次下进程启动、输入准备和检查点 I/O 可能占主导。calls.json 的调用墙钟包含启动和最终输出，完整 GP 墙钟还包括原 Python 控制与检查点，不能由旧的独立 PCA 时间直接推算。
+One MPI subprocess handles a GP progress chunk, not a single factor. Evaluation and QD currently use separate executable calls to establish reliable integration. For small batches, process startup, input preparation, and checkpoint I/O can dominate. Call walltime in `calls.json` includes startup and final output; full GP walltime also includes the original Python control loop and checkpointing. Independent PCA timing cannot directly predict full GP runtime.
 
-bridge metrics 的 total_seconds 为各 rank 最大值；engine_seconds、ranking_seconds 等阶段诊断目前来自 rank 0，不作为最慢 rank 阶段性能结论。配置、原始输出与计时均保存于私有运行目录。不同 MPI rank 数或精度可能引入细小评分差异，进化过程可能放大排序差异；固定输入、固定顺序的 QD 语义验证与跨配置整次进化结果相同是不同主张。
+Bridge `total_seconds` is the maximum across ranks. Stage diagnostics such as `engine_seconds` and `ranking_seconds` currently come from rank 0 and must not be presented as maximum-rank stage times. Configurations, raw outputs, and timing stay in private run directories. MPI rank count and precision can introduce small score differences that evolution amplifies through ordering. Fixed-input, fixed-order QD semantics and equality of complete evolution runs across configurations are separate claims.

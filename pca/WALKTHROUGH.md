@@ -1,46 +1,46 @@
-# 模块接口与数据约定
+# Module interfaces and data conventions
 
-R 的行是抽样日期，列是股票；常用维度为 293×5876。现成 R 已做百分位排名、NaN 填 0.5 与逐行去均值。只有未排名抽样值才使用 `--rank-input 1`。
+R has sampled dates as rows and stocks as columns; a common shape is 293x5876. Existing R already has percentile ranking, NaN filling with 0.5, and row centering. Use `--rank-input 1` only for unranked sampled values.
 
-## 文件与 API
+## Files and APIs
 
-| 文件 | 用途 |
+| File | Purpose |
 | --- | --- |
-| core.hpp / core.cpp | CPU 排名、两种求解器、自写 Jacobi、相似度和顺序档案 |
-| main.cpp | 独立批次驱动、MPI 三布局、结果和阶段计时 |
-| mpi_archive.hpp | 档案签名分片、局部复核、全局 MAXLOC |
-| gpu.hpp / gpu.cu | 百分位排名、批量幂迭代和手写分块相似度 |
-| c_api.cpp | Python 数值研究调用的 C ABI |
-| reference.py | Python 同输入幂迭代参考，仅用于验证 |
-| validate.py | 与原 Python 准入逐项核对，另可指定精确 SVD 抽查 |
-| synthetic.py / adversarial.py | 人工合成输入与阈值、并列等边界用例生成 |
+| core.hpp / core.cpp | CPU ranking, both solvers, handwritten Jacobi, similarity, and sequential archive |
+| main.cpp | Independent batch driver, three MPI layouts, outputs, and stage timing |
+| mpi_archive.hpp | Sharded archive signatures, local refinement, global MAXLOC |
+| gpu.hpp / gpu.cu | Percentile ranking, batched power iteration, handwritten tiled similarity |
+| c_api.cpp | C ABI used by Python numerical studies |
+| reference.py | Same-input Python power reference, for validation only |
+| validate.py | Per-candidate comparison with original Python admission and optional exact SVD samples |
+| synthetic.py / adversarial.py | Synthetic inputs and threshold/tie boundary cases |
 
-## 与上游引擎对接
+## Integration with the upstream engine
 
-上游按原始全局交易日分块，本驱动则按已抽样的 R 行分块，两者的边界不一定相同。接入时应先在本 rank 的自有日期内按 `t % sample_step == 0` 选行，排除 halo，再按股票行排名并逐行去均值。新版主工程没有旧的 `gpe::signature_rows`，不要依赖该已移除接口。
+The upstream engine partitions original global trading dates, while the independent driver partitions already-sampled R rows. Their boundaries may differ. For integration, select owned dates with `t % sample_step == 0`, exclude halos, rank each selected stock row, and center it. The current upstream project has no legacy `gpe::signature_rows`; do not depend on that removed interface.
 
-CPU 将本地抽样行放进 `pca::Matrix`，所有 rank 使用同一初始右向量；将 `MPI_Allreduce` 包装成 `pca::Sum`，传给 `pca::solve`。按全局日期顺序汇集局部签名后统一调用 `pca::finish`，不在各 rank 独立固定符号。实际接入由 engine_bridge.cpp 使用上游 keep_roots 保留有界表达式子批，再抽取自有日期；Python 可选后端、原 CLI 与检查点契约见 [GP_INTEGRATION.md](GP_INTEGRATION.md)。
+On CPU, put local sampled rows in `pca::Matrix` and use the same initial right vector on every rank. Wrap `MPI_Allreduce` as `pca::Sum` and pass it to `pca::solve`. Gather local signatures in global date order, then call `pca::finish` once; do not fix signs independently on each rank. The live `engine_bridge.cpp` uses upstream `keep_roots` to retain a bounded expression batch before sampling owned dates. See [GP_INTEGRATION.md](GP_INTEGRATION.md) for the optional Python backend, original CLI, and checkpoint contract.
 
-GPU `gpu_rank_rows` 将缺失值填 0.5 并去均值，供 PCA 使用；`gpu_percentile_rows` 保留 NaN、不填充、不去均值，供 RankIC 调用方复用。采样和成对有效值掩码由调用方负责。输入是连续 `[行][股票]` 的 FP32；当前排序最多 8192 列。`gpu_power` 的 `DeviceReduce` 回调接收显存指针，使用前须确认 CUDA-aware MPI 支持。
+GPU `gpu_rank_rows` fills missing values with 0.5 and centers rows for PCA. `gpu_percentile_rows` preserves NaN without filling or centering for RankIC callers. Sampling and pairwise-valid masks are the caller's responsibility. Input is contiguous FP32 `[row][stock]`; sorting currently supports at most 8192 columns. The `DeviceReduce` callback used by `gpu_power` receives a device pointer; confirm CUDA-aware MPI support before use.
 
-原引擎 `rank_rows_pct` 返回 double，需逐值兼容时使用 `gpu_percentile_rows_f64`。该入口复用相同排序 kernel，在 GPU 上恢复精确平均排名后做 FP64 除法，再返回主机 double 数组，可直接交给原有 `daily_rank_ic` 的目标排名参数。详见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)；提供可调用接口与消费者验证，不表示主 GP 已自动切换后端。
+The original engine's `rank_rows_pct` returns double. Use `gpu_percentile_rows_f64` when elementwise compatibility is needed. It reuses the sorting kernel, recovers exact average ranks on GPU, performs FP64 division, and returns host double arrays accepted by the original `daily_rank_ic` target-rank argument. See [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md). A callable API and consumer validation do not mean the main GP has automatically adopted it.
 
-## 签名和准入
+## Signatures and admission
 
-签名求解用 `u=normalize(Rv)`、`v=normalize(Rᵀu)` 交替更新，最后再求 `normalize(Rv)`；符号固定后转 FP32。Lanczos 通过左右基和小双对角矩阵得到近似主方向。NumPy 精确 SVD 只用于验证。
+Signature solving alternates `u=normalize(Rv)` and `v=normalize(R^T u)`, then computes one final `normalize(Rv)`. The result has a consistent sign and is converted to FP32. Lanczos approximates the leading direction using left/right bases and a small bidiagonal matrix. Exact NumPy SVD is for validation only.
 
-比较签名时还需重新中心化、归一化，取绝对 Pearson 相关；这是独立于签名归一化的步骤。一个非零 R 仍可能得到时间恒定的签名，这种签名不能比较，会被跳过。
+Similarity separately recenters and normalizes signatures before taking absolute Pearson correlation. A nonzero R can still yield a signature constant across dates; such a signature is incomparable and skipped.
 
-准入保持候选顺序：最大相似度低于 0.90 则加入，否则只有质量严格超过最近记录加 0.002 才替换；质量为 abs RankIC。相似度并列时选字典序较大的 key。相似度粗算使用 FP32 和保守误差界，再对可能改变最大值／阈值判定的记录用 FP64 复核。前面候选的加入、替换或删除对后续候选立即可见。
+Admission preserves candidate order. Admit when maximum similarity is below 0.90; otherwise replace only if quality is strictly greater than the nearest record's quality plus 0.002. Quality is absolute RankIC. Similarity ties select the lexicographically larger key. FP32 similarity estimates and conservative error bounds identify comparisons requiring FP64 refinement to protect maximum/threshold decisions. Earlier admissions, replacements, and removals are immediately visible to later candidates.
 
-默认档案由 rank 0 维护，CUDA 模式在 GPU 上粗算相似度；MPI 分片档案是另一条独立路径，保留小元数据、用 MAXLOC 统一最近记录，不假定块内档案不变。
+By default, rank 0 maintains the archive; CUDA estimates similarity on the GPU. The MPI sharded archive is a separate path with replicated small metadata and global MAXLOC. It does not assume the archive remains unchanged within a block.
 
-## 布局与计时
+## Layouts and timing
 
-date 每轮跨日期归约；transpose 先交换完整矩阵再本地迭代；factor 直接读取完整因子，不含上游重分布。CPU 新排名保留 double，转置也用 double；现成 FP32 R 按 float 转置。
+`date` reduces across date partitions each iteration. `transpose` first exchanges complete matrices, then iterates locally. `factor` reads complete factors directly and excludes upstream redistribution. Fresh CPU ranking and its redistribution retain double precision; an existing FP32 R is redistributed as float.
 
-日期布局的 power 已按批归约，Lanczos 当前逐因子归约，因此较少步数不保证较少 Allreduce。数值诊断额外做两次矩阵乘。各 rank 的阶段最大值可能来自不同进程，而且通信嵌套在求解／转置中，不可相加代替总时间。
+Power in the date layout uses batched reductions; Lanczos currently reduces per factor, so fewer iterations do not necessarily mean fewer Allreduce calls. Numerical diagnostics add two matrix-vector products. Different ranks may provide different stage maxima; communication is nested within solve/redistribution timings, so adding stages does not recover total time.
 
-查看结果时先检查验证标记，再看 metrics、逐候选 decisions 与最终 archive_keys；不能仅凭程序退出或文件夹存在判断正确性。所有输出留在 runs，不上传到公开仓库。
+Check validation markers before inspecting `metrics`, per-candidate `decisions`, and final `archive_keys`. A zero exit code or an existing directory alone does not establish correctness. All outputs stay in private runs and are excluded from the public repository.
 
-继续历史批次时传 --archive-input archive.json。集中档案和 MPI 分片档案都读取同一组 key、质量与签名，运行后导出完整快照；下一批应显式引用该快照，并保持抽样日期与算法约定一致。验证器自动读取 provenance 中的实际初始档案，不会把历史批次当成空库重放。字段和最终验收见 [DELIVERY.md](DELIVERY.md)。
+To continue a historical batch, supply `--archive-input archive.json`. Centralized and sharded archives read the same keys, qualities, and signatures, and export a complete snapshot. The next batch must explicitly reference it and retain compatible sampled dates and algorithm conventions. Validation reads the actual initial archive from provenance rather than replaying a continued batch as if it started empty. See [DELIVERY.md](DELIVERY.md) for fields and final acceptance.

@@ -1,47 +1,47 @@
-# PCA-QD 最终交付索引
+# PCA-QD delivery index
 
-本次交付为项目第③部分：PCA 签名、相似度、顺序 QD 准入，以及与原分层 GP 的可选后端衔接。开发分支为 pca-implementation；尚未合并 main。
+This delivery covers project component 3: PCA signatures, similarity, sequential QD admission, and the optional backend connecting them to the original hierarchical GP. The development branch is `pca-implementation`; it has not been merged into `main`.
 
-## 阅读顺序
+## Reading order
 
-1. [README.md](README.md)：编译、模块运行和基本接口。
-2. [GP_INTEGRATION.md](GP_INTEGRATION.md)：原 GP 与实际 MPI 引擎、PCA、QD、下一代和检查点的衔接。
-3. [DELIVERY.md](DELIVERY.md)：档案格式、验收含义与私有报告打包。
-4. [EXPERIMENTS.md](EXPERIMENTS.md) / [REPRODUCE.md](REPRODUCE.md)：实验目录和复现步骤。
+1. [README.md](README.md): build, module execution, and basic interfaces.
+2. [GP_INTEGRATION.md](GP_INTEGRATION.md): connect the original GP to the live MPI engine, PCA, QD, subsequent generations, and checkpoints.
+3. [DELIVERY.md](DELIVERY.md): archive format, validation semantics, and private report packaging.
+4. [EXPERIMENTS.md](EXPERIMENTS.md) / [REPRODUCE.md](REPRODUCE.md): experiment entry points and reproduction steps.
 
-算法与边界语义另见 [WALKTHROUGH.md](WALKTHROUGH.md)，GPU 百分位的 RankIC 消费契约见 [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md)。
+See [WALKTHROUGH.md](WALKTHROUGH.md) for algorithms and boundary semantics, and [RANKIC_INTERFACE.md](RANKIC_INTERFACE.md) for the GPU percentile contract consumed by RankIC.
 
-## 主报告
+## Main report
 
-服务器上的当前报告目录为 `pca/runs/final_submission_04/`，相对于当前 Git 仓库根目录。正文沿用 report/main_zh.tex 的章序：背景与算法、数据、平台、并行设计、验证、实验、讨论和结论。实验部分先报告 PCA 签名与相似度，再比较幂迭代与 Lanczos，最后给出实际 GP 衔接结果。保留 7 张结果与并行汇总表、8 幅主要实验图，精简基础概念与重复图示；原始数值不变，前三版报告保留为历史资料。
+The current server-side report directory is `pca/runs/final_submission_04/`, relative to the Git repository root. The body follows `report/main_zh.tex`: background and algorithms, data, platform, parallel design, validation, experiments, discussion, and conclusions. Experiments cover PCA signatures/similarity first, then power versus Lanczos, followed by actual GP integration. It retains 7 result/parallel-summary tables and 8 main figures, with introductory material and repeated illustrations reduced. Original values are unchanged; the first three report versions remain available as historical material.
 
-- **主报告：`pca_paper.pdf`**。
-- 可编辑正文：`pca_paper.md`；必要插图位于 `figures/`。
-- 论文合并片段：`latex/pca_sections.tex`。
-- 完整仓库源码：`source.tar.gz`，保留实际编译所需的上游源码布局。
-- 验收摘要：`DELIVERY_STATUS.json` 与 `evidence/`；文件校验见 `MANIFEST_SHA256.json`。
+- **Main report: `pca_paper.pdf`.**
+- Editable body: `pca_paper.md`; required figures are in `figures/`.
+- Manuscript integration fragment: `latex/pca_sections.tex`.
+- Complete repository source: `source.tar.gz`, retaining the upstream layout needed for compilation.
+- Acceptance summary: `DELIVERY_STATUS.json` and `evidence/`; file hashes are in `MANIFEST_SHA256.json`.
 
-报告合并 PCA 实验、接口验收、实际 GP 衔接和全部字段的完整数据维度预演。交接要求数据、表达式和实验输出不进入公开仓库，因此报告与结果包保留私有；GitHub 提交源码、人工合成检查、必要复现脚本和本文索引。
+The report combines PCA experiments, interface acceptance, actual GP integration, and a reduced-evolution-budget pilot with all fields and full data dimensions. Handoff requirements keep data, expressions, and experiment outputs out of the public repository, so reports and result packages remain private. GitHub contains source, synthetic checks, required reproduction scripts, and this index.
 
-## 源码范围
+## Source scope
 
-| 内容 | 主要文件 |
+| Component | Main files |
 |---|---|
-| CPU/OpenMP、Lanczos | core.cpp / core.hpp |
-| CUDA 排名、幂迭代与相似度 | gpu.cu / gpu.hpp |
-| 顺序及 MPI 档案、快照 | mpi_archive.hpp / archive_io.hpp / archive_io.py |
-| 独立模块入口 | main.cpp / prepare.py / validate.py |
-| 实际因子引擎桥接与 GP 后端 | engine_bridge.cpp / gp_bridge.py / run_gp.py |
-| 原项目可选接口 | ../python/src/gp_factor_miner/hierarchical_engine.py / hierarchical_cli.py |
+| CPU/OpenMP and Lanczos | core.cpp / core.hpp |
+| CUDA ranking, power iteration, and similarity | gpu.cu / gpu.hpp |
+| Sequential/MPI archives and snapshots | mpi_archive.hpp / archive_io.hpp / archive_io.py |
+| Independent module entry points | main.cpp / prepare.py / validate.py |
+| Live factor-engine bridge and GP backend | engine_bridge.cpp / gp_bridge.py / run_gp.py |
+| Original project opt-in interfaces | ../python/src/gp_factor_miner/hierarchical_engine.py / hierarchical_cli.py |
 
-其余 C++、Python、PBS 文件服务于独立参考、数值验收和报告中实验的复现。上游构建与 include/src 依赖保留，不把它们当成临时文件删除。生产目标不链接 BLAS/cuBLAS/cuSOLVER；库仅用于独立性能参照。
+Other C++, Python, and PBS files support independent references, numerical acceptance, and reproduction of report experiments. Upstream build and include/src dependencies are required source, not temporary files. Production targets do not link BLAS/cuBLAS/cuSOLVER; libraries serve only independent references.
 
-## 当前验收与边界
+## Acceptance status and limits
 
-已通过 CPU/MPI、CUDA、历史档案接续、顺序准入、独立数值参考、完整快照与失败反例验证；实际 GP 三阶段闭环、中断恢复、原 CLI 与合成样本外流程均已验证。全部真实字段和完整数据维度的缩小进化预算预演已经完成。跨节点 GPU 验证与单节点双卡性能实验分别记录。
+CPU/MPI, CUDA, historical-archive continuation, ordered admission, independent numerical references, complete snapshots, and negative cases have passed validation. Actual three-stage GP loops, interruption/resume, the original CLI, and synthetic out-of-sample flow have also been checked. A reduced-evolution-budget pilot used all real fields and complete data dimensions. Cross-node GPU validation and same-node dual-GPU performance are recorded separately.
 
-当前范围为使用已有进化期数据的 Python＋C++ 流程，2022 年样本外评估不纳入本次交付。正式人口与代数的运行已列入计划，目前正比较 CPU 配置，尚无正式规模结果。原 CLI 的合成样本外验证保留为接口检查。GPU Lanczos 不在本次范围，全组最终 LaTeX 合稿未在本次编译。
+The current scope is a Python+C++ workflow using existing evolution-period data; real 2022 out-of-sample evaluation is excluded. Production population/generation runs are planned, with CPU configuration comparison pending completion and no production-scale results yet. The original CLI's synthetic out-of-sample check remains interface evidence. GPU Lanczos is outside scope, and the complete team LaTeX manuscript was not compiled for this delivery.
 
-## 提交清单原则
+## Included files
 
-保留源码、必要测试、可重复实验入口及说明。运行目录、历史版本报告、构建产物、缓存、临时文件、账户记录、行情和因子表达式不提交；旧输出仍留在私有运行目录用于追溯。一次调度故障期间使用的 resume_pending.py 已退出交付清单。
+Keep source, required tests, reproducible experiment entry points, and documentation. Exclude run directories, historical reports, build products, caches, temporary files, account records, market data, and factor expressions. Historical outputs remain in private run directories for traceability. `resume_pending.py`, used during an earlier scheduler outage, is no longer part of the delivery.

@@ -1,10 +1,10 @@
-# 从私有输入到完整研究
+# Reproduce the study from private inputs
 
-从仓库根目录按阶段执行。先确认前一阶段的输出与成功标记，再提交依赖它的作业；PBS afterok 可用于自动连接这些阶段。本文不包含市场数据、表达式、运行输出或固定作业编号。所有输出目录须为新的 pca/runs 子目录，重跑时使用另一套目录名。
+Run stages from the repository root. Confirm the previous stage's outputs and success markers before submitting dependent jobs; PBS `afterok` dependencies can connect stages automatically. This document contains no market data, expressions, outputs, or fixed job IDs. Every output must use a new child of `pca/runs`; reruns need a different set of directory names.
 
-## 1. 输入与基础验证
+## 1. Inputs and baseline validation
 
-使用 README 中的 prepare.py，将已交接的 R、scores、提供签名和初始向量映射成 pca/runs/real_input/manifest.json。大矩阵保持只读，不复制到仓库。
+Use `prepare.py` as described in README to map the supplied R, scores, signatures, and initial vector into `pca/runs/real_input/manifest.json`. Large matrices remain read-only in their original location.
 
 ```bash
 PCA_RUNS="$PWD/pca/runs"
@@ -13,67 +13,67 @@ mkdir -p "$PCA_RUNS"
 qsub -v PCA_MANIFEST="$PCA_REAL",PCA_RUN="$PCA_RUNS/cpu_validation_01" pca/validate_cpu.pbs
 ```
 
-无私有输入时可先用 smoke.pbs / smoke_gpu.pbs 做合成检查；它们不替代整代研究。准备参考初始向量、scores 和提供签名是 P0 的前提。
+Without private input, run synthetic checks with `smoke.pbs` / `smoke_gpu.pbs` first. They do not replace the full-batch study. P0 requires the reference initial vector, scores, and supplied signatures.
 
-## 2. 整代数值研究与 QD 重放
+## 2. Full-batch numerical study and QD replay
 
-study.pbs 默认 PCA_COUNT=32，属于小规模开发设置。对交接批次的 9388 张非恒定 R，必须显式指定如下参数；其他数据规模需同时调整严格汇总中的数据集检查。
+`study.pbs` defaults to `PCA_COUNT=32` for development. For the handed-off batch of 9388 nonconstant R matrices, explicitly set the following parameters. A different dataset size also requires updating dataset-specific checks in strict report assembly.
 
 ```bash
 qsub -v PCA_MANIFEST="$PCA_REAL",PCA_RUN="$PCA_RUNS/study_full_01",PCA_COUNT=9388,PCA_WORKERS=8,PCA_NUMERICAL_ONLY=1 pca/study.pbs
 ```
 
-该阶段只生成精确 SVD、两种 C++ 算法、三个初值与 k=1…10 的数值检查点；NUMERICAL_SUCCESS.json 表示数值阶段完成，不表示准入实验完成。等数值作业成功，再执行：
+This stage writes only numerical checkpoints: exact SVD, both C++ solvers, three initial vectors, and k=1...10. `NUMERICAL_SUCCESS.json` marks numerical completion, not admission-experiment completion. After this job succeeds, run:
 
 ```bash
 qsub -v PCA_MANIFEST="$PCA_REAL",PCA_STUDY="$PCA_RUNS/study_full_01",PCA_RUN="$PCA_RUNS/sensitivity_full_01" pca/sensitivity.pbs
 ```
 
-完整的 60 条准入轨迹及 summary.json 在 sensitivity_full_01。基础 report.py 应同时接收 --study 与 --sensitivity。默认不加 PCA_NUMERICAL_ONLY 时，study.py 保留“数值研究后顺序重放”的原行为。
+The complete 60 admission trajectories and `summary.json` are in `sensitivity_full_01`. Supply both `--study` and `--sensitivity` to the basic `report.py`. Without `PCA_NUMERICAL_ONLY`, `study.py` retains its original numerical-study-then-sequential-replay behavior.
 
-受控谱实验单独运行：PCA_SYNTHETIC=1、PCA_COUNT=24、PCA_RUN=study_synthetic_01，仍传 PCA_MANIFEST 以满足 PBS 入口，脚本会生成并改用自己的合成 manifest。它与弱扩展输入不同。
+Run the controlled-spectrum experiment separately with `PCA_SYNTHETIC=1`, `PCA_COUNT=24`, and `PCA_RUN=study_synthetic_01`. Still supply `PCA_MANIFEST` for the PBS entry point; the script generates and switches to its own synthetic manifest. This input differs from weak-scaling input.
 
-新 study 同时生成 INPUT.json 绑定 manifest 和初始向量。复用没有该文件的历史研究时，prepare_completion.py 必须显式指定 --allow-legacy-study，并人工核对输入。历史结果不重写成新验收产生的结果。
+New studies also write `INPUT.json` to bind the manifest and initial vector. Reusing a historical study without this file requires explicit `--allow-legacy-study` in `prepare_completion.py` after manual input verification. Historical results are not relabeled as newly validated results.
 
-## 3. CPU 规模、强扩展、混合与弱扩展
+## 3. CPU size, strong, hybrid, and weak scaling
 
-serial_scale.pbs → serial_sizes_01；archive_scale.pbs → archive_sizes_01；iteration_cost.pbs 以真实 PCA_REAL 为输入 → iteration_cost_01。后者是前 8 个真实因子、8 ranks 的同精度代表实验。
+`serial_scale.pbs` -> `serial_sizes_01`; `archive_scale.pbs` -> `archive_sizes_01`; `iteration_cost.pbs` uses real `PCA_REAL` -> `iteration_cost_01`. The last is a representative matched-accuracy experiment on the first 8 real factors with 8 ranks.
 
-scaling.pbs 分别提交 1/2/4 节点，输出 scaling_1node_01、scaling_2node_01、scaling_4node_01。每节点须显式申请 ncpus=72、mpiprocs=72、mem=180gb。四节点超过免费池限制，使用项目路由队列，例如：
+Submit `scaling.pbs` for 1/2/4 nodes, producing `scaling_1node_01`, `scaling_2node_01`, and `scaling_4node_01`. Explicitly request `ncpus=72`, `mpiprocs=72`, and `mem=180gb` per node. Four nodes exceed the free pool limit; use a project routing queue, for example:
 
 ```bash
 qsub -q auto -l select=4:ncpus=72:mpiprocs=72:mem=180gb \
   -v PCA_MANIFEST="$PCA_REAL",PCA_RUN="$PCA_RUNS/scaling_4node_01" pca/scaling.pbs
 ```
 
-每节点 4 ranks×18 threads 的混合实验由该脚本同时执行。1/2 节点按相同方式设置 select 与相应输出名。
+The same script also runs the hybrid layout with 4 ranks x 18 threads per node. Set the corresponding allocation and output name for 1/2-node runs.
 
-weak_input.pbs → weak_input_01，生成 9216 张 293×5876 的合成 R。完成后，以 weak_input_01/manifest.json 为输入，分别运行 weak.pbs 的 1/2/4 节点版本 → weak_1/2/4node_01。每 rank 固定 32 张完整矩阵等价工作量，每个规模读取相同序列的前缀。
+`weak_input.pbs` -> `weak_input_01` generates 9216 synthetic R matrices of shape 293x5876. After completion, use `weak_input_01/manifest.json` with 1/2/4-node `weak.pbs` runs -> `weak_1/2/4node_01`. Each rank has 32 complete-matrix-equivalent inputs; every scale reads a prefix of the same sequence.
 
-raw_scaling.pbs 也使用该完整合成 manifest，但将输入解释为未排名抽样数值，实际排名后计算 → raw_scaling_1/2/4node_01。排序会改变谱，不将其称为真实行情或保持受控谱的实验。所有 288 核作业均使用满足限制的项目路由队列。
+`raw_scaling.pbs` uses the same complete synthetic manifest but treats the values as unranked sampled input, ranks them, and produces `raw_scaling_1/2/4node_01`. Ranking changes the spectrum; these are neither real market inputs nor preserved controlled-spectrum matrices. All 288-core jobs must use a project routing queue within site limits.
 
-## 4. GPU、精度与提供签名
+## 4. GPU, precision, and supplied signatures
 
-CPU 强扩展成功后，可使用同输入串行签名作为参考：
+After CPU strong scaling succeeds, a serial signature output on the same input can serve as the baseline:
 
 ```bash
 PCA_BASELINE="$PCA_RUNS/scaling_1node_01/strong_date_p1_t1_r1/signatures.f32"
 ```
 
-| 作业 | 额外输入 | 规范输出名 |
+| Job | Additional input | Expected output name |
 | --- | --- | --- |
 | validate_gpu_mpi.pbs | PCA_MANIFEST=PCA_REAL | gpu_two_01 |
-| gpu_roofline.pbs | 无市场输入 | gpu_roofline_01 |
-| precision_full.pbs | PCA_MANIFEST=PCA_REAL，PCA_BASELINE | precision_full_03 |
-| gpu_api_test.pbs | PCA_MANIFEST=PCA_REAL，PCA_BASELINE | gpu_api_01 |
-| adversarial.pbs | 无市场输入 | adversarial_02 |
-| cublas_reference.pbs | 无市场输入 | cublas_reference_01 |
+| gpu_roofline.pbs | No market input | gpu_roofline_01 |
+| precision_full.pbs | PCA_MANIFEST=PCA_REAL, PCA_BASELINE | precision_full_03 |
+| gpu_api_test.pbs | PCA_MANIFEST=PCA_REAL, PCA_BASELINE | gpu_api_01 |
+| adversarial.pbs | No market input | adversarial_02 |
+| cublas_reference.pbs | No market input | cublas_reference_01 |
 
-每项都须设置对应 PCA_RUN。完整精度实验可以直接执行 precision_full.pbs；precision_finish.pbs 只用于复用已完成 GPU 数值结果的恢复场景，不是每次必需阶段。GPU 经 auto_free 或 auto 路由，不直接提交 from_route_only 的执行队列。单／双卡是 GPU 扩展，288 核是另一组 CPU 实验。
+Set the corresponding `PCA_RUN` for every job. Run `precision_full.pbs` for the complete precision experiment; `precision_finish.pbs` is only for recovery that reuses completed GPU numerical outputs, not a mandatory stage. Route GPU jobs through `auto_free` or `auto`; do not submit directly to an execution queue marked `from_route_only`. Single-/dual-GPU scaling and the 288-core CPU study are separate experiments.
 
-## 5. 真实规模与整代同精度补充
+## 5. Real-size and full-batch matched-accuracy supplements
 
-本阶段依赖第 2 节的完整数值检查点。准备命令读取现有 manifest、SVD 研究及原始 scores，从中生成私有候选与步数计划；行情与导出 R 仍从原位置只读。将下面两个占位路径替换为已交接的 scores.jsonl 和原始行情字段目录（包含 meta.json 及字段文件）。
+This stage depends on complete numerical checkpoints from Section 2. Preparation reads the existing manifest, SVD study, and original scores to generate private candidate and budget plans. Market data and exported R remain read-only in their original location. Replace the two placeholder paths below with the supplied `scores.jsonl` and raw field directory containing `meta.json` and field files.
 
 ```bash
 python3 pca/prepare_completion.py --manifest "$PCA_REAL" \
@@ -84,33 +84,33 @@ qsub -v PCA_SOURCE="$PCA_RUNS/completion_plan_01/real_source.json",PCA_RUN="$PCA
 qsub -v PCA_PLAN="$PCA_RUNS/completion_plan_01/accuracy_plan.json",PCA_RUN="$PCA_RUNS/matched_full_01" pca/matched_full.pbs
 ```
 
-两项作业互不依赖。真实规模实验由引擎计算 128 个固定因子面板，19 个配置分别改变 B、采样日数 m、股票数 n、步数 k；每次都对所选股票重新排名。因子在完整股票池求值后固定，不在新股票池重新求值含截面算子的公式。准入使用原 scores，不重算质量。八线程生成面板的时间单列，PCA 计时使用一线程。每配置验证全量顺序 QD 与三次重复，前两个原始面板另做 pandas 排名和独立签名核对。
+The two jobs are independent. The real-size experiment computes 128 fixed factor panels with the engine, then varies B, sampled dates m, stock count n, and steps k over 19 configurations. Each configuration reranks its stock subset. Factor values are fixed after evaluation on the complete stock universe; cross-sectional expressions are not reevaluated on subsets. Admission uses original scores without recomputing quality. Eight-thread factor generation is timed separately; PCA uses one thread. Each configuration checks full sequential QD and three repeats; the first two raw panels also receive pandas ranking and independent-signature checks.
 
-整代成本作业执行全部输入。两算法各自选择串行研究中首次达标的步数，十步未达标者仍以十步执行并单列；MPI 结果与相同步数串行签名比较，以误差上界认证精度。仅在两算法共同认证的同一集合比较成本。该作业是离线预算实验，两算法均逐因子归约、不计算残差诊断；不等同于生产驱动的批量 power 归约。
+The full-batch cost job executes every input. Each solver uses its first target-reaching budget from the serial study. Inputs missing the target within ten steps still execute at ten steps and are reported separately. MPI results are compared with same-budget serial signatures and certified through an error bound. Cost comparison uses only the identical set certified for both solvers. This is an offline-budget experiment: both methods reduce per factor and omit residual diagnostics, unlike production power's batched reductions.
 
-matched_full.pbs 预留 16 个 CPU 核，实际启动 8 ranks、每 rank 一线程。全集 FP32 缓存约需 64.7 GB，Vanda 可能按核数改写内存；作业先记录并检查实际分配资源，内存不足则退出。记录中的预留核数和活跃 ranks 要分别报告。真实规模和整代作业只有独立验证通过后才写 SUCCESS。
+`matched_full.pbs` reserves 16 CPU cores but launches 8 single-threaded ranks. The full FP32 cache needs about 64.7 GB. Vanda may rewrite memory according to core count, so the job records the actual allocation and exits if memory is insufficient. Report reserved cores and active ranks separately. Real-size and full-batch jobs write `SUCCESS` only after independent validation.
 
-真实规模实验成功后，还可用其原始面板验证 RankIC 共用接口：
+After real-size validation succeeds, its raw panels can also validate the shared RankIC interface:
 
 ```bash
 qsub -v PCA_REAL_SIZE="$PCA_RUNS/real_sizes_01",PCA_RUN="$PCA_RUNS/rankic_interface_01" pca/rankic_interface.pbs
 ```
 
-不设置 PCA_REAL_SIZE 时执行合成边界检查；该作业验证 FP64 GPU 百分位与原引擎排名和实际 daily_rank_ic 消费者的一致性，不自动修改主 GP 后端。
+Without `PCA_REAL_SIZE`, the job runs synthetic boundary checks. It verifies agreement of FP64 GPU percentiles with original engine ranking and the actual `daily_rank_ic` consumer; it does not automatically change the main GP backend.
 
-## 6. 独立验收与报告
+## 6. Independent acceptance and reporting
 
-| 验收 | 前置 | 输出名 |
+| Acceptance | Prerequisites | Output name |
 | --- | --- | --- |
-| validate_full.pbs | PCA_REAL、PCA_BASELINE、PCA_CPU_RUN=scaling_2node_01、PCA_GPU_RUN=gpu_two_01 | full_validation_01 |
-| validate_scaling.pbs | scaling_1/4node_01、sensitivity_full_01 的默认轨迹 | scaling_validation_local_01 |
-| validate_synthetic_runs.pbs | 三组 weak 和三组 raw，PCA_MANIFEST=weak_input_01/manifest.json，PCA_KIND=both | synthetic_validation_01 |
+| validate_full.pbs | PCA_REAL, PCA_BASELINE, PCA_CPU_RUN=scaling_2node_01, PCA_GPU_RUN=gpu_two_01 | full_validation_01 |
+| validate_scaling.pbs | scaling_1/4node_01, default sensitivity_full_01 trajectory | scaling_validation_local_01 |
+| validate_synthetic_runs.pbs | Three weak and three raw runs, PCA_MANIFEST=weak_input_01/manifest.json, PCA_KIND=both | synthetic_validation_01 |
 
-每项还须设置 PCA_RUN。合成验收核对全量顺序 QD、三次重复和布局一致性，数值独立重算为每组前 8 个因子；不把抽查写成全部数值逐项验证。
+Every job also needs `PCA_RUN`. Synthetic acceptance checks full sequential QD, three repeats, and layout agreement. Independent numerical recomputation covers the first 8 factors in each group; do not present this sample as exhaustive numerical validation.
 
-全部前置成功后，以新的 PCA_RUN 调用 final_report.pbs。它检查既定目录、计时重复、配置数及验证标记，写出完整报告、图表与 EVIDENCE.json；缺证据会报错。代码目录中没有实际结果，交付验收应在服务器上检查运行与报告，而不是只查看 GitHub 文件列表。
+After all prerequisites pass, invoke `final_report.pbs` with a new `PCA_RUN`. It checks prescribed directories, timing repeats, configuration counts, and validation markers, then writes the complete report, figures, and `EVIDENCE.json`. Missing evidence is an error. The code directory contains no actual results; acceptance requires checking server-side runs and reports, not only GitHub files.
 
-final_report.pbs 保留基础实验的入口。包含本次两项补充的严格报告应在加载科学计算和 matplotlib 模块的计算节点上执行：
+`final_report.pbs` retains the baseline experiment entry point. For a strict report including both supplements, load scientific-computing and matplotlib modules on a compute node and run:
 
 ```bash
 python3 pca/assemble_report.py --runs "$PCA_RUNS" \
@@ -121,8 +121,8 @@ python3 pca/assemble_report.py --runs "$PCA_RUNS" \
   --matched-full "$PCA_RUNS/matched_full_01" --require-completion
 ```
 
-上述门槛要求交接的完整维度、9388 个因子、8 MPI ranks、19 个真实规模配置及双方成功标记；适用于本交接数据集。报告包含 completion_sections.md、两项新图及 CSV，只有补充验证完整才标记 completion_supplement_verified。迁移时可将 --runs 指向既有私有证据根；底层 report.py 的 --runs-root 同样允许显式指定根目录，输出仍须为其新的子目录。
+These gates require the full handoff dimensions, 9388 factors, 8 MPI ranks, 19 real-size configurations, and success markers for both supplements. They apply to this specific dataset. The report includes `completion_sections.md`, two added plots, and CSVs, and marks `completion_supplement_verified` only when supplementary validation is complete. For migration, `--runs` can point to an existing private evidence root. The underlying `report.py` also accepts an explicit `--runs-root`; output must still be a new child of that root.
 
-## 7. 当前接口验收与交付
+## 7. Current interface acceptance and delivery
 
-在基础实验之外，用 delivery_cpu.pbs / delivery_gpu.pbs 验证历史档案、连续批次及验收失败反例，然后按 [DELIVERY.md](DELIVERY.md) 打包当前源码和报告。跨节点 GPU 使用单独的 cross_node_gpu.pbs，须根据真实执行状态记录；现有同节点双卡结果不构成跨节点证据。实际 GP 自动衔接、原 EOD CLI 和闭环验收见 [GP_INTEGRATION.md](GP_INTEGRATION.md)；GPU Lanczos 不在本次范围。
+In addition to baseline experiments, use `delivery_cpu.pbs` / `delivery_gpu.pbs` to validate existing archives, consecutive batches, and negative cases, then package current source and report following [DELIVERY.md](DELIVERY.md). Run `cross_node_gpu.pbs` separately and record actual execution status; same-node dual-GPU results do not establish cross-node validation. See [GP_INTEGRATION.md](GP_INTEGRATION.md) for automatic GP integration, the original EOD CLI, and full-loop acceptance. GPU Lanczos is outside this delivery's scope.
