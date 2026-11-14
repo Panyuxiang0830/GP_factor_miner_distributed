@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_cublas_ref
+#PBS -j oe
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:ngpus=1:mem=16gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON -DPCA_CUBLAS_REFERENCE=ON
+cmake --build "$build" -j 2
+export OMP_NUM_THREADS=1 NVIDIA_TF32_OVERRIDE=0
+ctest --test-dir "$build" --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+"$build/pca_gpu_test" "$PCA_RUN/gpu_validation.json"
+for batch in 8 32 64; do
+    "$build/pca_cublas_reference" "$batch" 16384 293 "$PCA_RUN/B${batch}_A16384.json"
+done
+"$build/pca_cublas_reference" 128 50000 293 "$PCA_RUN/B128_A50000.json"
+python3 - "$build/pca_run" "$PCA_RUN" <<'PY'
+import json,pathlib,subprocess,sys
+root=pathlib.Path(sys.argv[2])
+deps=subprocess.run(['ldd',sys.argv[1]],capture_output=True,text=True,check=True).stdout
+assert 'cublas' not in deps.lower()
+reports=[json.loads(p.read_text()) for p in root.glob('B*_A*.json')]
+assert len(reports)==4 and all(x['passed'] and not x['production_uses_cublas'] for x in reports)
+(root/'PRODUCTION_LINK_CHECK.json').write_text(json.dumps(dict(verified=True,production_binary=sys.argv[1],cublas_dependency=False),indent=2)+'\n')
+PY
+touch "$PCA_RUN/SUCCESS"

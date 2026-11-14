@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_weak
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=180gb
+#PBS -l place=scatter
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_MANIFEST:?set PCA_MANIFEST to the large synthetic weak input}"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 4
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+sort -u "$PBS_NODEFILE" > "$PCA_RUN/hosts.txt"
+hosts=$(wc -l < "$PCA_RUN/hosts.txt")
+if [ "$hosts" = 1 ]; then rank_list="1 2 4 8 16 36 72"; else rank_list="$((hosts * 72))"; fi
+for ranks in $rank_list; do
+    processes=$((ranks / hosts)); [ "$processes" -gt 0 ] || processes=1
+    for layout in date transpose factor; do
+        for repeat in 0 1 2 3; do
+            mpirun -np "$ranks" --hostfile "$PCA_RUN/hosts.txt" --map-by "ppr:${processes}:node" --bind-to core \
+                "$build/pca_run" --manifest "$PCA_MANIFEST" \
+                --out "$PCA_RUN/weak_${layout}_p${ranks}_r${repeat}" --count "$((32 * ranks))" \
+                --chunk 576 --layout "$layout"
+        done
+    done
+done
+touch "$PCA_RUN/SUCCESS"

@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -q auto
+#PBS -N pca_real_sizes
+#PBS -j oe
+#PBS -l walltime=02:00:00
+#PBS -l select=1:ncpus=8:mpiprocs=1:mem=32gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_SOURCE:?set PCA_SOURCE to real_source.json}"
+: "${PCA_RUN:?set a new private output directory}"
+hostname > "${PCA_RUN}_host.txt"
+lscpu > "${PCA_RUN}_cpu.txt"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=OFF -DPCA_ENGINE_BENCH=ON
+cmake --build "$build" -j 4
+export OMP_NUM_THREADS=8
+"$build/pca_real_size_bench" --source "$PCA_SOURCE" --out "$PCA_RUN" --factors 128
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/validate_real_size.py --run "$PCA_RUN"

@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -q auto
+#PBS -N pca_live_gp_gpu
+#PBS -j oe
+#PBS -l walltime=00:15:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:ngpus=1:mem=16gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set new private run}"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON -DPCA_ENGINE_BENCH=ON
+cmake --build "$build" -j 2 --target pca_engine_bridge pca_run
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+PCA_MPI_BIN=$(command -v mpirun)
+PCA_MPI_LIBS=$LD_LIBRARY_PATH
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+export LD_LIBRARY_PATH="$PCA_MPI_LIBS:${LD_LIBRARY_PATH:-}"
+python3 pca/bridge_check.py --engine-binary "$build/pca_engine_bridge" --pca-binary "$build/pca_run" \
+    --out "$PCA_RUN" --ranks 1 --device cuda --mpiexec "$PCA_MPI_BIN"

@@ -1,0 +1,57 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_precision_end
+#PBS -j oe
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:mem=12gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+: "${PCA_REUSE:?set PCA_REUSE to completed GPU numerical outputs}"
+: "${PCA_MANIFEST:?set PCA_MANIFEST}"
+: "${PCA_BASELINE:?set PCA_BASELINE}"
+mkdir "$PCA_RUN"
+for name in full_float full_double raw_float raw_double; do
+    test -f "$PCA_REUSE/$name/metrics.json"
+    ln -s "$PCA_REUSE/$name" "$PCA_RUN/$name"
+done
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=OFF
+cmake --build "$build" -j 2
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+ctest --test-dir "$build" --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+for layout in factor transpose; do
+    mpirun -np 4 --map-by slot --bind-to core "$build/pca_run" \
+        --manifest "$PCA_REUSE/raw_input/manifest.json" --out "$PCA_RUN/raw_cpu_$layout" \
+        --count 8 --chunk 8 --layout "$layout" --rank-input 1
+done
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+for precision in float double; do
+    python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$PCA_RUN/full_$precision" \
+        --power-reference "$PCA_BASELINE" > "$PCA_RUN/full_$precision/validation.log" 2>&1
+    python3 pca/validate.py --manifest "$PCA_REUSE/raw_input/manifest.json" --run "$PCA_RUN/raw_$precision" \
+        > "$PCA_RUN/raw_$precision/validation.log" 2>&1
+done
+for layout in factor transpose; do
+    python3 pca/validate.py --manifest "$PCA_REUSE/raw_input/manifest.json" --run "$PCA_RUN/raw_cpu_$layout" \
+        > "$PCA_RUN/raw_cpu_$layout/validation.log" 2>&1
+done
+python3 - "$PCA_RUN" "$PCA_REUSE" <<'PY'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+assert (root/'raw_cpu_factor/signatures.f32').read_bytes()==(root/'raw_cpu_transpose/signatures.f32').read_bytes()
+def trace(name):
+    return {x['signature_index']:(x['action'],x['closest_key'],x['replaced_key'])
+            for x in json.loads((root/name/'decisions.json').read_text())}
+f,d=trace('full_float'),trace('full_double');union=f.keys()|d.keys()
+keys_f=set(json.loads((root/'full_float/archive_keys.json').read_text()))
+keys_d=set(json.loads((root/'full_double/archive_keys.json').read_text()))
+(root/'SUCCESS.json').write_text(json.dumps(dict(validated=True,
+    fp32_vs_fp64_changed_actions=sum(f.get(i,('skip',))[0]!=d.get(i,('skip',))[0] for i in union),
+    fp32_vs_fp64_changed_decision_tuples=sum(f.get(i)!=d.get(i) for i in union),
+    archive_key_symmetric_difference=len(keys_f^keys_d),cpu_raw_double_ranks_transpose_bitwise=True,
+    reused_gpu_numerical_results=sys.argv[2],
+    continuation_reason='Original GPU numerical phase completed; its later CPU MPI phase lacked mpiprocs=4. Reused GPU results; reran only CPU transpose and independent validation.'),indent=2)+'\n')
+PY
