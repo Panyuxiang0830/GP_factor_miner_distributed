@@ -22,7 +22,7 @@
 \title{分层 PCA-QD 遗传规划因子挖掘的分布式加速\\[4pt]
 \large DSA5208 Project 3}
 \author{吴嘉蕊（A0262371J） \and 侯佳成（A0353127J） \and 潘禹翔（A0355687J）}
-\date{2026年11月14日\\[6pt]\normalsize 源代码（GitHub）：\url{https://github.com/Panyuxiang0830/GP_factor_miner_distributed}}
+\date{2026年11月15日\\[6pt]\normalsize 源代码（GitHub）：\url{https://github.com/Panyuxiang0830/GP_factor_miner_distributed}}
 
 \begin{document}
 \maketitle
@@ -735,6 +735,17 @@ $B$ & 档案数 $A$ & 手写相似度 & 库 GEMM & 库 GEMM+abs & 库加速比 \
 \end{tabular}
 \end{table}
 
+\paragraph{Roofline 对照。}
+为区分访存与算术吞吐的限制，图~\ref{fig:pca-roofline} 将 FP32 实测点与 A40 的名义上界 $\min(696\,\mathrm{GB/s}\times I,\ 37.4\,\mathrm{TFLOP/s})$ 比较，$I$ 为算术强度（每字节的浮点运算数）。批量 $B=64$ 时，GEMV 的名义强度为 $0.5$ FLOP/byte，实测约 $266.2$ GFLOP/s，对应矩阵读取量估算的有效带宽 $532.5$ GB/s，约为名义带宽的 $76.5\%$。相似度乘法实测约 $2.255$ TFLOP/s，仍低于其强度 $26.18$ FLOP/byte 对应的模型上界，手写分块内核仍有优化空间。
+
+这里的流量来自矩阵读取及最小输入输出量估算，不是 profiler 测得的 DRAM 流量；FP32 上界也不用于解释 FP64。排序另列耗时，不套用矩阵乘法的 FLOP 模型。
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.65\linewidth]{\PCAFigureDir/gpu_roofline.png}
+\caption{A40 上 FP32 GEMV 与相似度乘法的名义 Roofline 对照，批量为 8、32、64。}
+\label{fig:pca-roofline}
+\end{figure}
+
 \subsubsection{MPI + CUDA 扩展性}
 CPU 三种布局的强扩展见图~\ref{fig:pca-scaling}。低进程数时增加进程能减少时间，随后收益趋缓，部分配置回升。\code{date} 每轮的向量归约不随进程数缩短，\code{transpose} 承担重分布，\code{factor} 依赖并行读取。弱扩展中，保持每进程完整矩阵等价工作量后，时间仍增长且有波动，效率未稳定在 1 附近。
 \begin{figure}[H]
@@ -746,7 +757,70 @@ CPU 三种布局的强扩展见图~\ref{fig:pca-scaling}。低进程数时增加
 \label{fig:pca-scaling}
 \end{figure}
 
-同机双 A40 相对单卡加速 1.764 倍，日期块分给两张卡，范数与右向量通过显存 Allreduce 合并。两台机器各一卡另有正确性检查，不能用同机性能代替跨机加速比。档案规模实验固定 128 个候选；在所测大档案配置中，签名分片降低了处理时间，但每个候选仍需 MAXLOC 和顺序决定，通信限制了扩展收益。
+\paragraph{通信与排名的代价。}
+强扩展固定全部 9388 个 $293\times5876$ 的 $R$，从 1 个进程扩展至四台机器 288 个进程；三种布局各预热一次、计时三次。表~\ref{tab:pca-phases} 拆开主要阶段。日期布局从 72 到 288 个进程时，归约时间由 7.078\,s 增至 15.493\,s，局部乘法减少未能抵消归约成本。转置布局的通信转为一次重分布；直接按因子读取的布局不做这两类集合通信，但仍需汇集签名，不能将表中的零解释为完全没有通信。
+\begin{table}[H]
+\centering\small
+\caption{固定真实 $R$ 批次的阶段时间中位数，单位 s。通信列只计 Allreduce/Alltoallv，Gatherv 另列。}
+\label{tab:pca-phases}
+\begin{tabular}{lrrrrrr}
+\toprule
+布局 & 进程 & 求解 & 通信 & 汇集 & 相似度 & 准入 \\
+\midrule
+\code{date} & 72 & 11.537 & 7.078 & 0.036 & 3.148 & 1.085 \\
+\code{date} & 144 & 14.497 & 11.219 & 0.054 & 3.057 & 1.080 \\
+\code{date} & 288 & 18.262 & 15.493 & 1.118 & 3.071 & 1.084 \\
+\code{transpose} & 72 & 2.851 & 3.816 & 0.297 & 3.152 & 1.101 \\
+\code{transpose} & 144 & 1.561 & 4.718 & 0.304 & 3.130 & 1.094 \\
+\code{transpose} & 288 & 0.792 & 5.900 & 0.071 & 3.077 & 1.068 \\
+\code{factor} & 72 & 2.863 & 0.000 & 2.723 & 3.273 & 1.112 \\
+\code{factor} & 144 & 1.586 & 0.000 & 3.262 & 3.162 & 1.099 \\
+\code{factor} & 288 & 0.805 & 0.000 & 1.064 & 3.002 & 1.086 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+通信嵌套在求解或转置阶段中；各阶段还可能取自不同进程的最大值，故不能逐列相加代替总时间。相似度及准入在根进程处理，进程数增加后也不会同比缩短。
+
+另以 9216 张合成抽样值面板补测实际排名，三种布局在 72、144、288 个进程下均完成三次计时及 Python 准入核对（表~\ref{tab:pca-raw-ranking}）。例如日期布局的排名从 19.842\,s 降至 7.972\,s，但流程总时间只从 34.085\,s 降至 28.277\,s；归约成本抵消了部分排名收益。这组实验包含排名，不能与预先构造 $R$ 的计时混用。
+\begin{table}[H]
+\centering\small
+\caption{含排名的合成输入补充实验，单位 s；每格为“排名 / 总时间”的三次中位数。}
+\label{tab:pca-raw-ranking}
+\begin{tabular}{rrrr}
+\toprule
+进程 & \code{date} & \code{transpose} & \code{factor} \\
+\midrule
+72 & 19.842 / 34.085 & 19.905 / 32.907 & 16.669 / 24.116 \\
+144 & 11.921 / 27.593 & 11.962 / 20.763 & 8.064 / 14.475 \\
+288 & 7.972 / 28.277 & 7.954 / 18.660 & 4.279 / 10.876 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+弱扩展固定每进程 32 张完整矩阵的等价工作量，即 $B=32P$，$m=293$、$N=5876$，最大 $P=288$ 时处理 9216 张合成矩阵。图~\ref{fig:pca-scaling} 的弱扩展效率按 $T_1/T_P$ 计算；全局档案增长、批次与读取变化以及通信均计入总时间。
+
+\paragraph{MPI 与 OpenMP 的组合。}
+固定相同真实 $R$ 批次，每台机器使用 4 个 MPI 进程、每进程 18 线程，分别占用 72、144、288 核，三种布局共 9 个配置（图~\ref{fig:pca-hybrid}）。混合并行并非总是更快：288 核下，\code{factor} 从纯 MPI 的 5.706\,s 降至 4.797\,s，而 \code{transpose} 从 7.505\,s 增至 10.036\,s。减少进程可降低部分归约与根进程相似度计算成本，但也减少了并行读取者，并改变重分布规模，需按布局选择。
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{\PCAFigureDir/hybrid_comparison.png}
+\caption{同一真实 $R$ 批次上，纯 MPI 与每台机器 4 个进程、每进程 18 线程的比较。}
+\label{fig:pca-hybrid}
+\end{figure}
+
+同机双 A40 相对单卡加速 1.764 倍，日期块分给两张卡，范数与右向量通过显存 Allreduce 合并。两台机器各一卡另有正确性检查，不能用同机性能代替跨机加速比。
+
+\paragraph{档案规模。}
+固定 128 个候选，档案大小取 $A=1000,5000,10000,50000$，比较集中单进程与 4、16、72 个进程的签名分片，共 16 个配置；输入由固定种子生成，每组预热一次、计时三次。图~\ref{fig:pca-archive} 分别展示总时间、通信、相似度和顺序决定。
+
+集中式总时间从 $A=1000$ 时的 0.050\,s 增至 $A=50000$ 时的 2.056\,s；72 进程分片对应为 0.008\,s 和 0.997\,s。大档案下分片减少了相似度计算，但 72 进程的通信已达 0.303\,s，且相较 16 进程的 1.015\,s，总时间仅略有下降。每个候选仍要通过 MAXLOC 确定最近记录，并按顺序更新状态。决策循环本身很短，不代表这一依赖已被消除；不同阶段计时仍不可直接相加。
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.86\linewidth]{\PCAFigureDir/archive_scaling.png}
+\caption{固定 128 个候选时，档案规模对集中式与 MPI 分片归档的影响；通信包含逐候选 MAXLOC。}
+\label{fig:pca-archive}
+\end{figure}
 
 \subsubsection{签名与准入判定的一致性}
 整批 FP32/FP64 对照中，动作变化数、动作/最近 key/替换 key 三元组变化数、最终成员对称差均为 0。提供签名重放与从相同 FP32 $R$ 重算的结果也保持一致。这支持本批输入下的实现及精度选择；算法、步数和初值的变化则在下一节单独比较。
@@ -780,6 +854,47 @@ CPU/CUDA 两次运行的最终 325 个 key 相同，但数值不逐位相同：�
 
 整个校准作业包含上述重复测试与三层 GP，共用时 10 分 28 秒。该机器由其他作业共享，因此这组时间用于验证资源路线和实际衔接，不与独占机器结果直接构造扩展加速比；它与第~\ref{sec:x1}~节的 10{,}000 条固定表达式也有不同输入和计时范围。
 
+\paragraph{CPU 配置比较。}
+在独立的 CPU 配置实验中，固定同一顺序的 1000 个实际表达式，经因子引擎、RankIC、PCA 和 QD 完成一次预热及三次计时；另对每个配置运行一次种群 64、各深度一代、基因池 32 的 GP（表~\ref{tab:gp-cpu-layouts}）。16 与 72 进程在同一次 72 核分配中依次运行；144、288 进程分别使用两、四台机器。表中批次加速比以本实验的 16 进程为基准，不使用前述共享机器的 64.648\,s。
+\begin{table}[H]
+\centering\small
+\caption{相同实际表达式的批次计时与小种群 GP。批次为三次中位数，GP 为每配置单次实测。}
+\label{tab:gp-cpu-layouts}
+\begin{tabular}{rrrr}
+\toprule
+进程 & 批次 / s & 批次加速比 & GP / s \\
+\midrule
+16 & 57.874 & 1.000 & 261.382 \\
+72 & 27.932 & 2.072 & 207.670 \\
+144 & 22.504 & 2.572 & 214.603 \\
+288 & 23.727 & 2.439 & 270.163 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+固定批次以 144 进程最快，而小种群 GP 以 72 进程最快；288 进程未继续受益。四种布局的固定输入有效性判断相同，各自均通过 Python QD 重放，GP 最终成员集合也相同，但跨布局浮点结果并非逐位相同。这说明固定批次的扩展收益不能直接等同于整个进化循环的收益。
+
+\paragraph{正式规模 GP。}
+在全部 2016--2021 年进化期数据上，种群提高至 10{,}000，深度 1、2、3 各运行 10 代，基因池和父代池上限均为 2000，热启动倍数为 3。窗口仍为 1/5/10/15/20/30/60，采用每五日抽样、四步 FP64 幂迭代及随机种子 2026。运行使用 CN-161 的 16 个单线程 MPI 进程、112 GB 内存配额，并复用经输入身份核对的字段分析。
+
+30 代全部完成，进化墙钟为 53{,}114.182\,s（14.754 小时），PBS 作业总墙钟为 14 小时 45 分 47 秒。累计记录 358{,}903 次候选评价，最终档案保留 67{,}987 条记录，PCA 失败计数为 0；完成后的档案索引、质量及签名完整性检查通过。表~\ref{tab:gp-production} 列出各深度第 10 代的结果。
+\begin{table}[H]
+\centering\small
+\caption{正式 GP 各深度末代的结果。RankIC 和适应度统计针对该代的 10{,}000 个个体，档案数为跨代累计保留数。}
+\label{tab:gp-production}
+\begin{tabular}{rrrrr}
+\toprule
+深度 & 档案数 & 最佳 $|\overline{\mathrm{IC}}|$ & 平均 $|\overline{\mathrm{IC}}|$ & 平均适应度 \\
+\midrule
+1 & 20304 & 0.1101 & 0.0842 & 0.0738 \\
+2 & 45417 & 0.1160 & 0.1000 & 0.0866 \\
+3 & 67987 & 0.1236 & 0.1071 & 0.0917 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+后续深度的平均绝对 RankIC 和适应度均提高，表明本次搜索在进化期数据上获得了评分更高的种群。档案规模由质量和多样性共同决定，不等于最终可交易因子数；表中的平均值也不是整个累计档案的平均值。这次正式规模只测了 16 核配置，因此记录其实际完成时间，不据此给出完整 GP 的 CPU/GPU 或跨核数加速比。
+
 \subsection{幂迭代与 Lanczos}
 
 \subsubsection{精度与迭代次数}
@@ -797,6 +912,32 @@ CPU/CUDA 两次运行的最终 325 个 key 相同，但数值不逐位相同：�
 \includegraphics[width=0.92\linewidth]{\PCAFigureDir/convergence.png}
 \caption{幂迭代与 Lanczos 的方向误差，分别按步数（左）和矩阵向量乘次数（右）比较。}
 \label{fig:solver-convergence}
+\end{figure}
+
+表~\ref{tab:pca-spectrum} 补充真实矩阵的谱比分布。大部分矩阵的两个主方向有明显间隔，但上尾接近 1，因此不能用一个固定迭代次数保证所有矩阵同精度。
+\begin{table}[H]
+\centering\small
+\caption{9388 个真实矩阵的第二与第一奇异值比 $\sigma_2/\sigma_1$ 分位数。}
+\label{tab:pca-spectrum}
+\begin{tabular}{rr}
+\toprule
+分位数 / \% & 谱比 \\
+\midrule
+25 & 0.4707 \\
+50 & 0.5806 \\
+75 & 0.7835 \\
+90 & 0.9353 \\
+99 & 0.9927 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+受控谱实验取四个解析正交方向，以奇异值 $(1,r,0.2,0.1)$ 构造矩阵，再加入标准差为 $10^{-8}$ 的高斯噪声。$r=0.5,0.9,0.99$ 各有 8 个矩阵，共 24 个；用精确 SVD 复核加噪后的谱比，两种算法各测三个初值、1--10 步（图~\ref{fig:pca-controlled}）。这隔离了谱间隔的影响；其近似低秩结构不能代替真实因子的结果。
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.98\linewidth]{\PCAFigureDir/controlled_spectrum_convergence.png}
+\caption{控制两个主奇异值的接近程度后，两种算法的方向误差随预算变化。}
+\label{fig:pca-controlled}
 \end{figure}
 
 \subsubsection{计算代价}
@@ -915,7 +1056,7 @@ GP 可进一步研究异步稳态进化，重叠 CPU 因子计算与 GPU PCA，�
 \section{结论}
 本文将原 Python GP 的批量评价迁移到 C++，以 DAG 共享减少重复计算，以日期划分组织 MPI + OpenMP 因子引擎，并接入手写 CPU/CUDA 的 PCA、相似度和顺序 QD。原引擎固定批次从单核约 5060\,s 降至 288 核纯 MPI 的 75.0\,s；同为 288 核时，按节点线程策略的 $4\times72$ 配置达到 27.8\,s。这些收益来自本地计算减少与共享内存复用，后期则受到 halo、边界重启和不均衡限制。
 
-PCA 实验表明，排名、准备、通信和准入必须与乘法一起计时。双 A40 比单卡快 1.764 倍，但本批流程仍以 72 核 CPU 配置更快。Lanczos 在十步内达标的矩阵更多，并在共同精度集合上减少约 20.3\% 求解时间；同时，改变算法或预算会改变部分档案成员。全数据维度上的三层 GP 运行与共享 16 核校准进一步验证了因子引擎、PCA、QD、后续进化和检查点之间的衔接。
+PCA 实验表明，排名、准备、通信和准入必须与乘法一起计时。双 A40 比单卡快 1.764 倍，但本批流程仍以 72 核 CPU 配置更快。Lanczos 在十步内达标的矩阵更多，并在共同精度集合上减少约 20.3\% 求解时间；同时，改变算法或预算会改变部分档案成员。在全部进化期数据上，16 核 CPU 已完成种群 10{,}000、三个深度各 10 代的正式运行，累计评价 358{,}903 次，保留 67{,}987 条档案记录，进化墙钟为 14.754 小时。这验证了因子引擎、PCA、QD 与持续进化在正式规模下的衔接；跨设备加速比仍依据固定输入的模块实验分别报告。
 
 \section*{AI 工具的使用}
 本项目使用 Claude 和 Codex 辅助 C++ 代码生成与编译、LaTeX 论文编写，以及论文润色与中英翻译。遗传规划的原始算法和分布式并行算法的设计由组员完成；分布式算法的实验由组员与 AI 讨论后合作完成。
@@ -971,6 +1112,14 @@ python3 pca/run_gp.py --panel-dir /path/to/evolution/panels \
   --warm-start-multiplier 3 --progress-chunk 1000 \
   --windows 1 5 10 15 20 30 60
 \end{lstlisting}
+正式规模使用相同入口，将输出目录换为新的私有目录，规模与后端参数设置如下：
+\begin{lstlisting}[language=bash]
+--population 10000 --generations 10 --gene-pool 2000
+--device cpu --precision double --method power
+--sample-step 5 --steps 4 --seed 2026
+\end{lstlisting}
+其余窗口、热启动和分块参数沿用上例，对应表~\ref{tab:gp-production}~的预算。程序会依次运行三个深度；首次字段分析与复用字段缓存的准备时间应分别记录。
+
 DAG 工具、数据格式及 GP 运行的详细说明分别见 \path{docs/dag/README.md}、\path{docs/engine/data_format.md} 和 \path{pca/GP_INTEGRATION.md}。原引擎在 Vanda 上的构建、验证、实验提交及绘图命令如下：
 \begin{lstlisting}
 module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0

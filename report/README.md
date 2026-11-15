@@ -19,3 +19,5 @@ xelatex -halt-on-error -interaction=nonstopmode main_zh.tex
 ```
 
 Run another pass if LaTeX requests it to stabilise references. The author and student-ID fields remain for the project team to complete.
+
+The results include PCA module scaling through 288 CPU cores, MPI/OpenMP and one-/two-GPU measurements, Roofline and archive-size analysis, solver comparisons, and the completed 16-core production GP run (population 10,000; ten generations at each of three depths). Module timings, small-population pilots and production timing are reported separately.
