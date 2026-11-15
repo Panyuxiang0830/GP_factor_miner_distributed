@@ -97,6 +97,8 @@ set_target_properties(gpp_native PROPERTIES OUTPUT_NAME gpp_native)
 
 add_executable(gpp_bench apps/gpp_bench.cpp)
 target_link_libraries(gpp_bench PRIVATE gpp_prod)
+add_executable(gpp_values apps/gpp_values.cpp)
+target_link_libraries(gpp_values PRIVATE gpe_core_reuse)
 
 if(GPP_BUILD_TESTS)
   enable_testing()

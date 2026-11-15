@@ -1,45 +1,281 @@
-# real_product：单机 128 核 + 4×RTX 4090 的分层 GP 因子挖掘（进行中）
+# real_product：单机 128 核 + 4×RTX 4090 的分层 GP 因子挖掘
 
-> 状态：**未完成**。CPU 路径已经实现并测试过；CUDA 源文件（`cuda/*.cu`、`tests/cpp/test_gpu.cpp`）还没写，`GPP_ENABLE_CUDA` 默认 OFF。完整的时间和内存估算章节也还没写完。
+本目录是课程项目之外的一套生产流水线，目标规模：
+- 每阶段种群 100,000；
+- 深度阶段 1–5；
+- 节点上限放宽；
+- 累计 lookback 约 300 天。
 
-不改动 `report/ src/ include/ pca/ python/ dag/ scripts/`。课程的 C++ 核心（`../src/core`、`../pca/core.cpp`）以原文件编译进本目录的 CMake；Python 侧需要修改的模块复制到 `python/gpp/` 后再改（改动处标 `PROD:`）。
+演化结束后，对全部基因池和档案候选做 2022 年样本外筛选，规则与课程版相同：
+- |RankIC| ≥ 0.07，且方向与演化时一致；
+- 按质量排序，再用 0.75 阈值做贪心相关性去重。
 
-## 结构
-- `src/engine.cpp`：共享内存 DAG 引擎。OpenMP 按节点并行，窄层退回算子内并行；chunk 大小由内存预算（`memory_budget_gb`）自动决定，超预算时把表达式组二分。根节点打分融合进节点任务：每天只排序一次，同时得到 RankIC、PCA 签名行和 OOS 秩向量。
-- `src/archive.cpp`：PCA-QD 准入，语义与 `PCAQDArchive.consider_batch` 一致。FP32 粗算 GEMM 加误差界，再用 FP64 精修；每行只保留摘要，块内的顺序扫描是串行的（这是定义，见下）。
-- `src/screening.cpp`：2022 样本外筛选。所有候选并入一个 DAG，一次求值；相关性由分块乘积给出近似值，阈值带内用两遍 FP64 公式精确计算，最后按原顺序贪心扫描。
-- `src/c_api.cpp` + `python/gpp/native.py`：ctypes 进程内后端，取代原来的 mpirun/文件桥。
-- `python/gpp/`：`config.py`（深度 1–5，各阶段节点上限 3/7/11/16/21，种群 100k）、`hier_engine.py`、`selection.py`（向量化 lexicase，随机抽取与原实现相同）、`backend.py`、`screening.py`、`cli.py`、`export.py`（可选 warm-up 行）、`synthetic.py`。
-- `configs/host_*.json`：按主机内存给的预设，含 `memory_budget_gb` 和 chunk 设置。`scripts/`：build、smoke、export、full、bench。
+**约束：** `report/ src/ include/ pca/ python/ dag/ scripts/` 一个文件都没改。
+- 课程的 C++ 核心（`../src/core/*.cpp`、`../pca/core.cpp`）由本目录的 CMake 直接以原文件编译复用。
+- Python 侧需要修改的模块复制到 `python/gpp/` 后再改，改动处标 `PROD:`。
 
-## 验证（本机 macOS、单线程、无 CUDA）
-- C++ `ctest`：引擎结果与课程串行引擎逐位一致（不限预算、紧预算、chunk=3 三种情况）；QD 决策与 `pca::Archive` 完全一致。
-- pytest `tests/python`：14 个测试，13 个通过。
-  - **因子值 / RankIC / 适应度 / 签名**：参照是课程 Python 算子，但每个节点的输出都舍入到 float32（C++ 面板就是 float32 存储），这样逐项一致（约 1e-17）。和原始 float64 pandas 相比：深度 ≤2 完全一致，深度 3–4 约有 2–11% 的表达式均值 RankIC 相差最多 3e-5。
-  - **截面常数日**：某天的截面完全是常数时，C++ 返回 NaN（数学上的定义值）。pandas 这时会给出 NaN 或 1e-16 的舍入残差，取决于 N 和求和的内存布局，所以没有办法逐位复现。参照里对这种日也取 NaN。
-  - **QD 准入**：与 Python 逐项一致（block 1/16/4096，且测了重新同步的情况）。
-  - **OOS 筛选**：sample_step 5/20、带 limit 的情况下，两个 CSV 逐行一致。和未修改的 pandas 相比，3 组种子 × 2 种步长的入选因子全部相同，|ΔIC| ≤ 6.6e-4。
-  - **lexicase**：随机抽取与原实现完全相同。
-  - **gpp.hier_engine（纯 Python 路径）与课程引擎**：深度 1–3 结果完全一致。
-  - **CLI smoke（深度 1–5 + 筛选）**：跑通。
-  - **未通过：`test_native_backend_equals_python_path`**。加入 `-ffp-contract=off` 之前这个测试是通过的，之后失败，还没定位原因。
-- 未验证：OpenMP 多线程（本机没有 libomp），以及全部 GPU 代码。
+> 本文的时间都是**推算**，依据课程实测（`report/main_zh.tex` §6、`report/progress.md`）加上本机的少量测量，推导过程逐条写在 §5。目标机器上的实测命令见 `scripts/bench.sh`。
 
-## 待办
-1. 定位上面那个失败的测试。
-2. 写 `cuda/gpu_scorer.cu`。设计：
-   - 每天一个 block，用 cub BlockRadixSort 排序；
-   - 平均秩通过 heads/tails 标记加 max-scan 得到；
-   - Pearson 求和与幂迭代的点积都用和 CPU 相同的串行顺序，配合 `--fmad=false`，目标是和 CPU 逐位一致；
-   - 每个 GPU 4 条 stream，pinned 暂存区。
-3. 写 `cuda/gpu_products.cu`：
-   - QD 的 SGEMM tile 回传主机，交给 `SummaryBuilder` 生成摘要；
-   - 筛选的六个对和用 DGEMM。
-   并在服务器上跑 `test_gpu.cpp`，和 CPU 逐位比对。
-4. 补全内存/显存预算和时间估算（依据 `report/main_zh.tex` §6、`report/progress.md`）：
-   - 串行 10k 表达式 5060 s，其中 RankIC 3522 s；
-   - 4×72 核 27.8 s；
-   - 一个面板 34.3 MB，字段 4.3 GB；
-   - 按 RankIC 约占 70% 推算，每代 130k 个根：CPU 打分约 0.35 核·s/根，约 355 s/代；GPU 受 PCIe 限制，约 1.4 ms/面板，约 45 s/代（4 卡）。这些是推算，不是实测。
-   - 24 GB 显存放不下因子面板：扣掉约 4.5 GB 字段后只够约 500 个面板。所以算子留在 CPU，GPU 只做打分。
-   - QD 准入本身是串行的：记录 i 必须看到 0..i-1 的决定，只有块内的相似度乘积能并行。
+---
+
+## 1. 快速开始
+
+```bash
+scripts/build.sh                                   # 有 nvcc 时自动开 CUDA
+scripts/run_smoke.sh /tmp/gpp_smoke                # 合成数据，深度 1–5 + 筛选，检查连通性
+scripts/export_data.sh EOD_FILE LABEL_FILE /data/gpp 0     # 导出 2016–2021 / 2022 面板（只需一次）
+scripts/run_full.sh /data/gpp /data/gpp_run configs/host_512g.json
+```
+
+- **断点续跑：** 中断后用同一个输出目录重跑，会从 `eval/run_*/run_state.pkl` 继续。
+- **主机内存不同：** 换一份 `configs/host_*.json`（§4）。
+- **临时覆盖参数：** 用命令行，例如 `--threads 96 --gpus 2 --memory-budget-gb 300 --stage-depths 1 2 3 4`。
+
+## 2. 目录
+
+| 路径 | 内容 |
+|---|---|
+| `src/engine.cpp` | 共享内存 DAG 引擎：节点并行，按内存预算决定 chunk、分组，根节点打分融合 |
+| `src/scoring.cpp` | 融合打分：每天只排序一次，同时得到 RankIC、PCA-QD 签名行、OOS 秩向量 |
+| `src/archive.cpp` | PCA-QD 档案，决策与 `PCAQDArchive.consider_batch` 一致，面向 10^5–10^6 个成员 |
+| `src/screening.cpp` | 2022 筛选：统一 DAG，分块乘积，串行贪心扫描 |
+| `src/c_api.cpp`、`python/gpp/native.py` | ctypes 进程内接口（替代 mpirun 加每块读写文件的桥） |
+| `cuda/gpu_scorer.cu` | GPU 根节点打分（RankIC + 签名），目标是与 CPU 逐位一致 |
+| `cuda/gpu_products.cu` | QD 的 SGEMM 粗算 tile；筛选的 FP64 DGEMM 对和 |
+| `python/gpp/config.py` | `ProductionGPConfig`：深度 1–5，各阶段节点上限 3/7/11/16/21，种群 100k，新增引擎和 GPU 参数 |
+| `python/gpp/hier_engine.py` | 课程 `hierarchical_engine` 的副本，改了 `PROD:` 处：深度 1..5、分阶段上限、检查点节流、向量化 lexicase |
+| `python/gpp/selection.py` | epsilon-lexicase：每代只建一次矩阵，随机数抽取与原实现完全相同 |
+| `python/gpp/backend.py` | 实现 `CppGPBackend` 协议的进程内后端（evaluate + QD 准入） |
+| `python/gpp/screening.py` | 原生筛选，输出与 Python 相同的 CSV 和 `ScreenedFactor` |
+| `python/gpp/cli.py`、`export.py`、`synthetic.py` | 端到端运行、导出（可选 warm-up）、合成数据 |
+| `apps/gpp_bench.cpp`、`apps/gpp_values.cpp`、`apps/driver_overhead.py` | 基准与规划器；导出课程引擎的因子值；Python 驱动开销测量 |
+| `configs/`、`scripts/` | 按主机内存分的预设；构建、导出、运行、基准脚本 |
+| `tests/cpp`、`tests/python` | 与课程实现的逐项对照测试（§6） |
+
+## 3. 架构：各阶段怎样并行
+
+```
+Python 驱动 (gpp.hier_engine) ── 提案/变异/lexicase/缓存/检查点 ── 串行，单进程
+        │  每批 ≤ progress_chunk_size 条表达式（ctypes，内存中传递）
+        ▼
+libgpp_native  Engine
+   字段常驻 (132 × 34.3 MB = 4.3 GB) + 目标秩 (T×N double)
+   ├─ 规划：hash-consing DAG；超预算时按子节点 id 排序后二分成组（组内共享基因）
+   ├─ 每组逐层执行（OpenMP 一个线程组，128 线程）
+   │    宽层：按节点并行，schedule(dynamic,1)；每块 chunk 个节点，chunk 由预算自动决定
+   │    窄层（任务数 < threads/4）：退回算子内并行
+   │    根节点算完就在同一个任务里打分；引用计数归零立即释放 → BufferPool 复用
+   ├─ 打分：CPU 线程内做 (score_root)，或提交到 GPU（4 卡 × 4 条 stream）
+   └─ 返回统计、签名、标志
+        ▼
+QdArchive (native)：分块 FP32 GEMM 摘要（CPU 或 GPU）→ 串行准入扫描 + FP64 精修
+        ▼
+演化结束 → 全部基因池 + 档案 → screen_factors：
+   统一 DAG 一次求值（RankIC + 抽样秩向量）→ 质量排序 → 分块对和 GEMM → 串行贪心扫描
+```
+
+### 3.1 因子计算（CPU，OpenMP 共享内存）
+- 课程实测：单机 72 线程按节点并行 89.2 s，72 进程 142.7 s，因为线程不需要 halo，也没有块边界重启。单机上按节点并行是最优方案，本引擎沿用。
+- 窄层（例如深度 1 阶段只有 132 个字段节点）任务数不足，退回课程的算子内并行。
+- **chunk 选择：** 规划器 `Engine::simulate_peak` 先模拟逐层分配和释放，在预算内取最大的 chunk（上限 `engine_max_chunk`）。即使 chunk 取最小值也装不下时，把表达式组按子节点排序后二分，直到每组都可行。分组的代价是共享的基因要重复计算（§5.1 有实测）。
+- **结果与分组无关：** 不限预算、紧预算（9 组）、chunk=3 三种情况下，结果都与课程串行引擎逐位一致（`tests/cpp/test_engine.cpp`）。
+
+### 3.2 RankIC 与签名（融合打分，CPU 或 GPU）
+- **融合：** 课程流程里 RankIC 要每天排序一次，PCA 桥再读回面板重新排序一次。现在每个根节点每天只排序一次：同一组秩同时给出每日 RankIC、签名行（NaN→0.5，按行去均值）和 OOS 抽样秩向量。
+- **GPU 打分（`cuda/gpu_scorer.cu`）：**
+  - 工作线程把算完的根面板 memcpy 到 pinned 暂存槽（4 卡 × 4 槽），在该槽的 stream 上异步发起 H2D 和核函数后立刻返回，下一个算子与传输、GPU 计算重叠。
+  - 每天一个 block：`cub::BlockRadixSort` 在共享内存里排序（N ≤ 6144），平均秩由 head/tail 标记加 max-scan 得到，结果是精确的。
+  - Pearson 求和、签名行均值、幂迭代（pca::solve power）的每一个归约，都按 CPU 代码的同一顺序串行执行（每个和一个线程）；GPU 用 `--fmad=false`，CPU 用 `-ffp-contract=off`。**设计目标是与 CPU 逐位一致**。为此付出的代价很小，因为这些归约远短于排序和 PCIe 传输。
+  - 回传只有 T 个 double、一个计数和 m 个 double。
+  - 课程已知的瓶颈是读数据和排序，不是 GEMV（纯 GEMV 内核 1.09 s，单 A40 整批却要 64.8 s）。这里全程不碰磁盘，面板从引擎内存直接上传，排序在共享内存里完成。
+
+### 3.3 PCA-QD 准入（串行，原因和上限见 §5.4）
+- 按定义，记录 i 必须看到 0..i-1 的全部准入和替换。能并行的只有：一个块（默认 4096 个候选）对块开始时档案快照的粗算相似度。这是一个 GEMM，CPU 用 OpenMP，GPU 用 cuBLAS SGEMM（关闭 TF32）。
+- GEMM 之后每个候选只保留一份摘要，而不是整行：
+  - top-K 下界；
+  - 可能影响最大值的条目；
+  - 阈值带内的条目；
+  - 确定超过阈值的条目（有上限，超出时回退）。
+- 串行扫描对每个候选只需处理 O(摘要 + 块内成员) 个条目，并对 Python 会精修的那些比较做 FP64 精修。摘要失效时回退到完整精确重算，所以决策与 K 和块大小都无关。
+- Python 原实现是按 key 逐个循环，复杂度 O(C·A)；在 100k 规模下，这正是需要换掉的部分。
+
+### 3.4 2022 样本外筛选（`src/screening.cpp`）
+1. 所有候选（去重后）合成一个 DAG，**只求值一次**，同时得到 RankIC 和 |IC| ≥ 阈值者的抽样秩向量。Python 版每个合格因子要求值两次（验证一次，相关性一次）。
+2. 按与 Python 相同的键排序：(-|IC₂₀₂₂|, -|IC_evo|, nodes, key)。
+3. 分块：当前块对已选集合和块内成员计算 6 个掩码对和（n, Σx, Σy, Σx², Σy², Σxy，平移 0.5 后计算），CPU 用 FP64，GPU 用 DGEMM（可选 `gpu_products`）。
+4. 串行贪心扫描：近似相关落在阈值 ±band 或行最大值 ±2·band 之内的配对，用 Python 的两遍 FP64 公式精确重算。最大值并列时取最早选入者（严格改进规则）；`limit` 在每一项之前检查。逐项对照见 §6。
+
+## 4. 内存与显存预算
+
+| 项 | 大小 | 依据 |
+|---|---|---|
+| 一个面板 | T×N×4 = 1461×5876×4 = **34.3 MB** | 课程数据 |
+| 字段（常驻） | 132 × 34.3 MB = **4.3 GB** | `docs/engine/data_format.md` |
+| 目标秩（double） | 68.7 MB | |
+| 每线程打分 scratch | 签名矩阵 m×N double，m = ⌈1461/5⌉ = 293 → 13.8 MB × 128 = 1.8 GB | |
+| 中间面板峰值 | budget_panels × 34.3 MB | 规划器 |
+| Python 驱动 | 约 10–20 GB：表达式缓存（全程约 6×10⁶ 个 Candidate）、种群和基因池、档案签名；检查点 pickle 时瞬时翻倍 | §5.3 有实测 |
+| 筛选面板 | 242 天 × 132 字段 ≈ 0.75 GB；秩向量只保留合格因子（step 20 时每个 76k float） | |
+
+规划器在 T=1461、N=5876、100,000 条深度 5 表达式（每层 20,000 个基因）上的实测（本机，`gpp_bench --plan-only`）：
+
+| 预算 | 可用面板 | 组数 | DAG 节点（含重复计算） | 相对不分组的重复计算 |
+|---|---|---|---|---|
+| 不限 | — | 1 | 125,948（峰值 30,954 个面板 = 1.06 TB） | — |
+| 80 GB | 2,447 | 33 | 193,825 | +54% |
+| 180 GB | 5,574 | 12 | 179,815 | +43% |
+| 400 GB | 12,453 | 4 | 159,122 | +26% |
+| 850 GB | 26,524 | 2 | 143,041 | +14% |
+
+推荐配置（`configs/`）：
+
+| 主机内存 | 预设 | memory_budget_gb | engine_max_chunk | 说明 |
+|---|---|---|---|---|
+| 128 GB | `host_128g.json` | 80 | 1000 | 可以跑，但重复计算约 +54%，算子时间按此比例增加 |
+| 256 GB | `host_256g.json` | 180 | 2000 | 课程 chunk 2000、72 线程的峰值 138 GB 也在此范围内 |
+| 512 GB | `host_512g.json`（推荐） | 400 | 4000 | 4 组，+26% |
+| 1 TB | `host_1t.json` | 850 | 8000 | 2 组，+14% |
+| 无 GPU | `cpu_only_256g.json` | 180 | 2000 | 打分在 CPU 线程上做 |
+
+预算的含义：总内存减去字段、Python 驱动和约 15% 的余量（留给 OS 和页缓存）。
+
+### 4.1 显存：因子面板能不能放进 24 GB？
+- 24 GB 扣掉常驻字段 4.3 GB，还能放约 (24 − 4.3 − 1) / 0.0343 ≈ **540 个面板**。规划器给出的峰值是 12k–31k 个面板，差两个数量级，所以**不能**把整个 DAG 放到 GPU 上算。
+- 若改成逐层流式上传：每个算子节点要搬 2–3 个 34 MB 的面板，PCIe 4.0 x16 实际约 22 GB/s，即每个节点约 4 ms。159k 个节点分到 4 卡约 160 s/代，与 CPU 算子时间（§5.1 约 213 s/代）相当，却要另写全部算子的 GPU 版本，不划算。
+- 所以算子留在 CPU，GPU 只做打分。打分每个根节点只需上传 1 个面板，而且排序正是它的主要成本。
+- 打分时的显存占用（每卡）：目标秩 69 MB；每个槽 = 面板 34 MB + R、Rᵀ（double）27.6 MB + 小向量，4 槽约 250 MB；QD tile（8192 × 4096 float）134 MB；筛选 DGEMM tile 约 0.5 GB。**合计 < 1 GB/卡**，远低于 24 GB。
+- 每天一个 block 用约 30 KB 静态加 N×8 = 47 KB 动态共享内存（需要 opt-in，sm_89 上限 99 KB），所以 N 上限是 6144。
+
+## 5. 时间估算（推导）
+
+单位换算全部基于课程批次：10,000 条深度 2 warm-start 表达式，12,083 个 DAG 节点，T=1461，N=5876。
+
+| 课程实测 | 数值 | 来源 |
+|---|---|---|
+| 串行单核整批 | 5060 s，其中算子 1536 s、RankIC 3522 s | main_zh.tex §6、progress.md |
+| 单机 72 线程按节点并行 | 89.2 s（加速 56.7，效率 0.79） | main_zh.tex |
+| 4×72 核按节点并行 | 27.8 s | main_zh.tex |
+| 纯 GEMV 内核 / 单 A40 PCA 整批 / 72 核 CPU PCA | 1.09 s / 64.8 s / 13.4 s | main_zh.tex |
+| 顺序准入占 PCA 流程的比例 | CPU 8.12%，单 A40 1.48%，双 A40 2.64% | main_zh.tex |
+
+推导出的单位成本（按课程机器的单核速度）：
+- 算子：1536 s / 11,951 个算子节点 = **0.129 核·s/节点**；
+- RankIC：3522 s / 约 10,000 个根 = **0.352 核·s/根**；
+- 签名：融合后多出的部分是每 5 天一行的去均值，加 293×5876 的 4.5 次幂迭代（约 1.6×10⁷ flop），每根约 10 ms，可以忽略。
+
+本机（Apple 笔记本单核，深度 2 合成批次，300 根 / 454 节点，含融合签名）测得 266 s，即 0.59 s/节点，与课程的 (1536+3522)/12083 = 0.42 s/节点同一量级。
+
+### 5.1 每代（100k 个新表达式）
+取 512 GB 预设：159k 个 DAG 节点、约 100k 个根，并行效率按课程的 0.75，即 128 核约等于 96 个有效核。
+
+| 部分 | CPU-only | 4×4090 打分 |
+|---|---|---|
+| 算子 | 159k × 0.129 = 20.5k 核·s → **213 s** | 213 s（不变） |
+| RankIC + 签名 | 100k × 0.352 = 35.2k 核·s → **367 s** | GPU 每根约 max(PCIe 34 MB/22 GB/s ≈ 1.6 ms，排序约 1.3 ms) → 100k / 4 卡 × 1.6 ms ≈ **40 s**，与算子重叠；外加 CPU 端 memcpy 到暂存区约 4 ms/根 = 400 核·s → 4 s |
+| QD 粗算 GEMM + 摘要 | 约 8×10⁴ 个候选 × 档案 5×10⁴ × 293 ≈ 1.2×10¹² FMA；按 §5.3 实测单核约 1.25×10⁹ FMA/s（含摘要），96 有效核 → **约 10 s** | SGEMM < 1 s，主机端摘要（OpenMP 按行）约数 s，未实测 |
+| QD 串行扫描 | 实测约 3 µs/候选 → 8×10⁴ 个候选 **< 0.5 s**（§5.4） | 同左 |
+| Python 驱动（串行） | §5.3 实测外推：**约 140–165 s/代** | 同左 |
+| **合计（不含驱动）** | **约 590 s ≈ 10 min/代** | **约 220–260 s ≈ 4 min/代** |
+| **合计（含驱动）** | **约 12–13 min/代** | **约 6–7 min/代** |
+
+缓存命中会让实际新表达式少于 100k（课程运行里重复表达式占不小的比例），所以以上偏保守。128 GB 主机上算子部分 ×1.22（194k/159k 个节点）。
+
+### 5.2 全程
+- 每阶段：warm start 3×100k，加上 10 代 × 100k，约等于 13 个"代当量"。5 个阶段共 65 个代当量。
+- 深度 1 阶段很便宜（不同的表达式少，DAG 浅）；深度 5 阶段的 DAG 每条表达式节点数更多（实测深度 5 批次为 1.26–1.94 个节点/条，取决于预算）。两者大致抵消，按平均估。
+
+| 配置 | 演化 | 2022 筛选 | 全程 |
+|---|---|---|---|
+| 128 核 CPU-only，512 GB | 65 × 590 s ≈ 10.7 h，加驱动约 3.6 h → **约 14 h** | 约 3 min | 约 14 h |
+| 128 核 + 4×4090，512 GB | 65 × 240 s ≈ 4.3 h，加驱动约 3.6 h → **约 8 h** | 约 3 min | 约 8 h |
+| 128 核 + 4×4090，128 GB | 算子 ×1.22 → 约 5 h，加驱动 → **约 9 h** | 约 3 min | 约 9 h |
+
+**筛选的推导：**
+- 候选数 ≤ 5 个基因池 × 20k + 档案（约 5×10⁴），共约 1.5×10⁵ 条。
+- T=242，单位成本按 242/1461 缩放：RankIC 0.058 核·s/根，算子 0.021 核·s/节点 → 1.5×10⁵ × (0.058 + 1.5×0.021) ≈ 1.3×10⁴ 核·s → **约 140 s**。
+- 对和：设合格 E ≈ 2×10⁴、最终选中 S ≈ 2×10³，则配对数约 E·S/2 = 2×10⁷。step 20 时向量长 13×5876 = 76k，6 个 FP64 和合计约 9×10¹² FMA，128 核约 5–10 s；step 5 时向量长 4 倍。
+- 对照：原 Python 版要对每个合格因子求值两次，并做 O(E·S) 次 numpy 相关（每次约 0.2 ms），单线程约 1 h 以上。
+
+### 5.3 Python 驱动开销（实测）
+驱动开销用 `apps/driver_overhead.py` 测量：评估后端换成瞬时返回的假后端（随机统计量，签名维数 293），QD 用真实的 NativeArchive。测到的墙钟就是留在 Python 里的那部分：提案、变异、规范化、缓存、lexicase、档案簿记和检查点。
+
+实测（本机 MacBook，单进程；该机没有 OpenMP，所以 QD 的 GEMM/摘要也是单线程）：种群 5000、gene/parent pool 1000、阶段 1–2、每阶段 warm start + 1 代，签名取 400 个聚类中心加噪声（随机独立签名会让档案无限膨胀，不像真实数据）。
+
+| 量 | 数值 |
+|---|---|
+| 墙钟 | 496 s |
+| 假评估（造 Candidate 和签名） | 13.4 s |
+| QD 合计 | 353.9 s，其中**可并行的相似度（GEMM + 摘要）351.9 s**，**串行准入 0.74 s** |
+| 评估过的表达式 | 217,599；档案最终 11,196 条 |
+| 候选进入准入 / FP64 精修 | 247,637 / 248,757；回退到全量扫描 1 次 |
+| Python 驱动（墙钟 − 假评估 − QD） | 128.7 s，约 **0.59 ms/条已评估表达式** |
+
+按事件拆开（驱动时间 = 区间墙钟 − 区间假评估 − 区间 QD）：
+
+| 事件 | 驱动时间 |
+|---|---|
+| 阶段 1 warm start | 51.6 s |
+| 阶段 1 第 1 代 | 6.9 s |
+| 阶段 2 warm start | 61.1 s |
+| 阶段 2 第 1 代 | 8.1 s |
+
+外推到种群 100k（线性放大 20 倍）：
+- 每代约 140–165 s，每阶段 warm start 约 1000–1200 s；
+- 5 个阶段 × (warm start + 10 代) ≈ 5 × (1100 + 1500) s ≈ **3.6 h**。驱动与评估不重叠（驱动等评估结果，评估等驱动的下一批），所以这 3.6 h 直接加到 §5.2 的总时间上。
+
+注意：
+- 这是笔记本单线程的数字，服务器单核通常更慢一点（0.7–1×），驱动时间可能偏乐观；
+- 签名是人造的聚类数据，真实档案的规模和精修比例会不同；
+- 线性外推忽略了缓存字典变大带来的超线性开销。
+
+### 5.4 QD 准入为什么只能串行，上限在哪里
+- 准入是一个顺序决策过程：记录 i 是否准入、替换谁，取决于 0..i-1 留下的档案状态。同一块里，前面的候选准入后会改变后面候选的最近邻。这不是实现上的限制，而是 `consider_batch` 的定义，改成并行就会改变结果。
+- 能做的是把每个候选的串行工作压到 O(摘要 + 块内已准入成员)，把 O(档案大小) 的部分全部移进可并行的 GEMM。
+- 由 Amdahl 定律，总加速 ≤ [f + (1−f)/q]⁻¹，其中 f 是串行部分所占比例。课程测得在 PCA 流程内 f 为 1.48–8.12%；新流程中实测串行准入约 3 µs/候选（24.8 万个候选共 0.74 s，而同一次运行里可并行的相似度部分是 352 s），每代 < 0.5 s，占 GPU 模式一代（约 240 s 计算 + 约 150 s 驱动）的 0.1%。所以准入不再是瓶颈。
+- 真正的串行余量是 Python 驱动（§5.3）：GPU 模式下每代约 150 s / 390 s，f ≈ 0.4，Amdahl 上限只有约 2.6×。下一步若要再提速，应把 warm start 提案、变异、规范化和缓存搬进 C++，而不是去动准入。
+
+## 6. 与现有实现的一致性（测试）
+
+```bash
+scripts/build.sh                                        # 含 ctest
+PYTHONPATH=python:../python/src python3 -m pytest tests/python
+```
+
+本机（macOS、无 OpenMP、无 CUDA）结果：ctest 2/2 通过，pytest 15/15 通过。
+
+| 项 | 参照 | 结果 |
+|---|---|---|
+| 引擎 vs 课程串行引擎（C++） | `gpe::evaluate_serial` + `gpe::daily_rank_ic` + `score_factor` + PCA 桥的签名路径 | 不限预算、紧预算、chunk=3 三种情况都**逐位一致** |
+| 因子值 | 课程 Python 算子（`gpp_values` 导出课程 C++ 引擎的面板） | NaN 位置完全相同；≥50% 的表达式逐位一致；其余每个表达式 ≥99% 的元素相对差 ≤1e-5（几个 float32 ulp，见下） |
+| RankIC / 适应度 / 分段 IC / 签名 | Python `_evaluate` + `factor_signature`（float32 节点语义，见下） | 200 条深度 1–5 表达式：统计量差 ≤1e-9（实测约 1e-17）；签名差 ≤2e-5 |
+| QD 准入 | `PCAQDArchive.consider_batch`（cpu） | block 1/16/4096，4 批 + 重同步：动作、closest、replaced、相似度、记录顺序全部一致 |
+| OOS 筛选 | `screen_hierarchical_factors` | sample_step 5/20、有/无 limit、0.02 与 0.07 两个阈值：两份 CSV 逐行一致，入选列表相同 |
+| lexicase | `_epsilon_lexicase` | 250 个种子，选中的表达式和 RNG 状态都相同 |
+| gpp.hier_engine（纯 Python 路径）vs 课程引擎 | `gp_factor_miner.hierarchical_engine`，深度 1–3 | 基因池、档案、评估数、QD 历史完全一致 |
+| 原生后端整轮演化，深度 1–5 | Python 路径 | 统计量：除 beta 例外（见下）外差 ≤1e-14；把原生统计量喂给 Python 路径后，整条轨迹完全一致 |
+| CLI 冒烟，深度 1–5 + 筛选 | — | 全部输出文件齐全 |
+| GPU vs CPU（`tests/cpp/test_gpu.cpp`） | CPU 路径 | **本机无法编译和运行**，需在 4090 主机上跑：打分与 CPU 逐位比较，QD 决策比较，对和比较 |
+
+**已知差异（都来自课程现有实现，本目录没有引入新的差异）：**
+1. **float32 存储。**
+   - 课程 C++ 引擎每个节点的输出存为 float32，pandas 全程 float64。
+   - 舍入会制造或打破截面上的并列：深度 ≤2 完全一致，深度 3–4 约 2–11% 的表达式均值 RankIC 差最多 3e-5。
+   - 课程引擎把 `pct_change` 也放在 float32 里算（`src/core/operators.cpp:342`）。
+   - 测试参照因此取"Python 算子 + 每个节点舍入到 float32"。与未修改的 pandas 相比：3 组种子 × 2 种步长的筛选入选完全相同，|ΔIC| ≤ 6.6e-4。
+2. **截面常数日。**
+   - 某天配对有效的截面是常数时，C++ 返回 NaN（数学上的定义值）。pandas 会返回 NaN 或 1e-16 的舍入残差，取决于 N、求和布局以及是否装了 bottleneck，两种情况大约各占一半，任何 C++ 规则都无法逐位复现。
+   - 2022 面板窗口从头开始，所以 `x − mean(x,w)` 一类的表达式第 1 天都是常数日：均值相对变化约 1/242，只有 |IC| 恰好在 0.07±0.0003 附近时才可能翻转筛选结果。
+   - 测试参照对常数日取 NaN。
+3. **beta 的协方差残差。** 窗口内 beta 的第一个输入是常数时，课程 C++ 的协方差留下约 1e-16 的残差，pandas 给出精确的 0。截面上大量的 0 因此被重新排序：一轮 600 多个候选里有 2 个，RankIC 差约 5e-6。
+4. **1e-17 量级的差。** 均值求和顺序不同（numpy pairwise vs C++ 顺序求和）。整轮演化迟早会因此翻转一个近似并列，所以整轮测试分两步验证（见上表）。
+
+**warm-up（可选，默认关闭）：**
+- 课程语义下，2022 筛选面板只有 2022 年的行，窗口从 1 月第一天重新开始。
+- `scripts/export_data.sh … 300` 会在前面补 300 个 2021 交易日作为历史，`meta.json` 写入 `score_begin=300`：RankIC 和秩向量仍只覆盖 2022，但长窗口因子在年初就有完整历史。
+- 这会**改变**结果，不再与课程逐项一致，所以默认为 0。
+- 5 层、每层 60 天窗口叠加，最长 lookback 为 300 天。单机不需要 halo；演化期 1461 天也足够长。
+
+## 7. 没有验证的部分
+- **OpenMP 多线程：** 本机没有 libomp，所有测试都是单线程跑的。并行正确性由课程 72 线程的验证和结果与分组无关的测试间接支持，仍需在目标机上跑一次 `ctest` 和 pytest。
+- **全部 CUDA 代码**（`cuda/*.cu`、`tests/cpp/test_gpu.cpp`）：本机没有 nvcc，只对 `test_gpu.cpp` 做了语法检查。首次在 4090 主机上构建时，请先跑 `build/test_gpp_gpu`。若 GPU 打分与 CPU 有任何不一致，这一项测试会失败；此时先用 `cpu_only` 预设，结果仍正确，只是更慢。
+- **时间数字：** 全部是由课程机器的单核成本推算的。4090 主机的 CPU 型号、PCIe 拓扑和内存带宽未知，用 `scripts/bench.sh` 实测后替换。

@@ -125,6 +125,17 @@ void SummaryBuilder::close(RowSummary& r, int K) {
     pool.clear();
 }
 
+void summaries_add_tile(const SummaryInputs& in, const float* values, int c0, int ncols,
+                        std::vector<SummaryBuilder>& builders, std::vector<RowSummary>& out) {
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (int i = 0; i < in.rows; ++i) {
+        if (!in.left_valid[i]) continue;
+        const float* row = values + static_cast<size_t>(i) * ncols;
+        for (int c = 0; c < ncols; ++c)
+            if (in.right_alive[c0 + c]) builders[i].add(in, i, c0 + c, std::fabs(row[c]), out[i]);
+    }
+}
+
 void cpu_summaries(const SummaryInputs& in, std::vector<RowSummary>& out) {
     out.assign(in.rows, RowSummary());
     #pragma omp parallel for schedule(dynamic, 1)

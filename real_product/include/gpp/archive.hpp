@@ -86,6 +86,10 @@ struct SummaryBuilder {
     void add(const SummaryInputs& in, int row, int col, float value, RowSummary& out);
     void close(RowSummary& out, int top_k);
 };
+// Feeds one tile of coarse values (rows x ncols, row-major, columns
+// c0..c0+ncols-1, not yet absolute) to every valid row, rows in parallel.
+void summaries_add_tile(const SummaryInputs& in, const float* values, int c0, int ncols,
+                        std::vector<SummaryBuilder>& builders, std::vector<RowSummary>& out);
 
 // Float32 normalization (centered, unit L2) and its distance to the FP64
 // normalization, as _normalized_matrix / _normalization_error_bounds.

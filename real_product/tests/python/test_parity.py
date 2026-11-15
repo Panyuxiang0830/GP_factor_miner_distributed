@@ -280,3 +280,40 @@ def test_lexicase_identical_draws():
     assert _check_equivalence(scored, seeds=range(200))
     assert _check_equivalence(scored, seeds=range(50), epsilon_scale=0.5)
     assert LexicaseSelector([(c, None) for c, _ in scored if not c.segment_rank_ics]).survivors == []
+
+
+# -- factor values ---------------------------------------------------------------
+
+def test_factor_values_match_python(native_lib, evolution_panels, float32_reference, tmp_path):
+    """Root panels of the C++ operators (gpp_values) vs the Python operators."""
+    import json
+    import subprocess
+
+    binary = native_lib.library_path().parent / "gpp_values"
+    if not binary.exists():
+        pytest.skip("gpp_values not built")
+    panel_dir, frames, _ = evolution_panels
+    expressions = [normalize_expression(e) for e in hierarchical_expressions(30, seed=17)]
+    (tmp_path / "e.json").write_text(json.dumps(expressions))
+    (tmp_path / "out").mkdir()
+    subprocess.run([str(binary), str(panel_dir), str(tmp_path / "e.json"), str(tmp_path / "out")], check=True)
+    exact = compared = 0
+    for i, expression in enumerate(expressions):
+        path = tmp_path / "out" / f"{i}.f32"
+        if not path.exists():
+            continue
+        native = np.fromfile(path, dtype="<f4").reshape(frames["close"].shape).astype(np.float64)
+        python = evaluate_expression(expression, frames).to_numpy(np.float64)
+        compared += 1
+        assert (np.isnan(native) == np.isnan(python)).all(), expression
+        both = ~np.isnan(native)
+        scale = np.maximum(1.0, np.abs(python[both]))
+        gap = np.abs(native[both] - python[both]) / scale
+        if gap.size == 0 or gap.max() == 0.0:
+            exact += 1
+        else:
+            # A few float32 ulps (zscore/std accumulate differently); a later
+            # pct_change or division by a near-zero value can amplify them
+            # locally, and beta keeps its covariance residue (test_evolution).
+            assert np.mean(gap <= 1e-5) >= 0.99, (expression, float(np.mean(gap <= 1e-5)))
+    assert compared > 100 and exact >= 0.5 * compared
