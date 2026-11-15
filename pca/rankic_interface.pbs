@@ -1,0 +1,28 @@
+#!/bin/bash
+#PBS -q auto
+#PBS -N pca_rankic_iface
+#PBS -j oe
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:ngpus=1:mem=16gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set a new private output directory}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON -DPCA_ENGINE_BENCH=ON
+cmake --build "$build" -j 2 --target pca_rankic_test pca_gpu_test
+export OMP_NUM_THREADS=1
+"$build/pca_gpu_test" "$PCA_RUN/existing_gpu_tests.json"
+extra=()
+if [[ -n "${PCA_REAL_SIZE:-}" ]]; then
+    read -r rows cols < <(python3 - "$PCA_REAL_SIZE" <<'PY'
+import json,sys
+from pathlib import Path
+x=json.loads((Path(sys.argv[1])/'source.json').read_text());print(2*x['T'],x['N'])
+PY
+)
+    extra=(--raw "$PCA_REAL_SIZE/raw_first2.f32" --rows "$rows" --cols "$cols")
+fi
+"$build/pca_rankic_test" --out "$PCA_RUN/SUCCESS.json" "${extra[@]}"
+touch "$PCA_RUN/SUCCESS"

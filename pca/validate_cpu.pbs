@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_validate
+#PBS -j oe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=8:mpiprocs=8:mem=24gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_MANIFEST:?set PCA_MANIFEST to a prepared manifest.json}"
+: "${PCA_RUN:?set PCA_RUN to a new output parent}"
+mkdir "$PCA_RUN"
+hostname > "$PCA_RUN/host.txt"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+cmake -S pca -B pca/build -DPCA_MPI=ON
+cmake --build pca/build -j 4
+export OMP_NUM_THREADS=1 OMP_MAX_ACTIVE_LEVELS=1
+export PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+ctest --test-dir pca/build --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+provided=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["provided_signatures"])' "$PCA_MANIFEST")
+binary="$PWD/pca/build/pca_run"
+mpirun -np 4 --map-by slot --bind-to core pca/build/pca_archive_test > "$PCA_RUN/mpi_archive_test.log" 2>&1
+"$binary" --manifest "$PCA_MANIFEST" --out "$PCA_RUN/replay40" --count 40 --signature-input "$provided"
+mpirun -np 4 --map-by slot --bind-to core "$binary" \
+    --manifest "$PCA_MANIFEST" --out "$PCA_RUN/mpi_archive40" --count 40 --signature-input "$provided" --archive mpi
+"$binary" --manifest "$PCA_MANIFEST" --out "$PCA_RUN/serial40" --count 40 --chunk 16
+for layout in date transpose factor; do
+    mpirun -np 4 --map-by slot --bind-to core "$binary" \
+        --manifest "$PCA_MANIFEST" --out "$PCA_RUN/mpi_${layout}40" \
+        --count 40 --chunk 16 --layout "$layout"
+done
+"$binary" --manifest "$PCA_MANIFEST" --out "$PCA_RUN/lanczos8" --count 8 --method lanczos --steps 10
+mpirun -np 4 --map-by slot --bind-to core "$binary" \
+    --manifest "$PCA_MANIFEST" --out "$PCA_RUN/mpi_lanczos8" \
+    --count 8 --method lanczos --steps 10 --layout date
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+for run in replay40 mpi_archive40 serial40 mpi_date40 mpi_transpose40 mpi_factor40; do
+    python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$PCA_RUN/$run" \
+        > "$PCA_RUN/$run/validation.log" 2>&1
+done
+for run in lanczos8 mpi_lanczos8; do
+    python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$PCA_RUN/$run" --svd-count 4 \
+        > "$PCA_RUN/$run/validation.log" 2>&1
+done
+python3 - "$PCA_RUN" <<'PY'
+import json, pathlib, sys
+import numpy as np
+root = pathlib.Path(sys.argv[1])
+serial = np.fromfile(root / "serial40/signatures.f32", dtype="<f4")
+for name in ("mpi_transpose40", "mpi_factor40"):
+    assert np.array_equal(serial, np.fromfile(root / name / "signatures.f32", dtype="<f4")), name
+reference = np.fromfile(root / "lanczos8/signatures.f32", dtype="<f4").reshape(8, -1).astype(float)
+parallel = np.fromfile(root / "mpi_lanczos8/signatures.f32", dtype="<f4").reshape(8, -1).astype(float)
+cos = np.abs(np.sum(reference * parallel, axis=1) / (np.linalg.norm(reference, axis=1) * np.linalg.norm(parallel, axis=1)))
+assert np.max(1-cos) < 1e-6, cos
+(root / "SUCCESS.json").write_text(json.dumps({"validated": True, "mpi_factor_and_transpose_bitwise": True,
+    "max_lanczos_mpi_cosine_error": float(max(0, np.max(1-cos)))} , indent=2) + "\n")
+PY

@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_serial_size
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=24gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 4
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+# Synthetic controlled-spectrum inputs: varying m models the amount of sampled
+# input, not a claim to have reranked the real market panels at another step.
+for step in 1 2 5 10 20; do
+    python3 pca/synthetic.py --out "$PCA_RUN/input_m${step}" \
+        --rows "$(((1461 + step - 1) / step))" --cols 5876 --factors 32
+done
+for n in 367 734 1469 2938; do
+    python3 pca/synthetic.py --out "$PCA_RUN/input_n${n}" --rows 293 --cols "$n" --factors 32
+done
+python3 pca/synthetic.py --out "$PCA_RUN/input_B" --rows 293 --cols 5876 --factors 128
+module purge
+module load OpenMPI/5.0.8-GCC-14.3.0
+export OMP_NUM_THREADS=1
+binary="$build/pca_run"
+measure() {
+    local manifest=$1 tag=$2 count=$3 steps=$4
+    for repeat in 0 1 2 3; do
+        "$binary" --manifest "$manifest" --out "$PCA_RUN/${tag}_r${repeat}" \
+            --count "$count" --steps "$steps" --chunk 32
+    done
+}
+for step in 1 2 5 10 20; do measure "$PCA_RUN/input_m${step}/manifest.json" "m${step}" 32 4; done
+for n in 367 734 1469 2938; do measure "$PCA_RUN/input_n${n}/manifest.json" "n${n}" 32 4; done
+for B in 8 16 32 64 128; do measure "$PCA_RUN/input_B/manifest.json" "B${B}" "$B" 4; done
+for k in 1 2 4 8 10; do measure "$PCA_RUN/input_B/manifest.json" "k${k}" 32 "$k"; done
+touch "$PCA_RUN/SUCCESS"

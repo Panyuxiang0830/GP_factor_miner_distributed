@@ -1,0 +1,31 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_raw_check
+#PBS -j oe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:mem=8gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/synthetic.py --out "$PCA_RUN/input" --rows 24 --cols 64 --factors 8
+module purge
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 2
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+ctest --test-dir "$build" --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+for layout in date transpose factor; do
+    mpirun -np 4 --map-by slot --bind-to core "$build/pca_run" \
+        --manifest "$PCA_RUN/input/manifest.json" --out "$PCA_RUN/$layout" \
+        --rank-input 1 --layout "$layout" --count 8 --chunk 4 --archive mpi
+done
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+for layout in date transpose factor; do
+    python3 pca/validate.py --manifest "$PCA_RUN/input/manifest.json" --run "$PCA_RUN/$layout" \
+        > "$PCA_RUN/$layout/validation.log" 2>&1
+done
+touch "$PCA_RUN/SUCCESS"

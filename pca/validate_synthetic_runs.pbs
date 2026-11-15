@@ -1,0 +1,35 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_synth_check
+#PBS -j oe
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=1:mpiprocs=1:mem=12gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN to a new validation directory}"
+: "${PCA_MANIFEST:?set PCA_MANIFEST to the full synthetic manifest}"
+module load SciPy-bundle/2025.06-gfbf-2025a
+phase="${PCA_KIND:-both}"
+if [[ "$phase" != both && "$phase" != weak && "$phase" != raw ]]; then
+    echo "PCA_KIND must be both, weak, or raw" >&2; exit 1
+fi
+if [[ "$phase" == weak || "$phase" == both ]]; then
+    mkdir "$PCA_RUN"
+    python3 pca/validate_synthetic_runs.py --kind weak --manifest "$PCA_MANIFEST" \
+        --runs pca/runs/weak_{1,2,4}node_01 --out "$PCA_RUN/weak"
+fi
+if [[ "$phase" == weak ]]; then exit 0; fi
+test -f "$PCA_RUN/weak/SUCCESS.json"
+python3 pca/validate_synthetic_runs.py --kind raw --manifest "$PCA_MANIFEST" \
+    --runs pca/runs/raw_scaling_{1,2,4}node_01 --out "$PCA_RUN/raw"
+python3 - "$PCA_RUN" <<'PY'
+import json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+expected={'weak':27,'raw':9}
+for kind,count in expected.items():
+    report=json.loads((root/kind/'SUCCESS.json').read_text())
+    assert report['verified'] and len(report['configurations'])==count
+    assert max(x['ranks'] for x in report['configurations'])==288
+(root/'SUCCESS.json').write_text(json.dumps(dict(verified=True,configurations=expected,
+    full_qd_oracle=True,numerical_sample_count=8),indent=2)+'\n')
+PY

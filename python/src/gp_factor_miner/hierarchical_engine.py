@@ -698,10 +698,13 @@ def validate_hierarchical_checkpoint_payload(
     seed: int,
     *,
     completed: bool,
+    backend_identity=None,
 ) -> None:
     """Validate one V4 checkpoint payload without mutating engine state."""
     _validate_config(config)
     _validate_checkpoint(payload, _config_fingerprint(config), seed)
+    if payload.get("batch_backend_identity") != backend_identity:
+        raise RuntimeError("checkpoint batch backend or input data changed; use a new output directory")
     if completed:
         if "result" not in payload:
             raise _checkpoint_error()
@@ -930,10 +933,15 @@ def run_hierarchical_evolution(
     seed: int,
     progress_callback=None,
     checkpoint_dir=None,
+    batch_backend=None,
 ) -> HierarchicalResult:
     """Run deterministic depth-wise PCA-QD genetic-program evolution."""
     _validate_config(config)
     fingerprint = _config_fingerprint(config)
+    backend_identity = None
+    if batch_backend is not None:
+        batch_backend.validate_inputs(data_dict, target, config)
+        backend_identity = batch_backend.identity
     checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
     completed_path = checkpoint_dir / "completed.pkl" if checkpoint_dir else None
     state_path = checkpoint_dir / "run_state.pkl" if checkpoint_dir else None
@@ -950,7 +958,7 @@ def run_hierarchical_evolution(
     if completed_path is not None and completed_path.exists():
         completed = load_pickle(completed_path)
         validate_hierarchical_checkpoint_payload(
-            completed, config, seed, completed=True
+            completed, config, seed, completed=True, backend_identity=backend_identity
         )
         return completed["result"]
 
@@ -967,7 +975,7 @@ def run_hierarchical_evolution(
     if state_path is not None and state_path.exists():
         state = load_pickle(state_path)
         validate_hierarchical_checkpoint_payload(
-            state, config, seed, completed=False
+            state, config, seed, completed=False, backend_identity=backend_identity
         )
         try:
             stage_index = state["stage_index"]
@@ -1019,6 +1027,7 @@ def run_hierarchical_evolution(
             {
                 "version": CHECKPOINT_VERSION,
                 "config_fingerprint": fingerprint,
+                "batch_backend_identity": backend_identity,
                 "seed": seed,
                 "stage_index": stage_index,
                 "generation": generation,
@@ -1036,7 +1045,7 @@ def run_hierarchical_evolution(
     evaluation_config = _evaluation_config(config)
     save_state()
     pool = None
-    if config.max_workers > 1:
+    if config.max_workers > 1 and batch_backend is None:
         context = mp.get_context("fork")
         pool = context.Pool(
             processes=config.max_workers,
@@ -1054,7 +1063,29 @@ def run_hierarchical_evolution(
             stop = min(start + config.progress_chunk_size, total)
             chunk = expressions[start:stop]
             results = []
-            if pool is None:
+            if batch_backend is not None:
+                pending = []
+                resolved = {}
+                for expression in chunk:
+                    key = expression_key(expression)
+                    candidate = cache.get(key)
+                    if candidate is None:
+                        pending.append(expression)
+                    else:
+                        resolved[key] = candidate
+                returned = batch_backend.evaluate(pending, evaluation_config, config, pca_seed)
+                if len(returned) != len(pending):
+                    raise RuntimeError("batch backend result count mismatch")
+                for expression, (candidate, signature) in zip(pending, returned):
+                    key = expression_key(expression)
+                    if candidate is not None:
+                        if expression_key(candidate.expression) != key:
+                            raise RuntimeError("batch backend candidate order mismatch")
+                        cache.put(key, candidate)
+                        resolved[key] = candidate
+                        precomputed_signatures[key] = signature
+                results = [resolved.get(expression_key(expression)) for expression in chunk]
+            elif pool is None:
                 for expression in chunk:
                     results.append(
                         _evaluate(
@@ -1128,7 +1159,12 @@ def run_hierarchical_evolution(
             for candidate in ordered
             if expression_key(candidate.expression) not in raw_signatures
         ]
-        if pool is None:
+        if batch_backend is not None:
+            returned = batch_backend.evaluate([item.expression for item in missing], evaluation_config, config, pca_seed)
+            if len(returned) != len(missing):
+                raise RuntimeError("batch backend signature count mismatch")
+            computed = [(expression_key(item.expression), signature) for item, (_, signature) in zip(missing, returned)]
+        elif pool is None:
             computed = []
             for candidate in missing:
                 try:
@@ -1212,11 +1248,13 @@ def run_hierarchical_evolution(
                     signature=signature,
                 ))
             )
-        decisions = archive.consider_batch(
-            [record for _, record in comparable],
-            block_size=config.pca_qd_block_size,
-            backend=config.pca_qd_backend,
-        )
+        records = [record for _, record in comparable]
+        if batch_backend is not None:
+            decisions = batch_backend.consider(archive, records, config, pca_seed)
+        else:
+            decisions = archive.consider_batch(
+                records, block_size=config.pca_qd_block_size, backend=config.pca_qd_backend,
+            )
         for (candidate, _), decision in zip(comparable, decisions):
             key = expression_key(candidate.expression)
             if math.isfinite(decision.max_similarity):
@@ -1803,6 +1841,7 @@ def run_hierarchical_evolution(
             {
                 "version": CHECKPOINT_VERSION,
                 "config_fingerprint": fingerprint,
+                "batch_backend_identity": backend_identity,
                 "seed": seed,
                 "result": result,
             },

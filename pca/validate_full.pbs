@@ -1,0 +1,41 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_full_check
+#PBS -j oe
+#PBS -l walltime=04:00:00
+#PBS -l select=1:ncpus=4:mem=12gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_MANIFEST:?set PCA_MANIFEST}"
+: "${PCA_BASELINE:?set PCA_BASELINE to completed serial signatures.f32}"
+: "${PCA_CPU_RUN:?set PCA_CPU_RUN to completed CPU scaling parent}"
+: "${PCA_GPU_RUN:?set PCA_GPU_RUN to completed GPU scaling parent}"
+: "${PCA_RUN:?set PCA_RUN to a new validation directory}"
+mkdir "$PCA_RUN"
+test -f "$PCA_CPU_RUN/SUCCESS"
+test -f "$PCA_GPU_RUN/SUCCESS"
+test -f "$(dirname "$PCA_BASELINE")/metrics.json"
+module load SciPy-bundle/2025.06-gfbf-2025a
+# One measured repetition of every distinct configuration; all repetitions
+# must also have exactly identical signatures and archive decisions.
+for directory in "$PCA_CPU_RUN"/*_r1 "$PCA_GPU_RUN"/strong_gpu_*_r1; do
+    test -f "$directory/metrics.json"
+    python3 pca/validate.py --manifest "$PCA_MANIFEST" --run "$directory" \
+        --power-reference "$PCA_BASELINE" > "$directory/validation.log" 2>&1
+done
+python3 - "$PCA_CPU_RUN" "$PCA_GPU_RUN" "$PCA_RUN" <<'PY'
+import json, pathlib, sys
+reports = []
+for parent in map(pathlib.Path, sys.argv[1:3]):
+    for run in sorted(parent.glob('*_r1')):
+        if not (run / 'metrics.json').exists():
+            continue
+        for repeat in (2, 3):
+            other = run.with_name(run.name[:-1] + str(repeat))
+            for artifact in ('signatures.f32', 'decisions.json', 'archive_keys.json'):
+                assert (run / artifact).read_bytes() == (other / artifact).read_bytes(), (run, repeat, artifact)
+        report = json.loads((run / 'validation.json').read_text())
+        assert report['passed'], run
+        reports.append({'configuration':run.name, 'validation':report})
+pathlib.Path(sys.argv[3], 'SUCCESS.json').write_text(json.dumps({'verified':True, 'configurations':reports}, indent=2)+'\n')
+PY

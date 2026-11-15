@@ -1,0 +1,37 @@
+#!/bin/bash
+#PBS -q auto
+#PBS -N pca_matched_full
+#PBS -j oe
+#PBS -l walltime=03:00:00
+#PBS -l select=1:ncpus=16:mpiprocs=8:mem=112gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_PLAN:?set PCA_PLAN to accuracy_plan.json}"
+: "${PCA_RUN:?set a new private output directory}"
+hostname > "${PCA_RUN}_host.txt"
+lscpu > "${PCA_RUN}_cpu.txt"
+# Vanda routes can rewrite memory in proportion to reserved CPUs. Verify the
+# allocation, rather than assuming the requested mem value was retained.
+python3 - "$PCA_PLAN" "$PBS_JOBID" "${PCA_RUN}_resources.json" <<'PY'
+import json,re,subprocess,sys
+from pathlib import Path
+p=json.loads(Path(sys.argv[1]).read_text())
+jobs=json.loads(subprocess.check_output(['qstat','-f','-F','json',sys.argv[2]],text=True))['Jobs']
+resources=next(iter(jobs.values()))['Resource_List']
+Path(sys.argv[3]).write_text(json.dumps(resources,indent=2)+'\n')
+match=re.fullmatch(r'([0-9.]+)([kmgtp]?b)',str(resources['mem']).lower())
+assert match,'unknown PBS memory unit'
+allocated=float(match[1])*1024**('b','kb','mb','gb','tb','pb').index(match[2])
+needed=p['count']*p['rows']*p['cols']*4*1.2+2*1024**3
+if allocated<needed:raise SystemExit('Actual PBS memory is too small for the FP32 cache; reserve more CPUs/memory before rerunning.')
+print('Actual PBS memory passes full-generation cache preflight.')
+PY
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 4
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+mpirun -np 8 --map-by slot --bind-to core "$build/pca_matched_bench" --plan "$PCA_PLAN" --out "$PCA_RUN"
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/validate_matched.py --plan "$PCA_PLAN" --run "$PCA_RUN"

@@ -1,0 +1,22 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_delivery_cpu
+#PBS -j oe
+#PBS -l walltime=00:20:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:mem=8gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set new private run}"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 2
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+"$build/pca_test"
+mpirun -np 4 --map-by slot --bind-to core "$build/pca_archive_test"
+PCA_MPI_BIN=$(command -v mpirun)
+PCA_MPI_LIBS=$LD_LIBRARY_PATH
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+export LD_LIBRARY_PATH="$PCA_MPI_LIBS:${LD_LIBRARY_PATH:-}"
+python3 pca/delivery_check.py --binary "$build/pca_run" --out "$PCA_RUN" --mpiexec "$PCA_MPI_BIN"

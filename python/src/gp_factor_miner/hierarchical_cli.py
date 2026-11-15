@@ -6,6 +6,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import pickle
+import sys
 
 import pandas as pd
 
@@ -55,6 +56,13 @@ def build_parser():
         help="dedicated output directory for this EOD GP run",
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--cpp-panel-dir", type=Path, help="opt-in live C++ backend: exported evolution panels")
+    parser.add_argument("--cpp-engine-binary", type=Path)
+    parser.add_argument("--cpp-pca-binary", type=Path)
+    parser.add_argument("--cpp-device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--cpp-ranks", type=int, default=1)
+    parser.add_argument("--cpp-precision", choices=("float", "double"), default="double")
+    parser.add_argument("--cpp-mpiexec", default="mpirun")
     return parser
 
 
@@ -223,7 +231,7 @@ def _package_versions():
     return versions
 
 
-def _validate_v4_output_dir(output_dir, config):
+def _validate_v4_output_dir(output_dir, config, backend_identities=None, defer_backend_identity=False):
     destination = Path(output_dir)
     legacy_outputs = (
         destination / "selected_raw_features.json",
@@ -262,10 +270,17 @@ def _validate_v4_output_dir(output_dir, config):
                 config,
                 seed,
                 completed=path.name == "completed.pkl",
+                backend_identity=(payload.get("batch_backend_identity") if defer_backend_identity
+                                  else (backend_identities or {}).get(run_number)),
             )
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    cpp_enabled = args.cpp_panel_dir is not None
+    if any(x is not None for x in (args.cpp_panel_dir, args.cpp_engine_binary, args.cpp_pca_binary)) and not all(
+        x is not None for x in (args.cpp_panel_dir, args.cpp_engine_binary, args.cpp_pca_binary)
+    ):
+        raise ValueError("C++ backend requires panel directory, engine binary and PCA binary together")
     config = HierarchicalGPConfig(
         data_file=args.data_file,
         label_file=args.label_file,
@@ -293,7 +308,7 @@ def main(argv=None):
             ),
             progress_chunk_size=min(config.progress_chunk_size, smoke_population),
         )
-    _validate_v4_output_dir(args.output_dir, config)
+    _validate_v4_output_dir(args.output_dir, config, defer_backend_identity=cpp_enabled)
     evolution_data, evolution_target, screening_data, screening_target = (
         split_eod_panels(dataset)
     )
@@ -304,6 +319,17 @@ def main(argv=None):
         smoke_assets = list(
             asset_coverage.sort_values(ascending=False, kind="stable").index[:512]
         )
+        if cpp_enabled:
+            # The export defines the exact smoke coordinates; never silently
+            # compute on a different stock subset than the upstream engine.
+            metadata = json.loads((args.cpp_panel_dir / "meta.json").read_text())
+            dates = {str(x): x for x in evolution_target.index}
+            assets = {str(x): x for x in evolution_target.columns}
+            try:
+                evolution_ids = [dates[x] for x in metadata["dates"][:256]]
+                smoke_assets = [assets[x] for x in metadata["assets"][:512]]
+            except KeyError as error:
+                raise ValueError("C++ export calendar/assets do not match the evolution split") from error
         evolution_data = {
             name: panel.loc[evolution_ids, smoke_assets]
             for name, panel in evolution_data.items()
@@ -324,6 +350,25 @@ def main(argv=None):
         feature_names,
     )
 
+    batch_backends = {}
+    if cpp_enabled:
+        bridge_dir = Path(__file__).resolve().parents[3] / "pca"
+        if not (bridge_dir / "gp_bridge.py").exists():
+            raise RuntimeError("C++ backend requires the repository pca/ module")
+        sys.path.insert(0, str(bridge_dir))
+        from gp_bridge import CppGPBackend
+        for run in range(1, config.independent_runs + 1):
+            implementation = CppGPBackend(
+                args.cpp_panel_dir, args.cpp_engine_binary, args.cpp_pca_binary,
+                eval_dir / f"cpp_backend_{run:02d}", dates=len(evolution_target.index),
+                stocks=len(evolution_target.columns), ranks=args.cpp_ranks,
+                device=args.cpp_device, precision=args.cpp_precision,
+                mpiexec=args.cpp_mpiexec,
+            )
+            implementation.validate_inputs(evolution_data, evolution_target, config)
+            batch_backends[run] = implementation
+        _validate_v4_output_dir(args.output_dir, config, {run: impl.identity for run, impl in batch_backends.items()})
+
     results = []
     for run in range(config.independent_runs):
         run_number = run + 1
@@ -332,6 +377,7 @@ def main(argv=None):
             f"[run {run_number}/{config.independent_runs}] started seed={seed}",
             flush=True,
         )
+        backend_options = {"batch_backend": batch_backends[run_number]} if cpp_enabled else {}
         result = run_hierarchical_evolution(
             evolution_data,
             evolution_target,
@@ -342,6 +388,7 @@ def main(argv=None):
                 run_number, config.independent_runs, config
             ),
             checkpoint_dir=eval_dir / f"run_{run_number:02d}",
+            **backend_options,
         )
         completed_depths = tuple(stage.depth for stage in result.stages)
         if completed_depths != tuple(config.stage_depths):
@@ -430,6 +477,7 @@ def main(argv=None):
         "package_versions": _package_versions(),
         "git_commit": _git_commit(),
         "smoke": args.smoke,
+        "batch_backends": {run: impl.identity for run, impl in batch_backends.items()},
     }
     atomic_json(args.output_dir / "run_config.json", run_config)
     print(f"[done] V4 outputs written to {args.output_dir}", flush=True)

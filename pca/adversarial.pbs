@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_boundaries
+#PBS -j oe
+#PBS -l walltime=01:00:00
+#PBS -l select=1:ncpus=8:mpiprocs=4:ngpus=1:mem=32gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set PCA_RUN}"
+mkdir "$PCA_RUN"
+module load SciPy-bundle/2025.06-gfbf-2025a
+python3 pca/adversarial.py --out "$PCA_RUN/input"
+module purge
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0 CUDA/12.9.1
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON -DPCA_CUDA=ON
+cmake --build "$build" -j 4
+export OMP_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+ctest --test-dir "$build" --output-on-failure > "$PCA_RUN/ctest.log" 2>&1
+for case in threshold near_tie duplicate_margin invalid; do
+    for device in cpu cuda; do
+        "$build/pca_run" --manifest "$PCA_RUN/input/$case/manifest.json" \
+            --signature-input "$PCA_RUN/input/$case/signatures.f32" --device "$device" \
+            --out "$PCA_RUN/${case}_${device}"
+    done
+    mpirun -np 4 --map-by slot --bind-to core "$build/pca_run" \
+        --manifest "$PCA_RUN/input/$case/manifest.json" --signature-input "$PCA_RUN/input/$case/signatures.f32" \
+        --archive mpi --out "$PCA_RUN/${case}_mpi"
+done
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+for case in threshold near_tie duplicate_margin invalid; do
+    for device in cpu cuda mpi; do
+        python3 pca/validate.py --manifest "$PCA_RUN/input/$case/manifest.json" \
+            --run "$PCA_RUN/${case}_${device}" > "$PCA_RUN/${case}_${device}/validation.log" 2>&1
+    done
+done
+touch "$PCA_RUN/SUCCESS"

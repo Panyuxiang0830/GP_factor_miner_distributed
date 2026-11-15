@@ -1,0 +1,33 @@
+#!/bin/bash
+# Real-panel GP pilot or explicitly configured production size, on compute nodes.
+#PBS -q auto_free
+#PBS -N pca_live_gp
+#PBS -j oe
+#PBS -l walltime=00:30:00
+#PBS -l select=1:ncpus=4:mpiprocs=4:mem=16gb
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_RUN:?set new private output}"
+: "${PCA_PANEL_DIR:?set panel directory}"
+: "${PCA_ENGINE_BINARY:?set compiled live MPI bridge}"
+: "${PCA_BINARY:?set compiled pca_run}"
+# For CUDA, submit with a GPU allocation and PCA_DEVICE=cuda; one MPI rank per GPU.
+module load OpenMPI/5.0.8-GCC-14.3.0
+if [[ "${PCA_DEVICE:-cpu}" == cuda ]]; then module load CUDA/12.9.1; fi
+export OMP_NUM_THREADS="${PCA_THREADS:-1}" OPENBLAS_NUM_THREADS=1 PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+PCA_MPI_BIN=$(command -v mpirun)
+PCA_MPI_LIBS=$LD_LIBRARY_PATH
+module purge
+module load SciPy-bundle/2025.06-gfbf-2025a
+export LD_LIBRARY_PATH="$PCA_MPI_LIBS:${LD_LIBRARY_PATH:-}"
+extra=()
+if [[ -n "${PCA_FIELDS:-}" ]]; then read -ra fields <<< "$PCA_FIELDS";extra+=(--fields "${fields[@]}");fi
+if [[ -n "${PCA_DATES:-}" ]]; then extra+=(--dates "$PCA_DATES");fi
+if [[ -n "${PCA_STOCKS:-}" ]]; then extra+=(--stocks "$PCA_STOCKS");fi
+if [[ "${PCA_RESUME:-0}" == 1 ]]; then extra+=(--resume);fi
+python3 pca/run_gp.py --panel-dir "$PCA_PANEL_DIR" --engine-binary "$PCA_ENGINE_BINARY" --pca-binary "$PCA_BINARY" \
+    --out "$PCA_RUN" --device "${PCA_DEVICE:-cpu}" --precision "${PCA_PRECISION:-double}" \
+    --ranks "${PCA_RANKS:-4}" --threads "${PCA_THREADS:-1}" --mpiexec "$PCA_MPI_BIN" \
+    --population "${PCA_POPULATION:-24}" --generations "${PCA_GENERATIONS:-1}" --gene-pool "${PCA_GENE_POOL:-12}" \
+    --progress-chunk "${PCA_PROGRESS_CHUNK:-24}" --sample-step "${PCA_SAMPLE_STEP:-5}" --steps "${PCA_STEPS:-4}" \
+    --windows 1 2 3 "${extra[@]}"

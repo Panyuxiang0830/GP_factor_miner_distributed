@@ -1,0 +1,53 @@
+#!/bin/bash
+#PBS -q auto_free
+#PBS -N pca_scaling
+#PBS -j oe
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=72:mpiprocs=72:mem=180gb
+#PBS -l place=scatter
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+: "${PCA_MANIFEST:?set PCA_MANIFEST}"
+: "${PCA_RUN:?set PCA_RUN to a new directory}"
+mkdir "$PCA_RUN"
+module load OpenMPI/5.0.8-GCC-14.3.0 CMake/4.0.3-GCCcore-14.3.0
+build="${PCA_RUN}_build"
+cmake -S pca -B "$build" -DPCA_MPI=ON
+cmake --build "$build" -j 4
+export PRTE_MCA_prte_launch_agent="$PWD/scripts/vanda/prted.sh"
+export OMP_PLACES=cores OMP_PROC_BIND=close
+sort -u "$PBS_NODEFILE" > "$PCA_RUN/hosts.txt"
+hosts=$(wc -l < "$PCA_RUN/hosts.txt")
+run() {
+    local ranks=$1 threads=$2 tag=$3 layout=$4 count=$5
+    local processes_per_node=$((ranks / hosts))
+    [ "$processes_per_node" -gt 0 ] || processes_per_node=1
+    local -a placement
+    if [ "$threads" -gt 36 ]; then
+        placement=(--map-by "ppr:${processes_per_node}:node" --bind-to none)
+    else
+        placement=(--map-by "ppr:${processes_per_node}:node:PE=${threads}" --bind-to core)
+    fi
+    for repeat in 0 1 2 3; do
+        # repeat 0 is an untallied warmup; retained for audit.
+        mpirun -np "$ranks" "${placement[@]}" -x OMP_NUM_THREADS="$threads" -x OMP_PLACES -x OMP_PROC_BIND \
+            "$build/pca_run" --manifest "$PCA_MANIFEST" \
+            --out "$PCA_RUN/${tag}_${layout}_p${ranks}_t${threads}_r${repeat}" \
+            --layout "$layout" --count "$count" --chunk 576 --steps 4
+    done
+}
+if [ "$hosts" = 1 ]; then
+    rank_list="${PCA_RANKS:-1 2 4 8 16 36 72}"
+else
+    rank_list="$((hosts * 72))"
+fi
+for ranks in $rank_list; do
+    for layout in date transpose factor; do
+        run "$ranks" 1 strong "$layout" "${PCA_COUNT:-9388}"
+    done
+done
+# One hybrid per node: total cores stays hosts*72.
+for layout in date transpose factor; do
+    run "$((hosts * 4))" 18 hybrid "$layout" "${PCA_COUNT:-9388}"
+done
+touch "$PCA_RUN/SUCCESS"
