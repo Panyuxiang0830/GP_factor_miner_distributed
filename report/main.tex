@@ -22,8 +22,8 @@
 
 \title{Distributed Acceleration of Hierarchical PCA-QD Genetic-Programming Factor Mining\\[4pt]
 \large DSA5208 Project 3}
-\author{\todo{Name (Student ID)} \and \todo{Name (Student ID)} \and \todo{Name (Student ID)}}
-\date{14 November 2026}
+\author{Wu Jiarui (A0262371J) \and Hou Jiacheng (A0353127J) \and Pan Yuxiang (A0355687J)}
+\date{14 November 2026\\[6pt]\normalsize Source code (GitHub): \url{https://github.com/Panyuxiang0830/GP_factor_miner_distributed}}
 
 \begin{document}
 \maketitle
@@ -260,6 +260,7 @@ We model the lifetime of materialised panels as a red--blue pebble problem: a co
 In the date-major layout a stock's history is a column with stride $N$ floats ($23.5$\,KB), so reading it touches one cache line per day for only four useful bytes. This is acceptable for two reasons. First, the loop over stocks uses a static schedule, so each thread processes a contiguous range of stocks: the $T$ cache lines loaded for one column ($T\times64$\,B $\approx 93$\,KB for the full period, less per rank) stay in the 2\,MB per-core L2 cache and serve the next 15 columns. Second, the gather is $O(T)$ per column, while the window kernels that follow do considerably more work per element (Kahan compensation, deque updates, sorted windows for the median), so the copy is a small part of the operator time. Storing panels stock-major instead would make the cross-sectional operators and the daily RankIC strided, and those are at least as expensive.
 
 \subsubsection{Calibrating floating-point differences}
+\label{sec:fpcal}
 Small differences in floating-point rounding can change which windows look constant, and hence whether a correlation is finite, so we port the pandas~3.0.3 window kernels rather than textbook formulas.
 \begin{itemize}[nosep]
   \item Rolling sums and means use Kahan summation with separate compensations for additions and removals. When the last $n_{obs}$ observations are identical, the repeated value is returned exactly.
@@ -317,7 +318,7 @@ For $p$ ranks and a batch with exchanged node set $\mathcal{X}$:
   \item \textbf{Halo volume.} Each rank sends, for each exchanged node $n\in\mathcal{X}$, its last $\mathrm{halo}(n)$ rows of $N$ floats, i.e.\ $4N\sum_{n\in\mathcal{X}}\mathrm{halo}(n)$ bytes per rank, nearly independent of $p$. For the 10{,}000-expression batch of Section~\ref{sec:experiments} this is 1811 of 12{,}083 nodes and 1.47--1.73\,GB per rank (it grows slightly with $p$ because short blocks forward rows from further left).
   \item \textbf{Messages.} One packed message per partner per level (per chunk, when a level is processed in chunks, Section~\ref{sec:threads}). While a block is longer than the longest halo, the only partner is the left neighbour; when $T/p$ drops below the halo, rows come from several ranks. For the 10{,}000-expression batch with chunks of 2000 nodes the measured maximum is 2 messages per rank up to 16 ranks and 4, 6, 12 and 24 at 36, 72, 144 and 288 ranks.
   \item \textbf{ema chain.} $p-1$ sequential hops per ema level, two numbers per stock each (Section~\ref{sec:ema}).
-  \item \textbf{Fitness.} One \code{MPI\_Allreduce} of a short summary vector per root (segment sums and counts), under 0.5\,ms at 288 ranks.
+  \item \textbf{Fitness.} One \code{MPI\_Allreduce} of a short summary vector per root (segment sums and counts), under 8\,ms even at 288 ranks.
 \end{itemize}
 Per rank, computation shrinks as $1/p$ while the halo volume stays constant and the chain grows with $p$, so communication dominates at large $p$. In practice the synchronisation matters more than the volume: a rank cannot finish a level before it has received its left neighbour's rows for that level.
 
@@ -377,7 +378,7 @@ A faster engine is only useful if it computes the same numbers. We had a ready-m
 
 \paragraph{Operators.} Comparing every cell of the full data would be slow, so we cut a sample of 120 days $\times$ 300 stocks from the real data, keeping all 132 fields, and evaluated 88 expressions on it. The first 48 test single operators, each with windows 1, 5 and 20, plus a few nested combinations; the other 40 are taken from the factor library, to check that operators still agree when combined as in real factors. The number of cases follows from this design, not from a target. A cell passes if $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and missing values are in the same places; the absolute term is there because pandas itself computes a few operators in float32.
 
-With textbook sliding-window formulas only 53 of the 88 cases passed. Every failure came from rounding: a tiny rounding difference decides whether a window counts as constant, and that decides whether a correlation is finite, missing or infinite. After porting the pandas~3.0.3 window kernels line by line (Section~\ref{sec:operators}) and treating windows that are constant within their range consistently, all 88 cases pass, with missing and infinite values in exactly the same places.
+With textbook sliding-window formulas only 53 of the 88 cases passed. Every failure came from rounding: a tiny rounding difference decides whether a window counts as constant, and that decides whether a correlation is finite, missing or infinite. After porting the pandas~3.0.3 window kernels line by line (Section~\ref{sec:fpcal}) and treating windows that are constant within their range consistently, all 88 cases pass, with missing and infinite values in exactly the same places.
 
 \paragraph{RankIC, fitness and signatures.} Here two kinds of difference have to be told apart: a bug in the code, and rounding caused by storing panels in float32. We therefore compared everything twice. First we gave C++ pandas' own factor values, rounded to float32, so both sides had identical input and only the code was tested. The daily RankIC agreed in 88/88 cases (largest difference $8.9\times10^{-16}$), the fitness in 88/88 ($8.3\times10^{-17}$), and the PCA signature was bit-identical to Python's in 88/88. Then we let C++ compute everything from the raw data. 63 of 88 cases matched Python exactly; for the rest the daily IC differed by at most $1.5\times10^{-4}$ and the fitness by at most $2.4\times10^{-5}$, and whether a factor is accepted agreed in all 88. These differences come from float32: two distinct float64 values can round to the same float32 and create a tie in the ranking. When we rounded pandas' own factor values to float32 and recomputed the IC in Python, we got exactly the same differences as C++, so the cause is storage precision, not the code. Signatures were also compared end to end on the full data ($1461\times5876$): $1-$similarity was at most $6.9\times10^{-6}$, tiny next to the 0.9 correlation threshold used for admission.
 
@@ -395,7 +396,7 @@ Small hand-computed unit tests cover the corner cases that real data rarely hit:
 \subsection{DAG and memory}
 \label{sec:dag-exp}
 \paragraph{Inputs and measurement scope.}
-S1 and S2 use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on the user's arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
+Tables~\ref{tab:dag-sharing} and~\ref{tab:dag-memory} use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on an arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
 
 \subsubsection{Subexpression sharing and serial planning}
 \begin{table}[htbp]
@@ -468,8 +469,8 @@ Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 r
 \label{fig:dag-memory}
 \end{figure}
 
-\paragraph{Small engine check (S4).}
-On Vanda CPU node CN-016, the handed-off serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
+\paragraph{Small engine check.}
+On Vanda CPU node CN-016, the serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
 
 \begin{table}[htbp]
 \centering
@@ -485,7 +486,7 @@ Formula chunk & Median wall time (s) & Range (s) & Median RSS (MiB) \\
 \caption{Actual single-node formula-chunk experiment; three separate processes per setting.}
 \label{tab:dag-s4}
 \end{table}
-All nine runs exit successfully. A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. The retained verification record and logs were reviewed; raw score files were not included in the review archive. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not exact S2 scheduling.
+All nine runs exit successfully. A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not the exact scheduling of Table~\ref{tab:dag-memory}.
 
 \paragraph{Consequences for the engine.} These results fix how the engine evaluates a batch in the experiments that follow. Sharing (Table~\ref{tab:dag-sharing}) is why a whole batch is merged into one DAG before evaluation: the real batch of Section~\ref{sec:experiments} gives 12{,}083 DAG nodes for 10{,}000 expressions. Once roots are released early, the widest level sets the peak (Table~\ref{tab:dag-memory}), so the engine also processes wide levels in chunks (Section~\ref{sec:threads}): the widest level of that batch has 8614 nodes, and the runs below use chunks of 1000 nodes on one node and 2000 on several. Chunking does not change any score (Table~\ref{tab:dag-s4} and Section~\ref{sec:threads}). Its cost is one halo exchange per chunk instead of one per level; we did not compare run times with and without chunking.
 
@@ -579,7 +580,7 @@ The drop from one to two ranks is the halo exchange (about 8.5\,s, rising only t
 \end{figure}
 
 \subsubsection{Communication}
-\paragraph{Halo exchange versus redundant computation.} Raising $H_0$ replaces exchanged nodes by recomputation. With pure MPI, $H_0=10$ changes almost nothing (1811 to 1591 exchanged nodes); $H_0=30$ leaves 715, and $H_0\ge60$ leaves 53 nodes and 40--45\,MB of halo per rank instead of 1.5--1.7\,GB, at the cost of 60{,}944 redundant rows per rank. The total time nevertheless rises: from 142.7 to 159.1\,s at 72 ranks ($+11\%$), from 94.2 to 109.7\,s at 144 ($+16\%$) and from 72.0 to 86.7\,s at 288 ($+20\%$) (Figure~\ref{fig:x4}, left). The halo time also rises (23.7 to 31.1\,s at 72 ranks) although 97\% less data is sent, so it is not transfer time but time spent waiting for the left neighbour to finish the level, which the redundant work makes longer. For this batch exchanging everything ($H_0=0$) is best; with hybrid splits the picture is the same (72 ranks $\times$ 4 threads: 50.8\,s at $H_0=0$, 54\,s at $H_0\ge60$). With fewer ranks per node $H_0$ hardly matters: 16 $\times$ 18 stays at 43.0--43.9\,s (43.1\,s at $H_0=0$), and 4 $\times$ 72 varies between 48.2 and 52.4\,s against 55.0\,s at $H_0=0$, without a trend in $H_0$; with one rank per node there are only three exchanging pairs, so there is little to save.
+\paragraph{Halo exchange versus redundant computation.} Raising $H_0$ replaces exchanged nodes by recomputation. With pure MPI, $H_0=10$ changes almost nothing (1811 to 1591 exchanged nodes); $H_0=30$ leaves 715, and $H_0\ge60$ leaves 53 nodes and 40--45\,MB of halo per rank instead of 1.5--1.7\,GB, at the cost of 60{,}944 redundant rows per rank. The total time nevertheless rises: from 142.7 to 159.1\,s at 72 ranks ($+11\%$), from 94.2 to 109.7\,s at 144 ($+16\%$) and from 72.0 to 86.7\,s at 288 ($+20\%$) (Figure~\ref{fig:x4}, left). The $H_0$ sweep was a separate set of jobs whose $H_0=0$ baselines were measured independently of Table~\ref{tab:x2}, so at 144 and 288 ranks they differ slightly from the 94.1\,s and 75.0\,s in the table. The halo time also rises (23.7 to 31.1\,s at 72 ranks) although 97\% less data is sent, so it is not transfer time but time spent waiting for the left neighbour to finish the level, which the redundant work makes longer. For this batch exchanging everything ($H_0=0$) is best; with hybrid splits the picture is the same (72 ranks $\times$ 4 threads: 50.8\,s at $H_0=0$, 54\,s at $H_0\ge60$). With fewer ranks per node $H_0$ hardly matters: 16 $\times$ 18 stays at 43.0--43.9\,s (43.1\,s at $H_0=0$), and 4 $\times$ 72 varies between 48.2 and 52.4\,s against 55.0\,s at $H_0=0$, without a trend in $H_0$; with one rank per node there are only three exchanging pairs, so there is little to save.
 
 \paragraph{Shared memory versus the network.} The same number of ranks packed on as few nodes as possible or spread over four nodes: 36 ranks take 241.3\,s on one node and 212.3\,s on four; 72 ranks take 142.7\,s and 126.4\,s; 144 ranks take 94.1\,s on two nodes and 94.0\,s on four (Figure~\ref{fig:x4}, right). Spreading is faster: the extra network hops cost less than sharing one node's memory bandwidth among more ranks.
 
@@ -704,7 +705,7 @@ $B$ & Archive $A$ & Handwritten & cuBLAS GEMM & GEMM+abs & Speed-up \\
 \end{table}
 
 \subsubsection{MPI + CUDA scaling}
-Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1. Occasional superlinear points need to be interpreted with node and run conditions.
+Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1.
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
@@ -885,12 +886,12 @@ We move the original Python GP's batch evaluation into C++, share subexpressions
 PCA experiments show why ranking, preparation, communication and admission must be timed alongside multiplication. Two A40s are 1.764 times faster than one, but the 72-core CPU configuration is faster for this batch workflow. Lanczos reaches the target on more matrices within ten steps and reduces common-target solve time by about 20.3\%; changing the solver or budget also changes some archive members. Three-depth GP runs at full data dimensions and the shared 16-core calibration further verify the connection between factor evaluation, PCA, QD, subsequent evolution and checkpoints.
 
 \section*{Use of AI tools}
-ChatGPT was used to assist discussion.
+Claude and Codex were used to help generate and compile the C++ code, write the \LaTeX{} report, and polish and translate the text between Chinese and English. The original genetic-programming algorithm and the design of the distributed parallel algorithm were done by the group members; the experiments on the distributed algorithm were carried out by the group members in collaboration with the AI tools after discussion.
 \clearpage
 
 \appendix
 \section{Code structure, building and running}
-The main sources are in the project's \href{https://github.com/houjiacheng435-a11y/GP_factor_miner_distributed/tree/pca-implementation}{GitHub repository (\code{pca-implementation} branch)}. The project comprises the factor engine, DAG analysis tools, Python GP and PCA backend. Table~\ref{tab:project-source} lists the main directories and entry points.
+The main sources are in the project's \href{https://github.com/Panyuxiang0830/GP_factor_miner_distributed}{GitHub repository} (\url{https://github.com/Panyuxiang0830/GP_factor_miner_distributed}, \code{main} branch). The project comprises the factor engine, DAG analysis tools, Python GP and PCA backend. Table~\ref{tab:project-source} lists the main directories and entry points.
 \begin{table}[H]
 \centering\small
 \begin{tabular}{p{5.0cm}p{8.4cm}}
