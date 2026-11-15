@@ -1,0 +1,8 @@
+{
+  "_comment": "128 GB host. Fields 4.3 GB + Python ~20 GB (cache, pools, archive) + OS/page cache headroom ~24 GB; engine budget 80 GB = ~2,300 panels of 34.3 MB. Expect more group splits (recomputation) than on larger hosts.",
+  "gp": {
+    "engine_threads": 128, "gpus": 4, "streams_per_gpu": 4,
+    "memory_budget_gb": 80, "engine_max_chunk": 1000,
+    "progress_chunk_size": 25000, "screening_engine_batch": 25000
+  }
+}

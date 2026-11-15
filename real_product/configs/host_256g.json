@@ -1,0 +1,8 @@
+{
+  "_comment": "256 GB host. Engine budget 180 GB = ~5,200 panels (the course run peaked at 138 GB with chunk 2000 on 72 threads).",
+  "gp": {
+    "engine_threads": 128, "gpus": 4, "streams_per_gpu": 4,
+    "memory_budget_gb": 180, "engine_max_chunk": 2000,
+    "progress_chunk_size": 50000, "screening_engine_batch": 50000
+  }
+}

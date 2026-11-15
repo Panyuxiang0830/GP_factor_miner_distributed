@@ -1,0 +1,8 @@
+{
+  "_comment": "512 GB host (recommended). Engine budget 400 GB = ~11,600 panels; larger chunks share more genes, i.e. less recomputation across groups.",
+  "gp": {
+    "engine_threads": 128, "gpus": 4, "streams_per_gpu": 4,
+    "memory_budget_gb": 400, "engine_max_chunk": 4000,
+    "progress_chunk_size": 100000, "screening_engine_batch": 100000
+  }
+}
