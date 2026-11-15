@@ -8,6 +8,10 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{float}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,skip=6pt}
+\setlength{\intextsep}{14pt plus 4pt minus 2pt}
+\setlength{\textfloatsep}{16pt plus 4pt minus 2pt}
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{hyperref}
@@ -664,7 +668,7 @@ The original engine first computes 128 factor panels. Their values are held fixe
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.82\linewidth]{\PCAFigureDir/real_problem_size.png}
-\caption{PCA size experiments on 128 real panels, varying $B$, sampled dates $m$, stocks $N$ and iteration count $k$ after fixing panel values.}
+\caption{Single-threaded PCA size experiment on 128 real panels, varying batch $B$, sampled dates $m$, stocks $N$ and steps $k$ separately.}
 \label{fig:pca-real-size}
 \end{figure}
 In Figure~\ref{fig:pca-real-size}, time grows with batch size, sampled dates and stocks. More iterations mainly affect the solve; ranking and preparation remain substantial. Matrix--vector work is approximately $O(BmNk)$, and synthetic dimension experiments also show near-linear growth in $B,m,N$. The stock-prefix experiment does not recompute cross-sectional operators or RankIC on a smaller universe: it measures PCA input-size changes, not the cost of mining a smaller stock universe.
@@ -673,7 +677,7 @@ In Figure~\ref{fig:pca-real-size}, time grows with batch size, sampled dates and
 Table~\ref{tab:pca-kernels} measures ranking, iterative multiplication and similarity separately. FP32/FP64 denotes iteration precision; ranking and coarse similarity both use FP32. Ranking is substantially more expensive than the two multiplication stages. FP64 nearly doubles iterative multiplication time but leaves ranking unchanged, so the whole workflow does not slow by the same factor.
 \begin{table}[H]
 \centering\small
-\caption{GPU component timing in ms: one warm-up, then the median of three repeats.}
+\caption{Single-A40 component times in ms: one warm-up and three-repeat medians. FP32/FP64 refers only to iteration precision.}
 \label{tab:pca-kernels}
 \begin{tabular}{lrrrr}
 \toprule
@@ -693,14 +697,14 @@ For all 9388 preconstructed matrices $R$, 72 CPU cores with the \code{date} layo
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.54\linewidth]{\PCAFigureDir/cpu_gpu_end_to_end.png}
-\caption{PCA workflow time for the same 9388 matrices $R$, using the stated CPU and GPU configurations.}
+\caption{Total PCA time for the same 9388 ranked matrices $R$: 72 CPU cores in FP64 versus GPU configurations in FP32.}
 \label{fig:pca-total}
 \end{figure}
 
 Table~\ref{tab:pca-total-stages} shows that 72 CPU processes share reading, whereas the GPU paths have only 1/2 host processes. The single-GPU pure GEMV median is 1.090\,s, much less than the full workflow. Reading, host preparation, upload and synchronisation need joint optimisation. The \code{solve} stage includes GPU preparation and computation, with nested timers; a slower workflow does not imply slower GPU multiplication.
 \begin{table}[H]
 \centering\small
-\caption{Configurations and median stage times for already-ranked $R$, in s. The solve contains preparation and nested stages; kernel and communication timers must not be added to it.}
+\caption{CPU/GPU configurations and stage times in s. Solve includes preparation and nested stages; communication must not be added again.}
 \label{tab:pca-total-stages}
 \begin{tabular}{lrlrrrr}
 \toprule
@@ -718,7 +722,7 @@ Sequential admission timing includes FP64 refinement and archive-state maintenan
 The independent cuBLAS reference uses identical device inputs, strict FP32 and disabled TF32 (\href{https://docs.nvidia.com/cuda/archive/12.9.1/cublas/index.html}{cuBLAS documentation}). Each block executes 50 operations; three blocks give the median, excluding warm-up, transfers, allocation and normalisation. Because the handwritten kernel fuses the absolute value, Table~\ref{tab:cublas} compares it with library GEMM plus abs, with pure GEMM also shown. Here abs means element-wise absolute value. The speed-up is handwritten time divided by library GEMM+abs time; values above 1 favour the library. cuBLAS is 1.45--3.89 times faster, leaving room to improve handwritten multiplication. This ratio cannot directly be converted into a full-GP speed-up. cuBLAS remains a reference only; production targets use handwritten code.
 \begin{table}[H]
 \centering\small
-\caption{Independent similarity comparison with cuBLAS; times are in $\mu$s.}
+\caption{Independent handwritten/cuBLAS comparison in $\mu$s, using identical device inputs and strict FP32. The corresponding library time includes abs.}
 \label{tab:cublas}
 \begin{tabular}{rrrrrr}
 \toprule
@@ -733,150 +737,107 @@ $B$ & Archive $A$ & Handwritten & cuBLAS GEMM & GEMM+abs & Speed-up \\
 \end{table}
 
 \paragraph{Roofline comparison.}
-Figure~\ref{fig:pca-roofline} compares FP32 measurements with the A40 nominal bound $\min(696\,\mathrm{GB/s}\times I,\ 37.4\,\mathrm{TFLOP/s})$, where $I$ is arithmetic intensity in FLOP/byte. At batch $B=64$, GEMV has nominal intensity $0.5$ FLOP/byte and reaches about $266.2$ GFLOP/s. Counting matrix reads gives effective bandwidth $532.5$ GB/s, about $76.5\%$ of nominal bandwidth. Similarity multiplication reaches about $2.255$ TFLOP/s, below the model bound at its intensity of $26.18$ FLOP/byte, leaving room to improve the handwritten tiled kernel.
-
-Traffic is estimated from matrix reads and compulsory input/output, rather than measured DRAM traffic from a profiler. The FP32 ceiling is not applied to FP64. Sorting is timed separately and is not assigned the matrix-product FLOP model.
+Figure~\ref{fig:pca-roofline} compares measurements with the A40 bandwidth and compute ceilings. At batch 64, FP32 matrix--vector multiplication reaches estimated effective bandwidth 532.5 GB/s, or 76.5\% of nominal bandwidth, indicating a matrix-read bottleneck. Similarity multiplication reaches 2.255 TFLOP/s and leaves room for improvement. The nominal ceilings are 696 GB/s and 37.4 TFLOP/s; traffic is estimated from matrix reads and writes.
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.65\linewidth]{\PCAFigureDir/gpu_roofline.png}
-\caption{Nominal FP32 Roofline comparison for A40 GEMV and similarity multiplication, with batches 8, 32 and 64.}
+\includegraphics[width=0.62\linewidth]{\PCAFigureDir/gpu_roofline.png}
+\caption{FP32 Roofline comparison for matrix--vector and similarity multiplication, with batches 8, 32 and 64.}
 \label{fig:pca-roofline}
 \end{figure}
 
 \subsubsection{MPI + CUDA scaling}
-Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1.
+Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Read from the figure, one rank takes about 130, 155 and 195\,s for \code{factor}, \code{date} and \code{transpose}. \code{date} is fastest at 72 ranks (13.4\,s, the CPU configuration of Table~\ref{tab:pca-total-stages}, a speed-up of about 12) and then slows down, to about 19\,s and an efficiency of about 0.03 at 288 ranks; \code{factor} is fastest at 144 ranks, about 5.5\,s or a speed-up of about 24; \code{transpose} reaches about 7.5\,s at 144--288 ranks, a speed-up of about 26. The fastest CPU layout is therefore \code{factor}, more than twice as fast as the 72-rank \code{date} configuration used in Table~\ref{tab:pca-total-stages}. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1: at 288 ranks the weak-scaling efficiency is about 0.12 for \code{date}, 0.3 for \code{transpose} and 0.55 for \code{factor}, and \code{factor} has one outlier above 1 at 144 ranks.
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
 \medskip
 \includegraphics[width=0.75\linewidth]{\PCAFigureDir/weak_scaling.png}
-\caption{CPU strong scaling (top) and weak scaling (bottom) of the PCA module. Layouts differ in reading, preparation and communication; comparisons use their own total times.}
+\caption{CPU strong scaling (top) and weak scaling (bottom) for PCA, using each layout's own total time.}
 \label{fig:pca-scaling}
 \end{figure}
 
-\paragraph{Communication and ranking costs.}
-Strong scaling fixes all 9388 matrices $R$ of size $293\times5876$, from one rank to 288 ranks on four machines. Each of the three layouts has one warm-up and three timed repeats. Table~\ref{tab:pca-phases} separates the main stages. For date partitioning, reduction time rises from 7.078\,s at 72 ranks to 15.493\,s at 288; less local multiplication does not offset the reductions. The transpose layout instead redistributes the data. Reading complete factors directly avoids these two collectives but still gathers signatures: zero in the communication column does not mean zero communication.
+\paragraph{Communication and ranking.}
+Strong scaling fixes 9388 matrices $R$ of size $293\times5876$, reaching 288 ranks on four machines, with one warm-up and three repeats per configuration. Table~\ref{tab:pca-phases} gives the 288-rank breakdown. Date-layout reductions grow from 7.078\,s at 72 ranks to 15.493\,s, offsetting part of the compute gain. Transpose and factor layouts instead incur redistribution or signature-gather costs.
 \begin{table}[H]
 \centering\small
-\caption{Median stage times for the fixed real $R$ batch, in s. Communication counts Allreduce/Alltoallv only; Gatherv is separate.}
+\caption{Stage times at 288 ranks, in s. Communication counts Allreduce/Alltoallv; gather is separate. Timers overlap and must not be summed.}
 \label{tab:pca-phases}
 \begin{tabular}{lrrrrrr}
 \toprule
-Layout & Ranks & Solve & Comm. & Gather & Similarity & Admission \\
+Layout & Total & Solve & Comm. & Gather & Similarity & Admission \\
 \midrule
-\code{date} & 72 & 11.537 & 7.078 & 0.036 & 3.148 & 1.085 \\
-\code{date} & 144 & 14.497 & 11.219 & 0.054 & 3.057 & 1.080 \\
-\code{date} & 288 & 18.262 & 15.493 & 1.118 & 3.071 & 1.084 \\
-\code{transpose} & 72 & 2.851 & 3.816 & 0.297 & 3.152 & 1.101 \\
-\code{transpose} & 144 & 1.561 & 4.718 & 0.304 & 3.130 & 1.094 \\
-\code{transpose} & 288 & 0.792 & 5.900 & 0.071 & 3.077 & 1.068 \\
-\code{factor} & 72 & 2.863 & 0.000 & 2.723 & 3.273 & 1.112 \\
-\code{factor} & 144 & 1.586 & 0.000 & 3.262 & 3.162 & 1.099 \\
-\code{factor} & 288 & 0.805 & 0.000 & 1.064 & 3.002 & 1.086 \\
+\code{date} & 18.755 & 18.262 & 15.493 & 1.118 & 3.071 & 1.084 \\
+\code{transpose} & 7.505 & 0.792 & 5.900 & 0.071 & 3.077 & 1.068 \\
+\code{factor} & 5.706 & 0.805 & 0.000 & 1.064 & 3.002 & 1.086 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Communication is nested within solving or redistribution. Stage maxima may also come from different ranks, so the columns must not be summed to reconstruct total time. Similarity and admission run on the root and do not shrink in proportion to rank count.
+A supplementary ranking experiment uses 9216 synthetic panels. Increasing date-layout ranks from 72 to 288 reduces ranking from 19.842\,s to 7.972\,s, but total time only falls from 34.085\,s to 28.277\,s. Weak scaling fixes 32 matrices per rank, $B=32P$, up to 9216 matrices; communication, reading and archive growth still affect total time.
 
-A separate experiment ranks 9216 synthetic sampled-value panels, with three repeats and Python admission checks for each layout at 72, 144 and 288 ranks (Table~\ref{tab:pca-raw-ranking}). In the date layout, ranking falls from 19.842\,s to 7.972\,s, but total time falls only from 34.085\,s to 28.277\,s; reductions offset part of the gain. These measurements include ranking and must be kept distinct from the preconstructed-$R$ timings.
+\paragraph{MPI and OpenMP.}
+Four ranks per machine with 18 threads each are compared across all three layouts at 72, 144 and 288 cores. At 288 cores, hybrid execution improves date and factor layouts but slows transpose (Table~\ref{tab:pca-hybrid}); threads do not remove redistribution and reading costs.
 \begin{table}[H]
 \centering\small
-\caption{Synthetic-input experiment including ranking, in s. Each cell gives ranking / total, each the median of three repeats.}
-\label{tab:pca-raw-ranking}
-\begin{tabular}{rrrr}
+\caption{Pure MPI versus MPI+OpenMP at 288 cores; total times in s.}
+\label{tab:pca-hybrid}
+\begin{tabular}{lrr}
 \toprule
-Ranks & \code{date} & \code{transpose} & \code{factor} \\
+Layout & Pure MPI: $288\times1$ & Hybrid: $16\times18$ \\
 \midrule
-72 & 19.842 / 34.085 & 19.905 / 32.907 & 16.669 / 24.116 \\
-144 & 11.921 / 27.593 & 11.962 / 20.763 & 8.064 / 14.475 \\
-288 & 7.972 / 28.277 & 7.954 / 18.660 & 4.279 / 10.876 \\
+\code{date} & 18.755 & 15.088 \\
+\code{transpose} & 7.505 & 10.036 \\
+\code{factor} & 5.706 & 4.797 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Weak scaling fixes 32 complete-matrix equivalents per rank: $B=32P$, $m=293$, $N=5876$, reaching 9216 synthetic matrices at $P=288$. Weak efficiency in Figure~\ref{fig:pca-scaling} is $T_1/T_P$; total time includes archive growth, changes in batches and reading, and communication.
-
-\paragraph{Combining MPI and OpenMP.}
-On the same real $R$ batch, four MPI ranks per machine with 18 threads each use 72, 144 and 288 cores, giving nine configurations across the three layouts (Figure~\ref{fig:pca-hybrid}). Hybrid execution is not always faster. At 288 cores, \code{factor} falls from 5.706\,s with pure MPI to 4.797\,s, whereas \code{transpose} rises from 7.505\,s to 10.036\,s. Fewer ranks can reduce some collective costs and parallelise root similarity work, but also reduce parallel readers and change redistribution costs; the choice depends on the layout.
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.98\linewidth]{\PCAFigureDir/hybrid_comparison.png}
-\caption{Pure MPI versus four ranks per machine with 18 threads each, on the same real $R$ batch.}
-\label{fig:pca-hybrid}
-\end{figure}
-
-Two A40s on one machine are 1.764 times faster than one. Date blocks are split between the GPUs, with norms and right vectors merged by device-memory Allreduce. A separate two-machine, one-GPU-per-machine correctness check does not establish cross-machine speed-up.
+Two A40s on one machine are 1.764 times faster than one, using CUDA-aware MPI to merge device-memory norms and vectors. Two machines with one GPU each also pass correctness checks.
 
 \paragraph{Archive size.}
-Fixing 128 candidates, the experiment varies $A$ over 1000, 5000, 10000 and 50000, comparing one central process with signature sharding across 4, 16 and 72 ranks. These 16 configurations use deterministic synthetic inputs, one warm-up and three timed repeats. Figure~\ref{fig:pca-archive} separates total time, communication, similarity and sequential decisions.
-
-Central total time grows from 0.050\,s at $A=1000$ to 2.056\,s at $A=50000$; the corresponding 72-rank times are 0.008\,s and 0.997\,s. Sharding reduces similarity work for large archives, but 72-rank communication already costs 0.303\,s, and total time is only slightly below 1.015\,s at 16 ranks. Every candidate still needs MAXLOC to find the nearest record and an ordered state update. A short decision loop does not remove that dependency; stage times must not be added directly.
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.86\linewidth]{\PCAFigureDir/archive_scaling.png}
-\caption{Archive-size effects for 128 fixed candidates, comparing central and MPI-sharded admission; communication includes per-candidate MAXLOC.}
-\label{fig:pca-archive}
-\end{figure}
+With 128 fixed candidates, archive size is varied for central admission and sharding across 4, 16 and 72 ranks. Table~\ref{tab:pca-archive} shows central and 72-rank results. Larger archives increase similarity cost; sharding reduces it, but per-candidate communication and ordered updates remain. At 50{,}000 records, total times at 16 and 72 ranks are 1.015\,s and 0.997\,s, showing little further gain.
+\begin{table}[H]
+\centering\small
+\caption{Archive-size experiment in s; one warm-up and the median of three timed repeats.}
+\label{tab:pca-archive}
+\begin{tabular}{rrrrrr}
+\toprule
+Records & Root similarity & Root admission & Root total & 72-rank total & 72-rank comm. \\
+\midrule
+1000 & 0.045 & 0.005 & 0.050 & 0.008 & 0.004 \\
+5000 & 0.229 & 0.044 & 0.273 & 0.102 & 0.011 \\
+10000 & 0.453 & 0.111 & 0.566 & 0.265 & 0.019 \\
+50000 & 1.729 & 0.309 & 2.056 & 0.997 & 0.303 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsubsection{Agreement of signatures and admission decisions}
-In the full-batch FP32/FP64 comparison, no admission actions change. Every triple of action, nearest key and replaced key agrees, and the final-membership symmetric difference is zero. Replaying supplied signatures and recomputing from the same FP32 $R$ also agree. This supports implementation and precision choices for this input; changes to the solver, iteration budget and initial vector are examined separately below.
+For this batch, CPU, MPI and GPU admission, replacement and rejection decisions agree with the Python reference. FP32/FP64 also gives the same final archive membership. Checks cover threshold boundaries, tied maxima, duplicate factors, replacement margins and invalid signatures; split-batch processing and interruption/resume checks pass as well.
 
-\paragraph{Backend and archive-state checks.}
-Given identical signatures, candidate actions, nearest keys, replaced keys and final members agree with the original Python reference for CPU, CUDA and MPI-sharded archives. Boundary cases cover values near $0.90$, tied maxima, identical keys, a quality increment exactly equal to $0.002$, and invalid signatures. One complete batch and two batches joined through an archive snapshot give the same final state. Actual GP checks also cover interruption/resume and backend identity. Direction error and the admission threshold are different quantities; archive agreement is established by decision-by-decision checks.
-
-\paragraph{Actual GP integration and 16-core calibration.}
-An initial interface check uses 120 dates, 300 stocks and 6 fields, with one generation at each of three depths. CPU/MPI and CUDA both retain 24 archive members, with GP walltimes 189.463\,s and 268.381\,s. The full data dimensions are then used: 1461 dates, 5876 stocks and 132 fields, population 64, warm-start multiplier 3, gene-pool limit 32, and one generation at each depth 1, 2 and 3. Windows are 1/5/10/15/20/30/60, sampling is every fifth date, and power iteration uses four FP64 steps. Table~\ref{tab:live-gp} reports this configuration.
+\paragraph{GP integration and CPU configuration.}
+CPU/MPI and CUDA both complete a full-data-dimension integration check with population 64 and one generation at each depth, retaining the same 325 archive members. A separate fixed batch of 1000 actual expressions compares CPU core counts through factor computation, RankIC, PCA and QD (Table~\ref{tab:gp-cpu-layouts}). The batch is fastest at 144 cores; 288 brings no further gain. Speed-up uses the 16-core baseline from this same experiment.
 \begin{table}[H]
 \centering\small
-\caption{Three-depth GP integration at full data dimensions. Setup and GP walltime are timed separately; the shared-CPU row is a later independent run.}
-\label{tab:live-gp}
-\begin{tabular}{lrrrrrr}
-\toprule
-Backend & Ranks & Threads/rank & Setup / s & GP wall / s & Evaluated & Archived \\
-\midrule
-CPU & 16 & 1 & 371.334 & 233.940 & 1450 & 325 \\
-CUDA (1 A40) & 1 & 16 & 0.046 & 336.705 & 1450 & 325 \\
-CPU (shared) & 16 & 1 & 0.052 & 234.358 & 1450 & 325 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-CPU uses 16 single-threaded MPI ranks. CUDA uses one process, 16 CPU threads and one A40, with an allocation of 36 cores and 240 GB. Factor values and RankIC remain on CPUs in both paths; GPU handles ranking, PCA and similarity. The first CPU run profiles the fields; CUDA and the later shared-CPU run reuse an identity-checked field cache, so setup times are not algorithm speed comparisons. GP walltime includes MPI subprocess startup, the factor engine, PCA, QD, Python control and checkpoints.
-
-The CPU and CUDA runs finish with the same 325 keys but are not bitwise identical: maximum absolute quality difference among common members is $4.70977\times10^{-5}$, and maximum FP32 signature-component difference is $0.00370505$. Evaluations include warm starts and searches at all depths, so the count is not population times generations. The archive accumulates across batches and may exceed one generation's population.
-
-The later shared-resource calibration allocates 16 cores and 112 GB on CN-161 (Xeon Platinum 8452Y). The same three-depth configuration takes 234.358\,s and retains 325 members. A separate fixed, deduplicated batch of 1000 actual expressions goes through factors, RankIC, PCA and QD in the same order. One warm-up and three measurements give a median batch walltime of 64.648\,s, range 64.308--65.301\,s. Each run is checked against original Python QD decisions and final members; repeated numerical outputs within the same layout are bitwise identical. Input validation is separately timed at 102.041\,s.
-
-The calibration job includes these repeated batches and the three-depth GP, taking 10 minutes 28 seconds in total. The machine is shared with other jobs. These measurements validate the resource route and integration, rather than forming a speed-up ratio against dedicated machines; they also differ in input and timing scope from the fixed 10{,}000-expression batch of Section~\ref{sec:x1}.
-
-\paragraph{CPU configuration comparison.}
-A separate CPU experiment fixes the order of 1000 actual expressions through the factor engine, RankIC, PCA and QD, with one warm-up and three timed repeats. Each configuration also runs GP once with population 64, one generation per depth and gene pool 32 (Table~\ref{tab:gp-cpu-layouts}). The 16- and 72-rank cases run sequentially within one 72-core allocation; 144 and 288 ranks use two and four machines. Batch speed-up is relative to this experiment's 16-rank time, not the earlier shared-machine 64.648\,s.
-\begin{table}[H]
-\centering\small
-\caption{Fixed actual-expression batches and small-population GP. Batches use three-repeat medians; GP has one run per configuration.}
+\caption{Fixed batch of 1000 actual expressions: one warm-up and the median of three timed repeats.}
 \label{tab:gp-cpu-layouts}
-\begin{tabular}{rrrr}
+\begin{tabular}{rrr}
 \toprule
-Ranks & Batch / s & Batch speed-up & GP / s \\
+MPI ranks & Batch / s & Speed-up vs 16 cores \\
 \midrule
-16 & 57.874 & 1.000 & 261.382 \\
-72 & 27.932 & 2.072 & 207.670 \\
-144 & 22.504 & 2.572 & 214.603 \\
-288 & 23.727 & 2.439 & 270.163 \\
+16 & 57.874 & 1.000 \\
+72 & 27.932 & 2.072 \\
+144 & 22.504 & 2.572 \\
+288 & 23.727 & 2.439 \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-The fixed batch is fastest at 144 ranks, whereas small-population GP is fastest at 72; 288 ranks bring no further gain. Fixed-input validity agrees across all configurations, each passes Python QD replay, and final GP membership also agrees, although floating-point outputs across layouts are not bitwise identical. Fixed-batch scaling therefore does not directly measure the gain of the whole evolution loop.
 
 \paragraph{Production-scale GP.}
-On all existing 2016--2021 evolution-period data, population is increased to 10{,}000 with ten generations at each of depths 1, 2 and 3. Gene and parent pools are capped at 2000, with warm-start multiplier 3. Windows remain 1/5/10/15/20/30/60; sampling is every fifth date, power iteration uses four FP64 steps, and the random seed is 2026. The run uses 16 single-threaded MPI ranks on CN-161, an allocation of 112 GB, and an identity-checked cached field profile.
-
-All 30 generations complete. Evolution walltime is 53{,}114.182\,s (14.754 hours); total PBS job walltime is 14 hours 45 minutes 47 seconds. There are 358{,}903 recorded candidate evaluations, 67{,}987 final archive records and zero recorded PCA failures. Final archive indices, qualities and signatures pass integrity checks. Table~\ref{tab:gp-production} gives the results at generation ten of each depth.
+The complete evolution-period data contain 1461 dates, 5876 stocks and 132 fields. Production uses 16 single-threaded MPI ranks, population 10{,}000, ten generations at each of three depths, gene-pool limit 2000 and four-step FP64 power iteration. All 30 generations complete in 14.754 hours, recording 358{,}903 evaluations and retaining 67{,}987 archive records. No PCA failures are recorded, and the final archive passes integrity checks.
 \begin{table}[H]
 \centering\small
-\caption{Last-generation results at each depth in production GP. RankIC and fitness describe the 10{,}000 current individuals; archive size accumulates across generations.}
+\caption{Last generation at each depth: scores describe the current population; archive size accumulates across generations.}
 \label{tab:gp-production}
 \begin{tabular}{rrrrr}
 \toprule
@@ -889,7 +850,7 @@ Depth & Archived & Best $|\overline{\mathrm{IC}}|$ & Mean $|\overline{\mathrm{IC
 \end{tabular}
 \end{table}
 
-Mean absolute RankIC and fitness increase at later depths, indicating a higher-scoring population on the evolution-period data in this run. Archive size reflects both quality and diversity, rather than a count of trade-ready factors; the means in the table do not describe the whole cumulative archive. Production-scale timing is measured only at 16 cores, so it is reported as an actual completion time, without inferring a full-GP CPU/GPU or cross-core speed-up.
+Mean absolute RankIC and fitness increase with depth in Table~\ref{tab:gp-production}, showing a higher-scoring population on the evolution-period data in this run. Production is measured only at 16 cores, so it does not establish full-workflow speed-up for other core counts or GPUs.
 
 \subsection{Power iteration versus Lanczos}
 
@@ -906,33 +867,15 @@ Among 9388 matrices, 13.9\% have $\sigma_2/\sigma_1>0.9$. With seed 0, four-step
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.92\linewidth]{\PCAFigureDir/convergence.png}
-\caption{Direction errors of power iteration and Lanczos against iteration count (left) and actual matrix--vector products (right).}
+\caption{Direction errors against iteration count (left) and matrix--vector products (right).}
 \label{fig:solver-convergence}
 \end{figure}
 
-Table~\ref{tab:pca-spectrum} adds quantiles of the real-matrix spectral ratios. Most matrices have a substantial leading gap, but the upper tail approaches one; a fixed iteration count cannot guarantee equal accuracy for every matrix.
-\begin{table}[H]
-\centering\small
-\caption{Quantiles of $\sigma_2/\sigma_1$ for the 9388 real matrices.}
-\label{tab:pca-spectrum}
-\begin{tabular}{rr}
-\toprule
-Percentile / \% & Ratio \\
-\midrule
-25 & 0.4707 \\
-50 & 0.5806 \\
-75 & 0.7835 \\
-90 & 0.9353 \\
-99 & 0.9927 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The controlled-spectrum experiment uses four analytical orthogonal directions with singular values $(1,r,0.2,0.1)$, then adds Gaussian noise of standard deviation $10^{-8}$. There are eight matrices at each $r=0.5,0.9,0.99$, for 24 in total. Exact SVD checks the noisy spectral ratios; both algorithms use three initial vectors and 1--10 steps (Figure~\ref{fig:pca-controlled}). This isolates the spectral-gap effect; its approximately low-rank structure does not replace the real-factor results.
+To control the gap, we generate matrices with singular values $(1,r,0.2,0.1)$ from four orthogonal directions and add Gaussian noise of standard deviation $10^{-8}$. Each value of $r$ (0.5, 0.9 or 0.99) has eight matrices, three initial vectors and 1--10 steps. Figure~\ref{fig:pca-controlled} shows slower power iteration as the leading values approach each other, while Lanczos reaches smaller error in fewer steps.
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.98\linewidth]{\PCAFigureDir/controlled_spectrum_convergence.png}
-\caption{Direction error versus budget with controlled separation of the two leading singular values.}
+\includegraphics[width=0.93\linewidth]{\PCAFigureDir/controlled_spectrum_convergence.png}
+\caption{Convergence of both algorithms under different spectral gaps.}
 \label{fig:pca-controlled}
 \end{figure}
 
@@ -940,7 +883,7 @@ The controlled-spectrum experiment uses four analytical orthogonal directions wi
 SVD first determines an offline iteration budget for each matrix, capped at ten steps. Both methods process all 9388 matrices; unreached targets are reported separately. Costs are then compared on the 6679 matrices where both methods reach the target (Table~\ref{tab:solver-cost}, Figure~\ref{fig:solver-cost}). This common reached set means both methods attain the same error threshold within ten steps, avoiding a timing comparison at different accuracies. Lanczos reaches more matrices and reduces common-set solve time from 10.235\,s to 8.154\,s, about 20.3\%.
 \begin{table}[H]
 \centering\small
-\caption{Matched-accuracy comparison. Reached/unreached counts cover all matrices; the final three columns cover only the common 6679. Logical payload uses decimal GB.}
+\caption{Matched accuracy: reached counts cover all 9388 matrices; costs cover only the common 6679.}
 \label{tab:solver-cost}
 \begin{tabular}{lrrrrr}
 \toprule
@@ -954,7 +897,7 @@ Lanczos & 8179 & 1209 & 8.154 & 109162 & 1.127 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.93\linewidth]{\PCAFigureDir/full_accuracy_cost.png}
-\caption{Solve time, reduction calls and logical communication payload for the common reached set.}
+\caption{Solve time, Allreduce calls and logical payload on the common reached set.}
 \label{fig:solver-cost}
 \end{figure}
 
@@ -964,7 +907,7 @@ Lanczos reorthogonalisation adds scalar reductions, but the required iteration b
 Use four-step power iteration with seed 0 as the baseline. Candidate order and quality are fixed; only the signature method and budget change. Action changes count differences between admit, replace and reject; nearest-record changes also include cases where the action stays the same but the matched record differs. Table~\ref{tab:decision-change} shows that eight-step power changes 637 actions and gives a final-membership symmetric difference of 372. This counts both members entering and leaving, not replacement events: one member removed and another added contribute 2. The complete experiment stores 60 trajectories, and different starts also give changes (Figure~\ref{fig:decision-change}).
 \begin{table}[H]
 \centering\small
-\caption{Admission changes relative to the four-step power baseline.}
+\caption{Admission changes relative to four-step power iteration (seed 0); final membership uses symmetric difference.}
 \label{tab:decision-change}
 \begin{tabular}{lrrrr}
 \toprule
@@ -982,7 +925,7 @@ Lanczos & 8 & 758 & 4945 & 461 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.72\linewidth]{\PCAFigureDir/decision_sensitivity.png}
-\caption{Effects of solver, budget and starting vector on admission actions.}
+\caption{Admission-action changes for two algorithms and three initial vectors relative to the baseline.}
 \label{fig:decision-change}
 \end{figure}
 
@@ -1052,7 +995,7 @@ GP can explore asynchronous steady-state evolution, overlap CPU factor evaluatio
 \section{Conclusion}
 We move the original Python GP's batch evaluation into C++, share subexpressions through a DAG, partition dates for an MPI + OpenMP engine, and integrate handwritten CPU/CUDA PCA, similarity and sequential QD. The original fixed engine batch falls from about 5060\,s on one core to 75.0\,s with 288 pure-MPI ranks. On the same 288 cores, node-level threading with $4\times72$ reaches 27.8\,s. Gains come from less local work and shared-memory reuse; halo, boundary restarts and imbalance limit later scaling.
 
-PCA experiments show why ranking, preparation, communication and admission must be timed alongside multiplication. Two A40s are 1.764 times faster than one, but the 72-core CPU configuration is faster for this batch workflow. Lanczos reaches the target on more matrices within ten steps and reduces common-target solve time by about 20.3\%; changing the solver or budget also changes some archive members. On all evolution-period data, the 16-core CPU completes population 10{,}000 and ten generations at each of three depths, recording 358{,}903 evaluations and retaining 67{,}987 archive records in 14.754 hours of evolution. This verifies the factor-engine/PCA/QD connection through production-scale evolution; cross-device speed-ups remain separately reported from fixed-input module experiments.
+PCA experiments show why ranking, preparation, communication and admission must be timed alongside multiplication. Two A40s are 1.764 times faster than one, but the 72-core CPU configuration is faster for this batch workflow. Lanczos reaches the target on more matrices within ten steps and reduces common-target solve time by about 20.3\%; changing the solver or budget also changes some archive members. The 16-core CPU also completes population 10{,}000 and ten generations at each of three depths in 14.754 hours, verifying integration at production scale.
 
 \section*{Use of AI tools}
 Claude and Codex were used to help generate and compile the C++ code, write the \LaTeX{} report, and polish and translate the text between Chinese and English. The original genetic-programming algorithm and the design of the distributed parallel algorithm were done by the group members; the experiments on the distributed algorithm were carried out by the group members in collaboration with the AI tools after discussion.
