@@ -177,13 +177,14 @@ For one expression on $T$ days and $N$ stocks:
 A batch of $E$ expressions costs $O(E\,TN\log N)$ in total. The run time should therefore grow linearly in $T$ and in the batch size and slightly faster than linearly in $N$; Section~\ref{sec:x1} compares these slopes with measurements.
 
 \subsection{The original implementation and its bottlenecks}
+\label{sec:legacy}
 The Python engine evaluates each expression independently in a pool of 32 processes:
 \begin{itemize}[nosep]
   \item shared subtrees are recomputed from raw data every time, because its cache stores only final scores;
   \item every process holds the full data, and parallelism is limited to the number of expressions in a batch;
   \item the signature is computed in single-threaded NumPy, and only the final similarity matrix multiplication uses the GPU.
 \end{itemize}
-A previous run selected $1481$ factors, with mean out-of-sample $|\mathrm{RankIC}|$ of $0.080$ in 2022.
+The original program was previously run once in full: after three-level GP evolution, candidates were screened on out-of-sample data from 2022, and $1481$ factors were selected, with mean out-of-sample $|\mathrm{RankIC}|$ of $0.080$. We call these 1481 factors the \emph{factor library}; the size estimates and the validation below use it as a reference.
 
 %======================================================================
 \section{Data}
@@ -364,7 +365,7 @@ Per rank, computation shrinks as $1/p$ while the halo volume stays constant and 
 \providecommand{\PCAFigureDir}{figures/pca}
 Let $m=\lceil T/5\rceil$ denote the number of sampled dates; here $m=293$.
 \paragraph{Sampling and ranking.}
-PCA follows the factor engine's date partition. Each rank selects only its owned rows with global index $t\bmod5=0$, excluding halo rows, so no date is counted twice. A GPU thread block sorts one sampled cross-section with bitonic sort, padding the stock count to a power of two; the current limit is 8192 columns. Ties receive average ranks, missing ranks are filled with $0.5$, and each row is centred. Bitonic sorting costs $O(N\log^2N)$, against $O(N\log N)$ for CPU comparison sorting; performance must be measured at the actual dimensions.
+PCA follows the factor engine's date partition. Each rank selects only its owned rows with global index $t\bmod5=0$, excluding halo rows, so no date is counted twice. A GPU thread block sorts one sampled cross-section with bitonic sort, padding the stock count to a power of two; the current limit is 8192 columns. Ties receive average ranks, missing ranks are filled with $0.5$, and each row is centred. Bitonic sorting costs $O(N\log^2N)$, against $O(N\log N)$ for CPU comparison sorting; Section~\ref{sec:pca-results} gives the measurements.
 
 \paragraph{Batched power iteration and communication.}
 Write the local date block as $R_p$. Every rank holds the same right vector $v$. The product $R_pv$ is local, while global normalisation and the reverse product require
@@ -378,14 +379,13 @@ A batch of $B$ factors combines the reductions into $B$ norms and $BN$ vector co
 \paragraph{Tiled similarity GEMM and the cuBLAS comparison.}
 Centre and normalise the candidate and archive signatures by row, giving $S_c\in\mathbb{R}^{B\times m}$ and $S_a\in\mathbb{R}^{A\times m}$. Then $C=|S_cS_a^\top|$, with element-wise absolute values, gives $B\times A$ absolute Pearson correlations. Here $B$ is the candidate count, $A$ is the current archive size, and $m$ is the signature length; $C_{ij}$ compares candidate $i$ with archive member $j$. The handwritten CUDA kernel loads signature tiles into shared memory with $16\times16$ thread blocks, accumulates along the signature dimension, and fuses the absolute value. Candidate--candidate similarities are also precomputed in batches.
 
-The independent cuBLAS reference uses identical device inputs, strict FP32 and disabled TF32. Its GEMM plus abs is compared with the handwritten kernel's fused operation. The library is 1.45--3.89 times faster; Table~\ref{tab:cublas} gives the configurations and timings. cuBLAS is a performance reference only; the production backend retains the handwritten kernel.
+We also implemented the same computation with cuBLAS, as a performance reference only; Section~\ref{sec:pca-results} compares the two.
 
 \paragraph{Sequential admission and the serial fraction.}
-After similarity precomputation, candidates are still admitted, replaced or rejected in their original order. FP32 estimates and conservative error bounds identify comparisons that could affect the nearest record, ties or threshold decisions; the CPU refines those comparisons in FP64 before updating the archive. If this sequential part occupies $f_{\rm adm}=T_{\rm adm}/T_{\rm total}$ of the workflow, accelerating everything else by a factor $q$ cannot give a total speed-up above $[f_{\rm adm}+(1-f_{\rm adm})/q]^{-1}$, with limit $1/f_{\rm adm}$. In the full-batch experiments of Table~\ref{tab:pca-total-stages}, sequential admission occupies about 1.48\% and 2.64\% for one and two GPUs, respectively. These fractions exclude similarity precomputation.
+After similarity precomputation, candidates are still admitted, replaced or rejected in their original order. FP32 estimates and conservative error bounds identify comparisons that could affect the nearest record, ties or threshold decisions; the CPU refines those comparisons in FP64 before updating the archive. If this sequential part occupies $f_{\rm adm}=T_{\rm adm}/T_{\rm total}$ of the workflow, accelerating everything else by a factor $q$ cannot give a total speed-up above $[f_{\rm adm}+(1-f_{\rm adm})/q]^{-1}$, with limit $1/f_{\rm adm}$. Section~\ref{sec:pca-results} reports the measured fractions.
 
 \paragraph{Data layouts and interfaces.}
 The three layouts differ in how MPI ranks share work: jointly processing different dates of a factor, or processing complete factors separately. \code{date} retains the date partition and reduces each iteration; \code{transpose} first redistributes complete factors with Alltoallv, then solves locally; \code{factor} reads complete factors assigned to each rank. Besides a central archive, signature sharding is implemented: ranks compare their local records and use MAXLOC to select the global nearest one, while small metadata such as keys and quality remain replicated.
-GPU ranking also offers a NaN-preserving percentile interface and an FP64 entry point compatible with the original engine's double ranking for RankIC reuse. In the measured GP runs, factor values and RankIC are still computed on CPUs.
 
 \subsection{Power iteration versus Lanczos}
 \label{sec:pca-solvers}
@@ -396,22 +396,22 @@ Both methods use only products with $R$ and $R^\top$, without explicitly forming
  s=\frac{Rv_k}{\|Rv_k\|_2}.
  \label{eq:power}
 \end{equation}
-It retains only the current vectors. When $\sigma_1>\sigma_2$ and the start has a component in the leading direction, secondary components decay approximately as $(\sigma_2/\sigma_1)^{2k}$. A smaller spectral gap slows convergence. Four steps are therefore the original program's budget, not a general convergence guarantee.
+It retains only the current vectors. When $\sigma_1>\sigma_2$ and the start has a component in the leading direction, secondary components decay approximately as $(\sigma_2/\sigma_1)^{2k}$. A smaller spectral gap slows convergence. Four steps are therefore only the budget inherited from the original program, not a guarantee of convergence.
 
 Lanczos also depends on singular-value gaps and the initial projection, but retains multiple orthogonal directions and solves in a growing subspace. For rectangular $R$, this implementation uses Golub--Kahan--Lanczos bidiagonalisation (\href{https://netlib.org/utk/people/JackDongarra/etemplates/node197.html}{Netlib description}). It constructs left and right bases $U_k,V_k$ and a small bidiagonal $B_k=U_k^\top RV_k$. If $z$ is the leading left singular vector of $B_k$, the signature is approximated by $U_kz$. Both bases receive two passes of full reorthogonalisation. A handwritten Jacobi method solves $B_kB_k^\top$; breakdown stops expansion and retains the terminal contribution actually formed.
 
 Extra storage is $O(m+N)$ for power iteration and $O(k(m+N)+k^2)$ for Lanczos, which also pays for orthogonalisation. A complete alternating update mainly requires one product with $R$ and one with $R^\top$, plus normalisation or orthogonalisation. In this implementation $k$ power iterations use $2k+1$ products, whereas a normal $k$-step bidiagonalisation usually uses $2k-1$; residual diagnostics add two more. The experiments compare iteration budgets, product counts and the cost of a common accuracy target. Power iteration supports CPU/MPI and CUDA; Lanczos currently runs on CPU/MPI.
 
-Whether four steps suffice for admission must be checked through decisions, not just direction error. With the same initial vector and candidate order, eight rather than four steps change 637 actions and produce a final-membership symmetric difference of 372 (Table~\ref{tab:decision-change}). Four steps therefore provide no general guarantee of exact admission decisions; the current budget is retained to reproduce the original program.
+The production pipeline uses four-step power iteration; Section~\ref{sec:solver-results} compares the two methods as an extension experiment, in accuracy, cost and effect on admission decisions.
 
 %======================================================================
 \section{Validation}
 \label{sec:validation}
-A faster engine is only useful if it computes the same numbers. We had a ready-made reference for this. An earlier full run of the original Python miner produced a factor library of 1481 factors, and Python had already computed their values, daily RankIC and fitness. Validation therefore means asking the C++ engine to compute the same things again and comparing them with Python's results item by item.
+We validate the C++ engine against the results of the original Python program. An earlier full run of that program produced a factor library of 1481 factors (Section~\ref{sec:legacy}), together with their factor values, daily RankIC and fitness. Validation asks the C++ engine to compute the same quantities again and compares them with Python's results item by item.
 
 \paragraph{Parsing and DAG.} We first checked that C++ reads expressions the way Python does. We parsed all 1481 library expressions plus 50 hand-written ones (at least one for every operator and every normalisation rule), 1531 in total, on both sides. Every valid expression gets the same depth and node count, and two expressions that Python considers equivalent (same normalised key) end up on the same DAG root in C++.
 
-\paragraph{Operators.} Comparing every cell of the full data would be slow, so we cut a sample of 120 days $\times$ 300 stocks from the real data, keeping all 132 fields, and evaluated 88 expressions on it. The first 48 test single operators, each with windows 1, 5 and 20, plus a few nested combinations; the other 40 are taken from the factor library, to check that operators still agree when combined as in real factors. The number of cases follows from this design, not from a target. A cell passes if $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and missing values are in the same places; the absolute term is there because pandas itself computes a few operators in float32.
+\paragraph{Operators.} Comparing every cell of the full data would be slow, so we cut a sample of 120 days $\times$ 300 stocks from the real data, keeping all 132 fields, and evaluated 88 expressions on it. The first 48 test single operators, each with windows 1, 5 and 20, plus a few nested combinations; the other 40 are taken from the factor library, to check that operators still agree when combined as in real factors. A cell passes if $|q-p|\le 10^{-4}|p| + 10^{-5}\,\mathrm{rms}(p)$ and missing values are in the same places; the absolute term is there because pandas itself computes a few operators in float32.
 
 With textbook sliding-window formulas only 53 of the 88 cases passed. Every failure came from rounding: a tiny rounding difference decides whether a window counts as constant, and that decides whether a correlation is finite, missing or infinite. After porting the pandas~3.0.3 window kernels line by line (Section~\ref{sec:fpcal}) and treating windows that are constant within their range consistently, all 88 cases pass, with missing and infinite values in exactly the same places.
 
@@ -420,6 +420,8 @@ With textbook sliding-window formulas only 53 of the 88 cases passed. Every fail
 Small hand-computed unit tests cover the corner cases that real data rarely hit: ties, perfectly positive and negative correlation, constant cross-sections, the segment split, the sign-consistency penalty and the three rejection rules. The ema scan is checked bit for bit against the serial ema for several block splits, missing-value patterns and spans.
 
 \paragraph{Distributed against serial.} The distributed engine is compared with our own serial engine rather than with Python. It must give the same validity for every candidate and fitness within $10^{-5}$. We do not require bit-identical panels: rolling sums and variances restart at every block boundary, so the last bits of a cell can differ, and a cell close to zero can differ by a large relative amount without changing any ranking. In the runs where we counted them (up to 32 ranks), more than 99.998\% of cells were bit-identical. On Vanda we also checked larger configurations on the first 1000 expressions of the batch: 72 ranks on one machine, 288 ranks on four machines, 16 ranks $\times$ 18 node-level threads on four machines, and several chunk sizes; all pass.
+
+\paragraph{PCA signatures and admission.} Given the same signatures, the CPU, CUDA and MPI-sharded backends reproduce the original Python implementation candidate by candidate: the same admission action, the same most similar archive member and the same final archive. The tests cover similarities close to the 0.9 threshold, ties for the maximum, a quality difference of exactly 0.002 and invalid signatures. For the 9388 matrices of Section~\ref{sec:pca-results}, signatures solved in FP32 and in FP64 give identical admission actions and final archives.
 
 %======================================================================
 \section{Experiments}
@@ -430,8 +432,7 @@ Small hand-computed unit tests cover the corner cases that real data rarely hit:
 
 \subsection{DAG and memory}
 \label{sec:dag-exp}
-\paragraph{Inputs and measurement scope.}
-Tables~\ref{tab:dag-sharing} and~\ref{tab:dag-memory} use random proposal batches, not consecutive evolved GP populations. The depth-3 batches share one randomly generated gene pool; this preserves reusable building blocks but does not establish real evolutionary reuse. Graph analyses run on an arm64 Mac (Python 3.13.5). The serial planner benchmark warms up once and measures three times; construction includes validation, normalisation and adjacency construction, while scheduling includes reference and live-panel checks. Neither time includes factor evaluation. The Vanda validation below is measured separately with GNU time. No MPI speed-up is inferred from these planner measurements.
+\paragraph{Inputs.} Tables~\ref{tab:dag-sharing}--\ref{tab:dag-memory} use randomly generated proposal batches rather than populations evolved by a real GP run, so the sharing ratios describe this kind of input only; the three depth-3 batches share one random gene pool. Planner times were measured on an arm64 Mac (Python 3.13.5), with one warm-up and three timed runs, and cover graph construction and scheduling only, not factor evaluation.
 
 \subsubsection{Subexpression sharing and serial planning}
 \begin{table}[htbp]
@@ -446,10 +447,10 @@ Depth 3 & 9,991 & 40,942 & 13,135 & 67.9\% & 44.5\% \\
 Depth 3 warm start & 29,955 & 125,465 & 32,825 & 73.8\% & 54.4\% \\
 \bottomrule
 \end{tabular}
-\caption{Random-batch sharing. Tree counts precede normalisation and include leaves; operator-only reduction excludes leaves. Neither reduction is a measured speed-up.}
+\caption{Subexpression sharing in random batches. Tree nodes are counted before normalisation and include leaves; ``operator-only reduction'' excludes leaves.}
 \label{tab:dag-sharing}
 \end{table}
-Depth 1 shares only field leaves in these batches: its operator count is unchanged. The warm-start DAG has 132 leaves and 7,117, 15,273 and 10,303 nodes at levels 1--3. The widest layer is therefore not the number of roots or the peak live set. Python and C++ agree on canonical node sets, levels, subtree sizes, reference counts, accepted inputs and root order for all measured prefixes.
+Depth-1 batches can share only field leaves, so their operator count does not fall; sharing grows with depth and batch size. The warm-start batch gives a DAG with 132 leaves and 7,117, 15,273 and 10,303 operator nodes in its three levels.
 
 \begin{table}[htbp]
 \centering\small
@@ -466,7 +467,7 @@ Expressions & $V_d$ & $E_d$ & Build (s) & Chunk 256 (s) & Greedy (s) \\
 \caption{Serial Python planning on warm-start prefixes: distinct vertices $V_d$ and child--parent edges $E_d$. The last two columns time scheduling only.}
 \label{tab:dag-runtime}
 \end{table}
-The largest graph has 44,034 operand references but 44,032 distinct edges, because repeated inputs count twice for lifetime management. Both graph dimensions grow in this experiment; they are not independently controlled. Construction grows approximately with batch size over these four points, while greedy scheduling is more expensive than simple chunk scheduling. These are planner overheads, not C++ factor runtimes, and no same-hardware end-to-end overhead ratio has been measured.
+Construction time grows roughly linearly with batch size, to about 0.47\,s for 10{,}000 expressions; greedy scheduling is 35--55 times slower than chunk scheduling but still takes only seconds. These are Python planner overheads and are not directly comparable with the C++ run times of Section~\ref{sec:fc-exp}.
 
 \begin{figure}[htbp]
 \centering
@@ -476,7 +477,7 @@ The largest graph has 44,034 operand references but 44,032 distinct edges, becau
 \end{figure}
 
 \subsubsection{Peak memory against batch size}
-For equal float32 panels, the model converts a peak live count $L$ into $4LN\lceil T/p\rceil$ bytes, with $T=1461$, $N=5876$ and $p=1$ here. This excludes halos, retained pool buffers, target ranks, operator scratch and communication/PCA workspaces; it is not RSS. Operator-group counts describe scheduling granularity, not measured MPI synchronisations or messages.
+Table~\ref{tab:dag-memory} estimates peak memory with a model: each float32 panel takes $4N\lceil T/p\rceil$ bytes ($T=1461$, $N=5876$, $p=1$), and the peak is the number of simultaneously live panels times the panel size. The model ignores halo, pool buffers and work areas, so it is a logical value, not measured memory. The number of execution groups is the number of groups into which the schedule is cut.
 
 \begin{table}[htbp]
 \centering\small
@@ -495,17 +496,17 @@ Greedy & 1,553 & 49.67 & 32,693 \\
 \caption{Logical live-panel peaks on the random warm-start batch.}
 \label{tab:dag-memory}
 \end{table}
-Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 reduces it by another 77.0\%. Reducing the chunk from 256 to 64 saves only 4.65\% more panels but nearly quadruples groups. The peak has two parts: the outputs of the current chunk (about $C$ panels) and input panels of earlier levels that still have pending consumers and cannot be released; a smaller $C$ shrinks only the first. Greedy uses the fewest panels and permits on-demand field loading, but its fine-grained execution may reduce parallelism. This is a memory--granularity trade-off, not evidence that greedy minimises runtime. The engine performs one halo exchange per execution group, and Section~\ref{sec:comm} shows that halo time is mostly waiting; greedy has more than 30{,}000 groups of about one node each, so threads cannot work in parallel and the number of synchronisations is two orders of magnitude higher than with chunk 256. The engine therefore uses chunking, and greedy serves only as a lower-bound reference for memory.
+Early release reduces the peak by 45.1\% relative to retained roots; chunk 256 reduces it by another 77.0\%. Reducing the chunk from 256 to 64 saves only 4.65\% more panels but nearly quadruples groups. The peak has two parts: the outputs of the current chunk (about $C$ panels) and input panels of earlier levels that still have pending consumers and cannot be released; a smaller $C$ shrinks only the first. Greedy uses the fewest panels but has the finest execution granularity. The engine performs one halo exchange per execution group, and Section~\ref{sec:comm} shows that halo time is mostly waiting; greedy has more than 30{,}000 groups of about one node each, so threads cannot work in parallel and the number of synchronisations is two orders of magnitude higher than with chunk 256. The engine therefore uses chunking, and greedy serves only as a lower-bound reference for memory.
 
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=\linewidth]{figures/dag_memory.png}
-\caption{Simulated memory against batch size (left) and scheduling groups for the largest batch (right), with logarithmic axes. Groups are not MPI message counts.}
+\caption{Model-estimated peak memory against batch size (left, logarithmic axes), and peak memory against number of execution groups for each schedule on the largest batch (right).}
 \label{fig:dag-memory}
 \end{figure}
 
-\paragraph{Small engine check.}
-On Vanda CPU machine CN-016, the serial C++ exporter evaluates the same first 200 expressions on 120 days $\times$ 300 stocks. OpenMP, MPI and CUDA are disabled (GCC 14.3.0, Release). Formula chunks of 16, 64 and 200 are each run three times in that order with GNU time. Each chunk constructs a separate DAG; this differs from dividing a layer of one shared DAG.
+\paragraph{Measured check of chunking.}
+On Vanda, the serial C++ engine evaluates the first 200 expressions (120 days $\times$ 300 stocks) in chunks of 16, 64 and 200 expressions, three runs per setting (Table~\ref{tab:dag-s4}).
 
 \begin{table}[htbp]
 \centering
@@ -518,14 +519,15 @@ Formula chunk & Median wall time (s) & Range (s) & Median RSS (MiB) \\
 200 & 1.29 & 1.26--1.75 & 34.53 \\
 \bottomrule
 \end{tabular}
-\caption{Actual single-machine formula-chunk experiment; three separate processes per setting.}
+\caption{Measured chunked evaluation by expression with the serial engine (first 200 expressions, 120 days $\times$ 300 stocks, three runs per setting).}
 \label{tab:dag-s4}
 \end{table}
-A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not the exact scheduling of Table~\ref{tab:dag-memory}.
+All three chunk sizes give identical RankIC, fitness and segment statistics for the 200 expressions; with 64 expressions per chunk the peak memory (median RSS) is 26.4\% lower than with 200. At this size the run-time differences between the three settings are within measurement noise.
 
 \paragraph{Consequences for the engine.} These results fix how the engine evaluates a batch in the experiments that follow. Sharing (Table~\ref{tab:dag-sharing}) is why a whole batch is merged into one DAG before evaluation: the real batch of Section~\ref{sec:experiments} gives 12{,}083 DAG nodes for 10{,}000 expressions. Once roots are released early, the widest level sets the peak (Table~\ref{tab:dag-memory}), so the engine also processes wide levels in chunks (Section~\ref{sec:threads}): the widest level of that batch has 8614 nodes, and the runs below use chunks of 1000 nodes on one machine and 2000 on several. Chunking does not change any score (Table~\ref{tab:dag-s4} and Section~\ref{sec:threads}). Its cost is one halo exchange per chunk instead of one per level; we did not compare run times with and without chunking.
 
 \subsection{Factor computation and evaluation}
+\label{sec:fc-exp}
 
 \subsubsection{Serial run time against problem size}
 \label{sec:x1}
@@ -548,7 +550,7 @@ batch size, real & 625 -- 10{,}000 & 568 -- 5059 & 0.89 \\
 \label{tab:x1}
 \end{table}
 
-The whole batch takes 5059\,s (1.4 hours) on one core, which is why a generation of the Python miner is slow. The run time is close to linear in every dimension, as Section~\ref{sec:cost} predicts: operators are $O(TN)$ per node and RankIC is $O(TN\log N)$, which shows up as the slope slightly above 1 on synthetic data. The slope in $T$ on real data (1.09) is larger because the market grows: the early years, which the short prefixes cover, have fewer listed stocks per day. The slope in batch size is below 1 (0.89) because larger batches share more subexpressions: 625 expressions need 2.1 DAG nodes each, 10{,}000 need 1.2. RankIC takes 70\% of the serial time (3522\,s against 1536\,s for the operators), because 83\% of the nodes of this batch are roots and each root's RankIC sorts every day's cross-section.
+The whole batch takes 5059\,s (1.4 hours) on one core (the 5060\,s for one rank in Table~\ref{tab:x2} is a separate run). The run time is close to linear in every dimension, as Section~\ref{sec:cost} predicts: operators are $O(TN)$ per node and RankIC is $O(TN\log N)$, which shows up as the slope slightly above 1 on synthetic data. The slope in $T$ on real data (1.09) is larger because the market grows: the early years, which the short prefixes cover, have fewer listed stocks per day. The slope in batch size is below 1 (0.89) because larger batches share more subexpressions: 625 expressions need 2.1 DAG nodes each, 10{,}000 need 1.2. RankIC takes 70\% of the serial time (3522\,s against 1536\,s for the operators), because 83\% of the nodes of this batch are roots and each root's RankIC sorts every day's cross-section.
 
 \begin{figure}[H]
 \centering
@@ -558,6 +560,7 @@ The whole batch takes 5059\,s (1.4 hours) on one core, which is why a generation
 \end{figure}
 
 \subsubsection{Strong scaling (pure MPI)}
+\label{sec:x2}
 One thread per rank, $H_0=0$, 1 to 72 ranks on one machine and 144 and 288 ranks on two and four machines (Table~\ref{tab:x2}, Figure~\ref{fig:x2}).
 
 \begin{table}[H]
@@ -630,6 +633,7 @@ The drop from one to two ranks is the halo exchange (about 8.5\,s, rising only t
 \end{figure}
 
 \subsubsection{MPI + OpenMP}
+\label{sec:x5}
 \paragraph{One rank.} With one rank and 2 to 72 threads, operator-level threading takes 2613, 1349, 690.9, 360.9, 200.2 and 110.3\,s, and node-level threading 2528, 1267, 635.9, 321.9, 166.6 and 89.2\,s (Figure~\ref{fig:x5}, left). Node-level threading is faster at every thread count and reaches a speed-up of 56.7 at 72 threads (operator-level: 45.9). With 3337 and 8614 nodes in the two operator levels there is always enough work for every thread, and no parallel region is opened per operator. On one machine, 72 threads (89.2\,s) are 1.6 times faster than 72 ranks (142.7\,s), because they need no halo exchange and no boundary restarts.
 
 \paragraph{288 cores.} We split four machines into ranks $\times$ threads (Table~\ref{tab:x5}, Figure~\ref{fig:x5}, right).
@@ -657,31 +661,39 @@ With node-level threads the time falls steadily as ranks are replaced by threads
 \label{fig:x5}
 \end{figure}
 
-\subsection{PCA signatures and similarity}
-
-\subsubsection{Serial cost}
+\subsection{Parallel PCA implementation}
 \label{sec:pca-results}
-The PCA input is constructed separately: random depth-3 proposals produce 9388 nonconstant matrices $R$, of which 8866 candidates are eligible for QD; four-step power iteration gives 2988 archive members. The lower-depth gene pool also comes from random proposals. This input differs from the earlier fixed depth-2 batch of 10{,}000 expressions. We first vary the size of 128 real panels, then report performance on the full $R$ batch.
+All PCA experiments in this section use the original program's four-step power iteration. The input is 9388 non-constant matrices $R$ (each $293\times5876$) exported from random depth-3 proposals; 8866 of them are valid candidates for admission, and sequential admission yields an archive of 2988 members. This input differs from the 10{,}000 expressions of Section~\ref{sec:fc-exp}.
 
-The original engine first computes 128 factor panels. Their values are held fixed while changing the sampling interval (1, 2, 5, 10, 20), stock prefix (367, 734, 1469, 2938, 5876), batch size $B$ and iteration count $k$, giving 19 configurations. Each has one warm-up and three timed repeats, including fresh ranking, signatures and QD. Eight-thread factor generation takes 86.410\,s and is reported separately. PCA is single-threaded and includes sample copying, ranking, solving and admission; serialisation is separate.
-
+\subsubsection{Single-thread cost}
+We first measure the single-thread CPU cost of PCA on 128 real factor panels. The panel values are fixed, and each configuration changes only the batch size $B$, the number of sampled dates $m$, the number of stocks $N$ or the number of steps $k$; each configuration is warmed up once and timed three times (Figure~\ref{fig:pca-real-size}). Time grows approximately linearly in $B$, $m$ and $N$, consistent with the $O(BmNk)$ estimate. Cross-sectional ranking takes about 80\% of the total, and only the solve time grows noticeably with $k$, so the main cost of PCA lies in ranking, not in matrix arithmetic.
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.82\linewidth]{\PCAFigureDir/real_problem_size.png}
-\caption{Single-thread CPU time of the PCA workflow against problem size (128 real factor panels, log--log axes). Each panel varies only the batch $B$, sampled dates $m$, stocks $N$ or power-iteration steps $k$, keeping the rest fixed. Blue: cross-sectional percentile ranking; orange: PCA solve; green: total from sampling to admission. Ranking takes about 80\% of the total at every size; the solve grows noticeably only with $k$.}
+\caption{Single-thread CPU time of the PCA pipeline against problem size (128 real factor panels, log--log axes). The four panels vary only the batch size $B$, the number of sampled dates $m$, the number of stocks $N$ and the number of power-iteration steps $k$, with the other parameters fixed. Blue: cross-sectional percentile ranking; orange: PCA solve; green: total time from sampling to admission. Ranking takes about 80\% of the total at every size, and only the solve time grows noticeably with $k$.}
 \label{fig:pca-real-size}
 \end{figure}
-In Figure~\ref{fig:pca-real-size}, time grows with batch size, sampled dates and stocks. More iterations mainly affect the solve; ranking and preparation remain substantial. Matrix--vector work is approximately $O(BmNk)$, and synthetic dimension experiments also show near-linear growth in $B,m,N$. The stock-prefix experiment does not recompute cross-sectional operators or RankIC on a smaller universe: it measures PCA input-size changes, not the cost of mining a smaller stock universe.
 
-\subsubsection{GPU kernels against the CPU}
-Table~\ref{tab:pca-kernels} measures ranking, iterative multiplication and similarity separately. FP32/FP64 denotes iteration precision; ranking and coarse similarity both use FP32. Ranking is substantially more expensive than the two multiplication stages. FP64 nearly doubles iterative multiplication time but leaves ranking unchanged, so the whole workflow does not slow by the same factor.
+\subsubsection{CPU scaling}
+Figure~\ref{fig:pca-scaling} shows strong and weak scaling on the CPU for the three data layouts (Section~\ref{sec:pca}); the input is all 9388 ranked matrices $R$. The numbers below are read from the figure. With one rank, \code{factor}, \code{date} and \code{transpose} take about 130, 155 and 195\,s. \code{date} is fastest at 72 ranks (13.4\,s, a speed-up of about 12) and then slows down, to about 19\,s at 288 ranks: every iteration reduces a right vector of length $N$, and this volume does not shrink with the number of ranks. \code{factor} and \code{transpose} solve each factor locally, with no per-iteration reduction: \code{factor} reaches about 5.5\,s at 144 ranks (speed-up about 24), and \code{transpose}, which adds one Alltoallv redistribution, about 7.5\,s at 144--288 ranks (speed-up about 26). In these standalone tests \code{factor} is therefore the fastest layout. Here the matrices $R$ have been written to disk by factor in advance, so \code{factor} can read them directly. Inside GP, the factor panels are already distributed by date across ranks, so the GP integration uses the \code{date} layout: each rank samples, ranks and solves on its own dates, with no redistribution. In weak scaling to 288 ranks, the efficiencies of the three layouts are about 0.12 (\code{date}), 0.3 (\code{transpose}) and 0.55 (\code{factor}).
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
+\medskip
+\includegraphics[width=0.75\linewidth]{\PCAFigureDir/weak_scaling.png}
+\caption{CPU scaling of the PCA module on all 9388 matrices $R$. Top: total time, speed-up and parallel efficiency in strong scaling; bottom: total time and efficiency $T_1/T_p$ in weak scaling. \code{date} partitions by date and reduces in every iteration; \code{transpose} first redistributes to whole factors and then solves locally; \code{factor} assigns whole factors directly. The layouts differ in reading, preparation and communication, so they are compared by their total times. Note that the same layout has different colours in the top and bottom plots.}
+\label{fig:pca-scaling}
+\end{figure}
+
+\subsubsection{GPU implementation}
+Table~\ref{tab:pca-kernels} times ranking, matrix--vector products and similarity separately on one A40. Ranking is about 20 times slower than the matrix--vector products: bitonic sort does $O(N\log^2N)$ work, and the 5876 columns are padded to 8192. Switching to FP64 only doubles the matrix--vector time and leaves ranking unchanged.
 \begin{table}[H]
 \centering\small
-\caption{GPU time of each PCA step on one A40 (ms; one warm-up, then the median of three repeats). The iteration precision affects only the matrix--vector products of the power iteration; ranking and similarity are always FP32. Ranking is about 20 times slower than the matrix--vector products and dominates the GPU time.}
+\caption{GPU timings (ms) of the PCA steps on one A40; median of three measurements after one warm-up. ``Iteration precision'' affects only the matrix--vector products of the power iteration; ranking and similarity are always FP32. Ranking is about 20 times slower than the matrix--vector products and is the main GPU cost.}
 \label{tab:pca-kernels}
 \begin{tabular}{lrrrr}
 \toprule
-Precision & Batch $B$ & Ranking & Matvecs & Similarity \\
+Iteration precision & Batch $B$ & Ranking & Mat--vec & Similarity \\
 \midrule
 FP32 & 8  & 21.212  & 0.964  & 0.097 \\
 FP32 & 32 & 84.694  & 3.737  & 0.156 \\
@@ -693,40 +705,38 @@ FP64 & 64 & 169.289 & 14.017 & 0.272 \\
 \end{tabular}
 \end{table}
 
-For all 9388 preconstructed matrices $R$, 72 CPU cores with the \code{date} layout take 13.366\,s, one A40 takes 64.766\,s, and two A40s on one machine take 36.713\,s (Figure~\ref{fig:pca-total}). This includes reading, preparation, transfers, computation, similarity, admission and signature writes inside the loop, but excludes factor generation. MPI startup, GPU initialisation and final JSON serialisation are separate; writes do not include an fsync durability guarantee. The input is already ranked, so this total excludes GPU sorting. CPU uses 72 ranks, FP64 and batch 576; GPU uses 1/2 ranks, FP32 and batch 128. These are comparisons of actual resource and implementation configurations, not an experiment changing only the device.
+For all 9388 ranked matrices $R$ (ranking excluded), the \code{date} layout with 72 ranks takes 13.4\,s, one A40 takes 64.8\,s and two A40s in the same machine take 36.7\,s (Figure~\ref{fig:pca-total}, Table~\ref{tab:pca-total-stages}). The three configurations differ in rank count, precision and batch size, so this compares actual configurations rather than changing only the device. The GPU runs are slow mainly in reading: only one or two host processes read the data from the shared file system, and reading takes about half the total; the pure matrix--vector kernel on one card takes only 1.09\,s. A matrix--vector product does 2 floating-point operations per 4 bytes read, so it is bound by memory bandwidth, and the memory bandwidth of an A40 is of the same order as that of a dual-socket 8452Y machine; even without reading, the GPU's advantage in this step is limited. Two A40s in one machine are 1.764 times faster than one (efficiency 0.88): the date blocks are split between the cards, and norms and right vectors are combined by an Allreduce on device memory.
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.54\linewidth]{\PCAFigureDir/cpu_gpu_end_to_end.png}
-\caption{Total PCA workflow time for the same 9388 ranked matrices $R$: 72 CPU cores (72 MPI ranks, FP64), one A40, and two A40s on one machine (FP32). The time covers reading, preparation, transfer, solve, similarity and admission. The configurations use different resources, so this is not a controlled comparison of devices alone.}
+\caption{Total PCA pipeline time for the same 9388 ranked matrices $R$: 72-core CPU (72 MPI ranks, FP64), one A40, and two A40s in the same machine (FP32). The time includes reading, preparation, transfer, solve, similarity and admission. The three configurations use different resources; this is not a controlled comparison in which only the device changes.}
 \label{fig:pca-total}
 \end{figure}
-
-Table~\ref{tab:pca-total-stages} shows that 72 CPU processes share reading, whereas the GPU paths have only 1/2 host processes. The single-GPU pure GEMV median is 1.090\,s, much less than the full workflow. Reading, host preparation, upload and synchronisation need joint optimisation. The \code{solve} stage includes GPU preparation and computation, with nested timers; a slower workflow does not imply slower GPU multiplication.
 \begin{table}[H]
 \centering\small
-\caption{Settings and stage times of the three configurations in Figure~\ref{fig:pca-total} (s, median of three runs). The GPU paths read the data with only one or two host processes, and reading takes about half the total. The solve stage includes data preparation and nested sub-stages, so kernel and communication timers must not be added to it.}
+\caption{Parameters and stage times (s, median of three runs) of the three configurations in Figure~\ref{fig:pca-total}. The GPU paths read data with only 1--2 host processes, and reading takes about half the total. The solve stage includes data preparation and its nested sub-stages and cannot be added to kernel or communication timings.}
 \label{tab:pca-total-stages}
 \begin{tabular}{lrlrrrr}
 \toprule
-Configuration & Ranks & Precision & Batch $B$ & Read & Solve & Total \\
+Configuration & MPI ranks & Solve precision & Batch $B$ & Read & Solve stage & Total \\
 \midrule
 CPU & 72 & FP64 & 576 & 1.496 & 11.537 & 13.366 \\
-1 A40 & 1 & FP32 & 128 & 34.170 & 27.429 & 64.766 \\
-2 A40 & 2 & FP32 & 128 & 18.845 & 17.479 & 36.713 \\
+One A40 & 1 & FP32 & 128 & 34.170 & 27.429 & 64.766 \\
+Two A40s & 2 & FP32 & 128 & 18.845 & 17.479 & 36.713 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Sequential admission timing includes FP64 refinement and archive-state maintenance, excluding similarity precomputation. Compute $T_{\rm adm}/T_{\rm total}$ per repeat and then take the median of three repeats: the fractions are 8.12\%, 1.48\% and 2.64\% for 72 CPU cores, one A40 and two A40s. These fractions describe this PCA workflow; the full GP serial fraction requires full-loop timing.
+\paragraph{Sequential admission.} Sequential admission (including the FP64 refinement and archive maintenance) takes 8.12\%, 1.48\% and 2.64\% of the total time in the 72-core CPU, one-A40 and two-A40 configurations. By Amdahl's law, however fast the rest becomes, the total speed-up of these configurations cannot exceed about 12, 68 and 38.
 
-The independent cuBLAS reference uses identical device inputs, strict FP32 and disabled TF32 (\href{https://docs.nvidia.com/cuda/archive/12.9.1/cublas/index.html}{cuBLAS documentation}). Each block executes 50 operations; three blocks give the median, excluding warm-up, transfers, allocation and normalisation. Because the handwritten kernel fuses the absolute value, Table~\ref{tab:cublas} compares it with library GEMM plus abs, with pure GEMM also shown. Here abs means element-wise absolute value. The speed-up is handwritten time divided by library GEMM+abs time; values above 1 favour the library. cuBLAS is 1.45--3.89 times faster, leaving room to improve handwritten multiplication. This ratio cannot directly be converted into a full-GP speed-up. cuBLAS remains a reference only; production targets use handwritten code.
+\paragraph{Comparison with cuBLAS.} The handwritten similarity kernel is 1.45--3.89 times slower than cuBLAS (strict FP32, TF32 disabled; Table~\ref{tab:cublas}), so the handwritten matrix multiplication leaves room for improvement. Similarity, however, takes only about 40\,ms over the whole batch, so its effect on the total is small.
 \begin{table}[H]
 \centering\small
-\caption{Handwritten similarity kernel against cuBLAS ($\mu$s, strict FP32, TF32 disabled). $B$ is the number of candidates and $A$ the number of archived signatures. The handwritten kernel fuses the absolute value, so it is compared with library GEMM+abs; the library speed-up is handwritten time divided by GEMM+abs time, and values above 1 favour cuBLAS.}
+\caption{Handwritten similarity kernel against cuBLAS ($\mu$s, strict FP32, TF32 disabled). $B$ is the number of candidates and $A$ the number of archive signatures. The handwritten kernel fuses the absolute value, so it is compared with ``library GEMM+abs''; library speed-up = handwritten time / library GEMM+abs time, and a value above 1 means cuBLAS is faster.}
 \label{tab:cublas}
 \begin{tabular}{rrrrrr}
 \toprule
-$B$ & Archive $A$ & Handwritten & cuBLAS GEMM & GEMM+abs & Speed-up \\
+$B$ & Archive $A$ & Handwritten & Library GEMM & Library GEMM+abs & Library speed-up \\
 \midrule
 128 & 50000 & 1465.10 & 282.17 & 376.59 & 3.89 \\
 32  & 16384 & 121.53  & 47.66  & 51.45  & 2.36 \\
@@ -736,80 +746,55 @@ $B$ & Archive $A$ & Handwritten & cuBLAS GEMM & GEMM+abs & Speed-up \\
 \end{tabular}
 \end{table}
 
-\subsubsection{MPI + CUDA scaling}
-Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Read from the figure, one rank takes about 130, 155 and 195\,s for \code{factor}, \code{date} and \code{transpose}. \code{date} is fastest at 72 ranks (13.4\,s, the CPU configuration of Table~\ref{tab:pca-total-stages}, a speed-up of about 12) and then slows down, to about 19\,s and an efficiency of about 0.03 at 288 ranks; \code{factor} is fastest at 144 ranks, about 5.5\,s or a speed-up of about 24; \code{transpose} reaches about 7.5\,s at 144--288 ranks, a speed-up of about 26. The fastest CPU layout is therefore \code{factor}, more than twice as fast as the 72-rank \code{date} configuration used in Table~\ref{tab:pca-total-stages}. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1: at 288 ranks the weak-scaling efficiency is about 0.12 for \code{date}, 0.3 for \code{transpose} and 0.55 for \code{factor}, and \code{factor} has one outlier above 1 at 144 ranks.
-\begin{figure}[H]
-\centering
-\includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
-\medskip
-\includegraphics[width=0.75\linewidth]{\PCAFigureDir/weak_scaling.png}
-\caption{CPU scaling of the PCA module on all 9388 matrices $R$. Top: strong-scaling total time, speed-up and parallel efficiency. Bottom: weak-scaling total time and efficiency $T_1/T_p$. \code{date} partitions dates and reduces every iteration; \code{transpose} redistributes to whole factors and solves locally; \code{factor} assigns whole factors directly. The layouts differ in reading, preparation and communication, so each is judged by its own total time. Note that a layout has different colours in the top and bottom plots.}
-\label{fig:pca-scaling}
-\end{figure}
-
-Two A40s on one machine are 1.764 times faster than one. Date blocks are split between the GPUs, with norms and right vectors merged by device-memory Allreduce. A separate two-machine, one-GPU-per-machine correctness check does not establish cross-machine speed-up. Archive-scale experiments fix 128 candidates: signature sharding reduces time for the tested large archives, but each candidate still needs MAXLOC and a sequential decision, limiting scaling.
-
-\subsubsection{Agreement of signatures and admission decisions}
-In the full-batch FP32/FP64 comparison, no admission actions change. Every triple of action, nearest key and replaced key agrees, and the final-membership symmetric difference is zero. Replaying supplied signatures and recomputing from the same FP32 $R$ also agree. This supports implementation and precision choices for this input; changes to the solver, iteration budget and initial vector are examined separately below.
-
-\paragraph{Backend and archive-state checks.}
-Given identical signatures, candidate actions, nearest keys, replaced keys and final members agree with the original Python reference for CPU, CUDA and MPI-sharded archives. Boundary cases cover values near $0.90$, tied maxima, identical keys, a quality increment exactly equal to $0.002$, and invalid signatures. One complete batch and two batches joined through an archive snapshot give the same final state. Actual GP checks also cover interruption/resume and backend identity. Direction error and the admission threshold are different quantities; archive agreement is established by decision-by-decision checks.
-
-\paragraph{Actual GP integration and 16-core calibration.}
-An initial interface check uses 120 dates, 300 stocks and 6 fields, with one generation at each of three depths. CPU/MPI and CUDA both retain 24 archive members, with GP walltimes 189.463\,s and 268.381\,s. The full data dimensions are then used: 1461 dates, 5876 stocks and 132 fields, population 64, warm-start multiplier 3, gene-pool limit 32, and one generation at each depth 1, 2 and 3. Windows are 1/5/10/15/20/30/60, sampling is every fifth date, and power iteration uses four FP64 steps. Table~\ref{tab:live-gp} reports this configuration.
+\subsubsection{Integration with GP}
+Finally, the engine and PCA are connected to the original Python GP, and each of the three depths is run for one generation on the full data (population 64, warm-start multiplier 3; Table~\ref{tab:live-gp}). PCA uses the final configuration: the \code{date} layout, four-step power iteration, and a central archive maintained by rank 0 with sequential admission (Table~\ref{tab:parallel-summary}). The CPU backend (16 MPI ranks) and the CUDA backend (one A40) obtain the same 325 archive members, with GP wall-clock times of 234\,s and 337\,s. With such a small population, these times are dominated by subprocess start-up, Python control and checkpointing, and do not represent the speed with large populations.
 \begin{table}[H]
 \centering\small
-\caption{Three-depth GP runs on the full data (1461 days, 5876 stocks, 132 fields), population 64, one generation per depth. ``Setup'' is field profiling or cache loading; ``GP walltime'' is the elapsed real time of the whole GP run. All three runs end with the same 325 archive members; the shared-CPU row is a later run on a shared machine.}
+\caption{Three-depth GP runs on the full data (1461 days, 5876 stocks, 132 fields), population 64, one generation per depth. GP wall-clock time is the actual elapsed time of the whole run, including subprocess start-up, the factor engine, PCA, admission, Python control and checkpointing.}
 \label{tab:live-gp}
-\begin{tabular}{lrrrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Backend & Ranks & Threads/rank & Setup / s & GP wall / s & Evaluated & Archived \\
+Backend & MPI ranks & Threads per rank & GP wall clock / s & Evaluations & Archive size \\
 \midrule
-CPU & 16 & 1 & 371.334 & 233.940 & 1450 & 325 \\
-CUDA (1 A40) & 1 & 16 & 0.046 & 336.705 & 1450 & 325 \\
-CPU (shared) & 16 & 1 & 0.052 & 234.358 & 1450 & 325 \\
+CPU & 16 & 1 & 233.940 & 1450 & 325 \\
+CUDA (1 A40) & 1 & 16 & 336.705 & 1450 & 325 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-CPU uses 16 single-threaded MPI ranks. CUDA uses one process, 16 CPU threads and one A40, with an allocation of 36 cores and 240 GB. Factor values and RankIC remain on CPUs in both paths; GPU handles ranking, PCA and similarity. The first CPU run profiles the fields; CUDA and the later shared-CPU run reuse an identity-checked field cache, so setup times are not algorithm speed comparisons. GP walltime includes MPI subprocess startup, the factor engine, PCA, QD, Python control and checkpoints.
-
-The CPU and CUDA runs finish with the same 325 keys but are not bitwise identical: maximum absolute quality difference among common members is $4.70977\times10^{-5}$, and maximum FP32 signature-component difference is $0.00370505$. Evaluations include warm starts and searches at all depths, so the count is not population times generations. The archive accumulates across batches and may exceed one generation's population.
-
-The later shared-resource calibration allocates 16 cores and 112 GB on CN-161 (Xeon Platinum 8452Y). The same three-depth configuration takes 234.358\,s and retains 325 members. A separate fixed, deduplicated batch of 1000 actual expressions goes through factors, RankIC, PCA and QD in the same order. One warm-up and three measurements give a median batch walltime of 64.648\,s, range 64.308--65.301\,s. Each run is checked against original Python QD decisions and final members; repeated numerical outputs within the same layout are bitwise identical. Input validation is separately timed at 102.041\,s.
-
-The calibration job includes these repeated batches and the three-depth GP, taking 10 minutes 28 seconds in total. The machine is shared with other jobs. These measurements validate the resource route and integration, rather than forming a speed-up ratio against dedicated machines; they also differ in input and timing scope from the fixed 10{,}000-expression batch of Section~\ref{sec:x1}.
-
-\subsection{Power iteration versus Lanczos}
+\subsection{Extension experiment: replacing power iteration with Lanczos}
+\label{sec:solver-results}
+All experiments so far use the original program's four-step power iteration. After completing the parallel implementation, we studied the signature algorithm itself: Section~\ref{sec:pca-solvers} notes that four-step power iteration does not guarantee convergence, so can Lanczos give more accurate signatures with less computation? This section uses the same 9388 matrices as Section~\ref{sec:pca-results}.
 
 \subsubsection{Accuracy against iterations}
-\label{sec:solver-results}
-For the leading left singular vector $u_{\mathrm{ref}}$ from a full NumPy SVD, define direction error as
+Taking the leading left singular vector $u_{\mathrm{ref}}$ of an exact NumPy SVD as reference, we define the direction error
 \begin{equation}
- e=1-\frac{|s^\top u_{\mathrm{ref}}|}{\|s\|_2\,\|u_{\mathrm{ref}}\|_2}.
+ e=1-\frac{|s^\top u_{\mathrm{ref}}|}{\|s\|_2\,\|u_{\mathrm{ref}}\|_2},
  \label{eq:direction-error}
 \end{equation}
-The absolute value removes the sign ambiguity. The strict target is $e\le10^{-6}$; smaller error means a direction closer to the SVD reference. This quantity differs from the Pearson similarity used by admission and cannot be compared directly with the $0.90$ threshold. The experiment also diagnoses relative eigen-residuals of $RR^\top s$ against the direction implied by its Rayleigh quotient; residuals require two extra products.
+with a strict target of $e\le10^{-6}$. $e$ measures how accurately the signature direction is computed; it is not the same quantity as the 0.9 correlation threshold used in admission.
 
-Among 9388 matrices, 13.9\% have $\sigma_2/\sigma_1>0.9$. With seed 0, four-step power iteration misses the strict target on 7053 matrices. Figure~\ref{fig:solver-convergence} compares iteration budgets and actual product counts: Lanczos approaches the SVD reference faster as the budget grows. Controlled-spectrum experiments also show slower power convergence when the two leading directions are closer. This measures finite-budget approximation, not whether the implementation is faulty.
+Of the 9388 matrices, 13.9\% have $\sigma_2/\sigma_1>0.9$; for these, each power-iteration step reduces the error only a little (Section~\ref{sec:pca-solvers}). The original four-step power iteration (seed 0) misses the strict target on 7053 matrices (75\%). Measured by the actual number of matrix--vector products, Lanczos converges much faster (Figure~\ref{fig:solver-convergence}): after about 15 products its median error is of order $10^{-15}$, while power iteration is still around $10^{-10}$ after 21 products.
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.92\linewidth]{\PCAFigureDir/convergence.png}
-\caption{Median direction error $e$ (Eq.~(\ref{eq:direction-error}); smaller is closer to the exact SVD) of power iteration (blue) and Lanczos (orange) over 9388 matrices, against iteration count (left) and actual matrix--vector products excluding the residual check (right). The shaded bands on the left show the spread over matrices. For the same number of products, Lanczos converges faster.}
+\caption{Median direction error $e$ (Equation~(\ref{eq:direction-error}); smaller is closer to the exact SVD) of power iteration (blue) and Lanczos (orange) over 9388 matrices: left, by iteration step; right, by actual number of matrix--vector products (excluding residual checks). The shading on the left shows the spread over matrices. For the same number of products, Lanczos converges faster.}
 \label{fig:solver-convergence}
 \end{figure}
 
-\subsubsection{Cost}
-SVD first determines an offline iteration budget for each matrix, capped at ten steps. Both methods process all 9388 matrices; unreached targets are reported separately. Costs are then compared on the 6679 matrices where both methods reach the target (Table~\ref{tab:solver-cost}, Figure~\ref{fig:solver-cost}). This common reached set means both methods attain the same error threshold within ten steps, avoiding a timing comparison at different accuracies. Lanczos reaches more matrices and reduces common-set solve time from 10.235\,s to 8.154\,s, about 20.3\%.
+\subsubsection{Cost of reaching the same accuracy}
+We first determine offline, with the SVD, how many steps each matrix needs to reach the target (at most ten), and then compare costs only on the 6679 matrices on which both methods reach it, so that the two sets of results have the same accuracy (Table~\ref{tab:solver-cost}, Figure~\ref{fig:solver-cost}). The experiment uses 8 single-threaded MPI ranks, and both methods reduce one factor at a time.
+
+Lanczos reaches the target within ten steps on more matrices (8179, against 6679 for power iteration), and on the common matrices it cuts the solve time from 10.235\,s to 8.154\,s ($-20.3\%$). It makes 39\% more Allreduce calls but sends 33\% less logical payload: reorthogonalisation adds scalar reductions of only a few numbers, while needing fewer steps removes reductions of length-$N$ vectors. Logical payload counts the bytes of the reduced arrays; actual network traffic also depends on MPI's reduction algorithm.
 \begin{table}[H]
 \centering\small
-\caption{Cost of reaching the same accuracy ($e\le10^{-6}$ within ten steps). The reached and unreached counts cover all 9388 matrices; solve time, Allreduce calls and logical payload cover only the 6679 matrices that both methods reach. Logical payload uses decimal GB.}
+\caption{Cost of reaching the same accuracy ($e\le10^{-6}$) within ten steps. ``Reached'' and ``missed in ten steps'' count all 9388 matrices; solve time, Allreduce calls and logical payload cover only the 6679 matrices on which both methods reach the target, with payload in decimal GB.}
 \label{tab:solver-cost}
 \begin{tabular}{lrrrrr}
 \toprule
-Method & Reached & Unreached at 10 & Solve / s & Allreduce calls & Payload / GB \\
+Method & Reached & Missed in ten steps & Solve / s & Allreduce calls & Logical payload / GB \\
 \midrule
-Power & 6679 & 2709 & 10.235 & 78747 & 1.694 \\
+Power iteration & 6679 & 2709 & 10.235 & 78747 & 1.694 \\
 Lanczos & 8179 & 1209 & 8.154 & 109162 & 1.127 \\
 \bottomrule
 \end{tabular}
@@ -817,25 +802,23 @@ Lanczos & 8179 & 1209 & 8.154 & 109162 & 1.127 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.93\linewidth]{\PCAFigureDir/full_accuracy_cost.png}
-\caption{The last three columns of Table~\ref{tab:solver-cost} (8 MPI ranks, 6679 commonly reached matrices): sum of per-rank maximum solve time (left), Allreduce calls (middle) and logical communication payload (right). Lanczos makes more calls but moves less data and solves faster in total.}
+\caption{The last three columns of Table~\ref{tab:solver-cost} (8 MPI ranks, 6679 common matrices): left, sum over matrices of the maximum solve time across ranks; middle, Allreduce calls; right, logical communication payload. Lanczos makes more calls but has lower total payload and solve time.}
 \label{fig:solver-cost}
 \end{figure}
 
-Lanczos reorthogonalisation adds scalar reductions, but the required iteration budgets also differ; more reduction calls can still carry fewer total bytes. Logical payload is not network traffic: it sums reduction-array bytes, whereas physical transmission also depends on MPI's communication algorithm. The experiment reserves 16 cores and 111 GB but uses 8 single-threaded MPI ranks. Both methods reduce per factor, without the production power solver's batched reductions. Pure solve timing excludes residual diagnostics, input caching and logging. This compares offline-selected budgets; production still uses a fixed step count.
-
 \subsubsection{Effect on admission decisions}
-Use four-step power iteration with seed 0 as the baseline. Candidate order and quality are fixed; only the signature method and budget change. Action changes count differences between admit, replace and reject; nearest-record changes also include cases where the action stays the same but the matched record differs. Table~\ref{tab:decision-change} shows that eight-step power changes 637 actions and gives a final-membership symmetric difference of 372. This counts both members entering and leaving, not replacement events: one member removed and another added contribute 2. The complete experiment stores 60 trajectories, and different starts also give changes (Figure~\ref{fig:decision-change}).
+We fix the order and quality of the candidates, change only the solver and the number of steps, and compare the admission results with those of four-step power iteration (Table~\ref{tab:decision-change}). Eight-step power iteration changes 637 admission actions and 372 members of the final archive; four-step Lanczos changes 469 actions and 233 members. With three different initial vectors, all configurations settle at about 700 changed actions as the number of steps grows (Figure~\ref{fig:decision-change}). The reason is that admission is sequential: once one candidate's decision changes, later candidates are compared against a different archive, and candidates whose similarity is close to the 0.9 threshold get a different decision when the signature changes slightly.
 \begin{table}[H]
 \centering\small
-\caption{Changes in QD archive decisions against the four-step power-iteration baseline (seed 0) when only the solver and step count $k$ change. Action changes: candidates whose add, replace or reject decision differs; nearest-record changes: also cases with the same decision but a different nearest archive member; final symmetric difference: members present in only one of the two final archives.}
+\caption{Changes in QD archive decisions relative to the baseline of seed 0 and four-step power iteration, changing only the solver and the number of steps $k$. Changed actions: candidates whose add, replace or reject decision differs; changed nearest records: additionally includes the same decision with a different most similar archive member; final-membership symmetric difference: members present in only one of the two final archives.}
 \label{tab:decision-change}
 \begin{tabular}{lrrrr}
 \toprule
-Method & Steps $k$ & Action changes & Nearest-key changes & Final symmetric diff. \\
+Method & Steps $k$ & Changed actions & Changed nearest records & Membership sym.\ diff. \\
 \midrule
-Power & 2 & 960 & 5984 & 568 \\
-Power & 4 & 0 & 0 & 0 \\
-Power & 8 & 637 & 4204 & 372 \\
+Power iteration & 2 & 960 & 5984 & 568 \\
+Power iteration & 4 & 0 & 0 & 0 \\
+Power iteration & 8 & 637 & 4204 & 372 \\
 Lanczos & 2 & 1373 & 6992 & 942 \\
 Lanczos & 4 & 469 & 3702 & 233 \\
 Lanczos & 8 & 758 & 4945 & 461 \\
@@ -845,77 +828,97 @@ Lanczos & 8 & 758 & 4945 & 461 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.72\linewidth]{\PCAFigureDir/decision_sensitivity.png}
-\caption{Admission-action changes against the baseline (power iteration, $k=4$, seed 0) as a function of iteration count, for both solvers and three starting vectors (seeds 0/1/2). Only the baseline itself is zero; with more steps all curves settle near 700, so a more accurate signature also changes a stable share of decisions.}
+\caption{Number of changed admission actions relative to the baseline (power iteration, $k=4$, seed 0) against the number of steps, for both methods and three initial vectors (seeds 0/1/2). Only the baseline itself is 0; as the number of steps grows, all curves approach about 700, so more accurate signatures consistently change a share of the admission decisions.}
 \label{fig:decision-change}
 \end{figure}
 
-Reproducing the original four-step baseline and preserving its membership after choosing a more accurate direction are different goals. A sequential archive propagates early decision differences; lower direction error alone does not establish better factor quality.
+\paragraph{Summary.} At the same accuracy, Lanczos converges faster than power iteration, takes about 20\% less solve time and sends about a third less payload, so it is a candidate to replace power iteration in the future. The code already contains a CPU/MPI Lanczos (\code{--method lanczos}), but this project's production pipeline does not use it, and no GPU version was implemented: the primary goal of the project is to reproduce the original GP algorithm faithfully, and more accurate signatures change about 700 admission decisions, so the archive would no longer match the original program. Whether these changes lead to better out-of-sample factors needs separate validation.
 
 %======================================================================
-\section{Discussion}
+\section{Experimental findings and discussion}
+\label{sec:discussion}
 
-\subsection{How each part is parallelised}
-Table~\ref{tab:parallel-summary} summarises parallelism and communication. The engine partitions dates, keeping cross-sectional work local and exchanging history for rolling operators. PCA follows the date partition but also merges norms and right vectors each iteration. GPUs accelerate ranking, multiplication and similarity; archive updates retain sequential dependencies.
+\subsection{Main findings}
+Table~\ref{tab:findings} summarises the findings of the experiments in Section~\ref{sec:experiments}.
 \begin{table}[H]
 \centering\small
-\caption{Parallel methods, logical communication and bottlenecks. Halo is per rank; other volumes are per batch.}
-\label{tab:parallel-summary}
+\caption{Main experimental findings. Unless stated otherwise, factor-engine numbers come from the real batch of 10{,}000 expressions and PCA numbers from the 9388 matrices $R$.}
+\label{tab:findings}
 \resizebox{\linewidth}{!}{%
-\begin{tabular}{p{2.2cm}p{2.7cm}p{4.1cm}p{4.1cm}}
+\begin{tabular}{p{2.6cm}p{5.6cm}p{6.0cm}l}
 \toprule
-Module & Parallelism & MPI volume or operation & Bottleneck \\
+Question & Finding & Key numbers & Where \\
 \midrule
-Factor operators & MPI + OpenMP & halo: 1.5--1.7\,GB per rank/batch; ema: $p-1$ sends of $2N$ values & History and imbalance \\
-RankIC / fitness & Local dates, global summaries & Reduce $O(E)$ statistics & Ranking / bandwidth \\
-Sample ranking & CPU / CUDA & No distributed ranking exchange & Sorting / transfers \\
-PCA (date) & MPI + CPU/CUDA & $B+BN$ values per iteration, then a final $B$ & Fixed reduction size \\
-PCA (transpose) & Alltoallv + local solve & Redistribute $O(BmN)$, gather $O(Bm)$ & Preparation / reading \\
-Central archive & CPU/CUDA estimates, CPU refinement & Gather $O(Bm)$ signatures & Sequential admission \\
-Sharded archive & MPI comparison + MAXLOC & One MAXLOC per candidate & Communication / metadata \\
+Subexpression sharing & Merge the whole batch into one DAG and evaluate wide levels in chunks & 10{,}000 expressions become 12{,}083 nodes; early root release plus chunking cuts the logical peak memory to about 1/8 & \S\ref{sec:dag-exp} \\
+Pure-MPI strong scaling & Efficiency falls below 0.5 beyond 72 ranks & 5060\,s on one core; 75.0\,s on 288 cores, speed-up 67.5, efficiency 0.23 & \S\ref{sec:x2} \\
+Bottleneck & Halo waiting, boundary recomputation and load imbalance, not the network & Halo phase steady at 22--24\,s; weak-scaling efficiency still 0.63 across 4 machines & \S\ref{sec:x2}--\S\ref{sec:comm} \\
+Halo strategy & Exchange everything ($H_0=0$) & $H_0\ge60$ sends 97\% less data but increases total time by 11--20\% & \S\ref{sec:comm} \\
+Hybrid parallelism & One rank per machine, node-level threading inside the rank & $4\times72$ takes 27.8\,s, speed-up 182, efficiency 0.63 & \S\ref{sec:x5} \\
+Parallel PCA & In GP: \code{date} layout + four-step power iteration + central archive; \code{factor} fastest in standalone tests; GPU currently slower than CPU & \code{date} 13.4\,s on 72 ranks, \code{factor} about 5.5\,s on 144 ranks; one A40 64.8\,s (pure mat--vec only 1.09\,s), two cards 1.76 times faster & \S\ref{sec:pca-results} \\
+Serial part & Sequential admission bounds the PCA speed-up & 1.5--8.1\% of PCA pipeline time & \S\ref{sec:pca-results} \\
+Lanczos (extension) & Could replace power iteration; not used in production so as to reproduce the original program & 20.3\% faster and 33\% less payload at equal accuracy; changes about 700 admission decisions & \S\ref{sec:solver-results} \\
 \bottomrule
 \end{tabular}}
 \end{table}
 
-Halo dominates logical sending in the original engine batch: about 500\,GB in total at 288 ranks, while IC-summary reductions take little time. PCA has a different limit: the right-vector reduction in the date layout does not shrink as ranks increase. Actual GP also includes startup, snapshot preparation, Python control and checkpoints, so resources should be chosen by the target workflow's walltime, not by a single kernel.
-
-\subsection{Conclusions about the data}
-The real-data universe grows from 2636 to 4845 active stocks, so equal date blocks have unequal work; this is an important source of engine waiting and scaling loss. Fixed-size $R$ experiments measure PCA cost rather than that changing engine load. Distributed reductions and panel precision can also affect nearly equal values; numerical agreement, admission agreement and complete evolution outcomes are checked separately.
-
-Table~\ref{tab:qd-quality} and Figure~\ref{fig:qd-quality} examine the random depth-3 proposals: 8866 valid candidates and the 2988 archive members obtained with four-step power. This is not the earlier three-depth GP's 325 members, nor the historical library of 1481 selected factors used in validation.
+\subsection{How each part is parallelised}
+Table~\ref{tab:parallel-summary} lists the parallelisation finally used for each part of the pipeline. The factor engine partitions by trading date, keeps cross-sectional work local and exchanges history for time-series operators; PCA reuses the same date partition and combines norms and right vectors in every iteration; similarity and admission are centralised on rank 0.
 \begin{table}[H]
 \centering\small
-\caption{In-sample absolute mean RankIC of random proposals and the QD archive.}
+\caption{Parallelisation, MPI communication and main bottleneck of each part of the final pipeline. Halo is per rank, everything else per batch; $B$ is the number of candidates in a batch, $m$ the number of sampled dates and $p$ the number of ranks.}
+\label{tab:parallel-summary}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{p{2.4cm}p{5.0cm}p{4.0cm}p{3.0cm}}
+\toprule
+Part & Final parallelisation & MPI communication & Main bottleneck \\
+\midrule
+Factor operators & MPI ranks partitioned by trading date, OpenMP over DAG nodes inside each rank; one rank per machine, $H_0=0$ (exchange everything) & Halo about 1.5--1.7\,GB per rank per batch; ema: $p-1$ sequential hand-offs & Halo waiting, load imbalance \\
+RankIC and fitness & Each rank computes daily RankIC on its own dates & One Allreduce, under 8\,ms at 288 ranks & Ranking, memory bandwidth \\
+Sampling and ranking & Each rank ranks only its own sampled dates (CPU; CUDA optional) & None & Sorting \\
+PCA signature & \code{date} layout, four-step power iteration, FP64 & Per iteration, reduction of $B$ norms and $BN$ right-vector entries & Reduction volume does not shrink with $p$ \\
+Similarity and admission & Signatures gathered on rank 0, central archive; batched similarity, FP64 refinement, then sequential admission & $O(Bm)$ signature gather & Sequential admission is serial \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Several alternatives were implemented and tested but are not used in the final pipeline: the \code{factor} and \code{transpose} PCA layouts are faster when $R$ is already stored by factor (Section~\ref{sec:pca-results}), but inside GP they would first need to redistribute the date-partitioned panels; the sharded archive (each rank compares against its local archive and MAXLOC selects the global most similar member) needs one communication per candidate; Lanczos is covered in Section~\ref{sec:solver-results}. The GPU path is currently slower than the CPU, so the CPU is the default backend.
+
+In the factor engine, halo sends the most data: about 500\,GB in total across 288 ranks, while the IC reduction takes very little time. Fewer ranks, with threads inside each machine, is therefore the most effective optimisation of the factor engine. PCA is limited differently: with the \code{date} layout the volume of each right-vector reduction does not shrink with the number of ranks, and it slows down beyond 72 ranks; if PCA has to scale to more ranks, it can switch to a by-factor layout at the cost of one redistribution.
+
+\subsection{Conclusions about the data}
+In the real data, the number of stocks with data grows from 2636 in 2016 to 4845 in 2021, so date blocks with the same number of days carry different amounts of work. This is an important source of waiting and scaling loss in the factor engine; synthetic data have the same number of stocks every day, which is why their weak scaling is steadier.
+
+Table~\ref{tab:qd-quality} and Figure~\ref{fig:qd-quality} compare the in-sample $|$RankIC$|$ of the 8866 valid candidates and the 2988 archive members from the input of Section~\ref{sec:pca-results}. The archive median (0.011) is lower than the candidate median (0.023): QD compares quality only among similar factors, so factors of lower quality but different patterns also enter the archive, trading some quality for diversity. These are in-sample results and say nothing about out-of-sample performance.
+\begin{table}[H]
+\centering\small
+\caption{In-sample $|$RankIC$|$ distribution of valid candidates and of the QD archive.}
 \label{tab:qd-quality}
 \begin{tabular}{lrrrrrr}
 \toprule
-Set & Count & Minimum & 25\% & Median & 75\% & Maximum \\
+Set & Count & Min & 25th pct. & Median & 75th pct. & Max \\
 \midrule
-Valid candidates & 8866 & $1.82136\times10^{-7}$ & 0.0086576 & 0.0230372 & 0.0434855 & 0.107231 \\
-QD archive & 2988 & $1.82136\times10^{-7}$ & 0.00349045 & 0.0107784 & 0.0240051 & 0.107231 \\
+Valid candidates & 8866 & $1.8\times10^{-7}$ & 0.0087 & 0.0230 & 0.0435 & 0.1072 \\
+QD archive & 2988 & $1.8\times10^{-7}$ & 0.0035 & 0.0108 & 0.0240 & 0.1072 \\
 \bottomrule
 \end{tabular}
 \end{table}
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.68\linewidth]{\PCAFigureDir/rankic_distributions.png}
-\caption{In-sample RankIC distributions of valid candidates and the QD archive.}
+\caption{In-sample RankIC distributions of valid candidates and of the QD archive. The archive keeps more factors of lower quality but different patterns.}
 \label{fig:qd-quality}
 \end{figure}
 
-The archive median is below the candidate median. QD compares quality within similar behaviour patterns rather than keeping only the highest-RankIC fraction; a lower-quality factor can enter if its pattern differs. The distribution illustrates a quality/diversity trade-off, not investment returns or out-of-sample performance.
-
-Precision affects ranking too: distinct float64 values can become tied after float32 conversion. Panel-storage effects must therefore be separated from solver differences on the same FP32 $R$. RankIC is checked using identically rounded inputs; solver comparisons check signatures and complete admission trajectories. FP32/FP64 solving changes neither actions nor final members for this batch, without implying agreement for every possible input.
-
 \subsection{Future work}
-The factor engine can use work-weighted date blocks to reduce waiting as the stock universe grows, organise cross-block ema propagation with \code{MPI\_Exscan}, and fuse element-wise operators to reduce intermediate panels and memory traffic.
+The factor engine could weight date blocks by the number of stocks with data per day, reducing waiting caused by load imbalance; organise the ema hand-off across blocks with \code{MPI\_Exscan}; and fuse adjacent element-wise operators to reduce intermediate panels and memory round trips.
 
-GP can explore asynchronous steady-state evolution, overlap CPU factor evaluation with GPU PCA, and prepare random immigrants before the current generation's PCA finishes. Independent subprocess and archive-snapshot overhead can also be reduced. Chunking should follow the device-memory budget: with only 24\,GB, smaller batches and on-demand uploads avoid retaining too many root panels at once. Residual-based online stopping may reduce unnecessary iterations, but diagnostic cost and admission changes must be measured together; lower direction error alone is not a complete workflow evaluation.
+For PCA, the GPU path should build $R$ directly from the factor panels in memory instead of writing them to disk and reading them back, and use CUDA streams to overlap transfer and computation. At the GP level, factor evaluation of the next generation could overlap with PCA of the current one. For the signature algorithm, residual-based early stopping could be studied, but its effect on admission results must be evaluated at the same time.
 
 %======================================================================
 \section{Conclusion}
-We move the original Python GP's batch evaluation into C++, share subexpressions through a DAG, partition dates for an MPI + OpenMP engine, and integrate handwritten CPU/CUDA PCA, similarity and sequential QD. The original fixed engine batch falls from about 5060\,s on one core to 75.0\,s with 288 pure-MPI ranks. On the same 288 cores, node-level threading with $4\times72$ reaches 27.8\,s. Gains come from less local work and shared-memory reuse; halo, boundary restarts and imbalance limit later scaling.
+We rewrote the batch evaluation of the original Python GP as a C++ engine: a batch of expressions is first merged into a DAG and then partitioned by trading date across MPI ranks, with OpenMP threads parallel over DAG nodes inside each rank; PCA signatures, similarity and sequential admission have CPU and CUDA parallel implementations. For the real batch of 10{,}000 expressions, one core needs 5060\,s, 288 cores of pure MPI 75.0\,s (speed-up 67.5), and the hybrid configuration with one rank and 72 threads per machine 27.8\,s (speed-up 182, efficiency 0.63). Pure-MPI scaling is limited mainly by halo waiting, boundary recomputation and load imbalance, and replacing ranks with threads reduces all three.
 
-PCA experiments show why ranking, preparation, communication and admission must be timed alongside multiplication. Two A40s are 1.764 times faster than one, but the 72-core CPU configuration is faster for this batch workflow. Lanczos reaches the target on more matrices within ten steps and reduces common-target solve time by about 20.3\%; changing the solver or budget also changes some archive members. Three-depth GP runs at full data dimensions and the shared 16-core calibration further verify the connection between factor evaluation, PCA, QD, subsequent evolution and checkpoints.
+For PCA, the final pipeline reuses the factor engine's date partition (\code{date} layout), computes signatures with the original four-step power iteration and admits candidates sequentially on rank 0; 72 ranks process 9388 matrices in 13.4\,s. The GPU matrix--vector kernel itself is fast, but the whole pipeline is limited by reading and ranking and is currently slower than the CPU. Sequential admission takes 1.5--8.1\% of PCA time and sets the upper bound on the speed-up of this stage. The extension experiment shows that Lanczos is 20.3\% faster at equal accuracy and could replace power iteration in the future; this project does not adopt it in order to reproduce the original program's results.
 
 \section*{Use of AI tools}
 Claude and Codex were used to help generate and compile the C++ code, write the \LaTeX{} report, and polish and translate the text between Chinese and English. The original genetic-programming algorithm and the design of the distributed parallel algorithm were done by the group members; the experiments on the distributed algorithm were carried out by the group members in collaboration with the AI tools after discussion.
