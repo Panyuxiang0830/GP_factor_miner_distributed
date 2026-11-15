@@ -465,7 +465,7 @@ The largest graph has 44,034 operand references but 44,032 distinct edges, becau
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.96\linewidth]{figures/dag_runtime.png}
-\caption{Planner construction versus vertices and scheduling versus edges, on log--log axes. Mac measurements are not combined with Vanda engine timings.}
+\caption{Graph construction versus vertices (left) and chunk-256 and greedy scheduling versus edges (right), on log--log axes; data as in Table~\ref{tab:dag-runtime}.}
 \label{fig:dag-runtime}
 \end{figure}
 
@@ -515,7 +515,7 @@ Formula chunk & Median wall time (s) & Range (s) & Median RSS (MiB) \\
 \caption{Actual single-node formula-chunk experiment; three separate processes per setting.}
 \label{tab:dag-s4}
 \end{table}
-All nine runs exit successfully. A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not the exact scheduling of Table~\ref{tab:dag-memory}.
+A server-side comparison records 200 identical score records per run against the chunk-200 reference, excluding only chunk/slot metadata; RankIC, fitness and segment statistics agree. Chunk 64 uses 26.4\% less median RSS than chunk 200. CPU user time is about 0.88\,s for every setting, wall times overlap, and file-system caching and fixed run order were not controlled, so no runtime winner is claimed. The exporter suppresses $R$ output but still performs signature-row preprocessing. This checks the memory trend of formula subdivision, not the exact scheduling of Table~\ref{tab:dag-memory}.
 
 \paragraph{Consequences for the engine.} These results fix how the engine evaluates a batch in the experiments that follow. Sharing (Table~\ref{tab:dag-sharing}) is why a whole batch is merged into one DAG before evaluation: the real batch of Section~\ref{sec:experiments} gives 12{,}083 DAG nodes for 10{,}000 expressions. Once roots are released early, the widest level sets the peak (Table~\ref{tab:dag-memory}), so the engine also processes wide levels in chunks (Section~\ref{sec:threads}): the widest level of that batch has 8614 nodes, and the runs below use chunks of 1000 nodes on one node and 2000 on several. Chunking does not change any score (Table~\ref{tab:dag-s4} and Section~\ref{sec:threads}). Its cost is one halo exchange per chunk instead of one per level; we did not compare run times with and without chunking.
 
