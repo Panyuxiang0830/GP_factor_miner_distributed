@@ -7,6 +7,10 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{float}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,skip=6pt}
+\setlength{\intextsep}{14pt plus 4pt minus 2pt}
+\setlength{\textfloatsep}{16pt plus 4pt minus 2pt}
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{hyperref}
@@ -665,7 +669,7 @@ $N$，合成，500 条 & 5876 -- 23504 & 540 -- 2304 & 1.05 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.82\linewidth]{\PCAFigureDir/real_problem_size.png}
-\caption{128 个真实面板上的 PCA 规模实验。固定面板值后改变 $B$、抽样天数 $m$、股票数 $N$ 和步数 $k$。}
+\caption{单线程 CPU 上 PCA 流程时间随问题规模的变化（128 个真实因子面板，双对数坐标）。四个子图依次只改变批量 $B$、抽样天数 $m$、股票数 $N$ 和幂迭代步数 $k$，其余参数固定。蓝线为截面百分位排名，橙线为 PCA 求解，绿线为从抽样到准入的总时间。各规模下排名都占总时间的约八成，求解时间只随 $k$ 明显增长。}
 \label{fig:pca-real-size}
 \end{figure}
 图~\ref{fig:pca-real-size} 中，耗时随批量、抽样天数和股票数增长；步数主要影响求解部分，排名和准备仍占较大比例。矩阵向量乘的主要工作量约为 $O(BmNk)$，合成维度实验也显示 $B,m,N$ 方向近似线性增长。股票前缀实验没有在较小股票池重新计算截面算子或 RankIC，因此反映的是 PCA 输入规模变化，而非重新挖掘一个较小股票池的成本。
@@ -674,7 +678,7 @@ $N$，合成，500 条 & 5876 -- 23504 & 540 -- 2304 & 1.05 \\
 表~\ref{tab:pca-kernels} 分别测量排名、迭代乘法和相似度。FP32/FP64 指迭代精度；排名及相似度粗算均为 FP32。排名时间明显高于两类乘法。改用 FP64 后迭代乘法接近翻倍，但排名不变，因此整个流程不会按相同比例变慢。
 \begin{table}[H]
 \centering\small
-\caption{GPU 分项计时，单位 ms；每组预热一次，三次测量取中位数。}
+\caption{单张 A40 上 PCA 各步骤的 GPU 计时（ms），每组预热一次后取三次测量的中位数。“迭代精度”只影响幂迭代中的矩阵向量乘，排名和相似度始终为 FP32。排名比矩阵向量乘慢约 20 倍，是 GPU 上的主要开销。}
 \label{tab:pca-kernels}
 \begin{tabular}{lrrrr}
 \toprule
@@ -694,7 +698,7 @@ FP64 & 64 & 169.289 & 14.017 & 0.272 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.54\linewidth]{\PCAFigureDir/cpu_gpu_end_to_end.png}
-\caption{同一批 9388 个 $R$ 的 PCA 流程时间。CPU 与 GPU 使用各自所列资源配置。}
+\caption{同一批 9388 个已排名矩阵 $R$ 的 PCA 流程总时间：72 核 CPU（72 个 MPI 进程，FP64）、单张 A40、同一台机器上的两张 A40（FP32）。时间包括读取、准备、传输、求解、相似度和准入。三者的资源配置不同，不是只改变设备的受控对比。}
 \label{fig:pca-total}
 \end{figure}
 
@@ -702,7 +706,7 @@ FP64 & 64 & 169.289 & 14.017 & 0.272 \\
 
 \begin{table}[H]
 \centering\small
-\caption{整批已排名 $R$ 的配置及阶段时间中位数，单位 s。求解阶段包含准备及嵌套子阶段，不能与 GPU 内核或通信计时直接相加。}
+\caption{图~\ref{fig:pca-total} 中三种配置的参数与阶段时间（s，三次运行的中位数）。GPU 路径只有 1--2 个主机进程读取数据，读取约占总时间的一半。求解阶段包含数据准备及其中嵌套的子阶段，不能再与内核或通信计时相加。}
 \label{tab:pca-total-stages}
 \begin{tabular}{lrlrrrr}
 \toprule
@@ -721,7 +725,7 @@ CPU & 72 & FP64 & 576 & 1.496 & 11.537 & 13.366 \\
 独立 cuBLAS 参照使用相同显存输入，严格 FP32、关闭 TF32（\href{https://docs.nvidia.com/cuda/archive/12.9.1/cublas/index.html}{cuBLAS 文档}）。每块执行 50 次，三个块取中位数，排除预热、传输、分配和归一化。手写版本融合了绝对值，因此表~\ref{tab:cublas} 以库 GEMM 加 abs 的时间作对应比较，纯 GEMM 另列。其中 abs 表示逐元素取绝对值。表中的加速比为手写耗时除以库 GEMM+abs 耗时，大于 1 表示库实现更快。库实现快 1.45--3.89 倍，说明手写乘法仍有优化空间；这一差距不能直接换算成整个 GP 的加速比。cuBLAS 只用于参照，生产目标仍使用手写实现。
 \begin{table}[H]
 \centering\small
-\caption{相似度操作与 cuBLAS 的独立对照，时间单位为 $\mu$s。}
+\caption{手写相似度内核与 cuBLAS 的对照（$\mu$s，严格 FP32、关闭 TF32）。$B$ 为候选数，$A$ 为档案签名数。手写内核融合了取绝对值，因此与“库 GEMM+abs”比较；库加速比 = 手写耗时 / 库 GEMM+abs 耗时，大于 1 表示 cuBLAS 更快。}
 \label{tab:cublas}
 \begin{tabular}{rrrrrr}
 \toprule
@@ -736,13 +740,13 @@ $B$ & 档案数 $A$ & 手写相似度 & 库 GEMM & 库 GEMM+abs & 库加速比 \
 \end{table}
 
 \subsubsection{MPI + CUDA 扩展性}
-CPU 三种布局的强扩展见图~\ref{fig:pca-scaling}。低进程数时增加进程能减少时间，随后收益趋缓，部分配置回升。\code{date} 每轮的向量归约不随进程数缩短，\code{transpose} 承担重分布，\code{factor} 依赖并行读取。弱扩展中，保持每进程完整矩阵等价工作量后，时间仍增长且有波动，效率未稳定在 1 附近。
+CPU 三种布局的强扩展见图~\ref{fig:pca-scaling}。低进程数时增加进程能减少时间，随后收益趋缓，部分配置回升。从图中数据看，单进程时 \code{factor}、\code{date}、\code{transpose} 分别约需 130、155、195\,s。\code{date} 在 72 个进程时最快（13.4\,s，即表~\ref{tab:pca-total-stages} 的 CPU 配置，加速约 12 倍），之后反而变慢，288 个进程时约 19\,s，效率只有约 0.03；\code{factor} 在 144 个进程时最快，约 5.5\,s，加速约 24 倍；\code{transpose} 在 144--288 个进程时约 7.5\,s，加速约 26 倍。所以 CPU 上最快的是 \code{factor} 布局，比表~\ref{tab:pca-total-stages} 采用的 72 进程 \code{date} 配置快一倍以上。\code{date} 每轮的向量归约不随进程数缩短，\code{transpose} 承担重分布，\code{factor} 依赖并行读取。弱扩展中，保持每进程完整矩阵等价工作量后，时间仍增长且有波动，效率未稳定在 1 附近：288 个进程时，\code{date}、\code{transpose}、\code{factor} 的弱扩展效率分别约为 0.12、0.3 和 0.55，其中 \code{factor} 在 144 个进程时有一个高于 1 的离群点。
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
 \medskip
 \includegraphics[width=0.75\linewidth]{\PCAFigureDir/weak_scaling.png}
-\caption{PCA 模块的 CPU 强扩展（上）与弱扩展（下）。三种布局的读取、准备和通信范围不同，比较以各自总时间为准。}
+\caption{PCA 模块在 CPU 上的扩展性，处理全部 9388 个 $R$。上：强扩展的总时间、加速比与并行效率；下：弱扩展的总时间与效率 $T_1/T_p$。\code{date} 按日期划分、每轮迭代归约；\code{transpose} 先重分布为完整因子再本地求解；\code{factor} 直接按因子分配。三种布局的读取、准备和通信范围不同，比较以各自总时间为准。注意上下两图中同一布局的颜色不同。}
 \label{fig:pca-scaling}
 \end{figure}
 
@@ -759,7 +763,7 @@ CPU 三种布局的强扩展见图~\ref{fig:pca-scaling}。低进程数时增加
 
 \begin{table}[H]
 \centering\small
-\caption{全数据维度上的三层 GP 衔接实验。准备时间与 GP 墙钟分别计时；共享 CPU 行是后续单独运行。}
+\caption{全量数据（1461 天、5876 只股票、132 个字段）上的三层 GP 衔接运行，种群 64，每个深度一代。“准备”是字段分析或读取缓存的时间，“GP 墙钟”是整个 GP 运行从开始到结束的实际耗时。三次运行得到相同的 325 个档案成员；“CPU（共享）”是之后在共享机器上的单独运行。}
 \label{tab:live-gp}
 \begin{tabular}{lrrrrrr}
 \toprule
@@ -795,7 +799,7 @@ CPU/CUDA 两次运行的最终 325 个 key 相同，但数值不逐位相同：�
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.92\linewidth]{\PCAFigureDir/convergence.png}
-\caption{幂迭代与 Lanczos 的方向误差，分别按步数（左）和矩阵向量乘次数（右）比较。}
+\caption{幂迭代（蓝）与 Lanczos（橙）在 9388 个矩阵上的方向误差 $e$（式~(\ref{eq:direction-error})，越小越接近精确 SVD）的中位数：左图按迭代步数，右图按实际矩阵向量乘次数（不含残差检查）。左图阴影为各矩阵误差的分布区间。同样的乘法次数下，Lanczos 收敛更快。}
 \label{fig:solver-convergence}
 \end{figure}
 
@@ -803,7 +807,7 @@ CPU/CUDA 两次运行的最终 325 个 key 相同，但数值不逐位相同：�
 先用 SVD 离线确定各矩阵达到目标的迭代预算，上限为十步；两种方法均执行全部 9388 个矩阵，将未达标者单列，再在共同达标的 6679 个矩阵上比较成本（表~\ref{tab:solver-cost}、图~\ref{fig:solver-cost}）。“共同达标”指两种算法都在十步内达到同一误差阈值；只在这部分矩阵上比较时间，是为了避免把精度不同的运行直接比较。Lanczos 达标数更多，共同集合求解时间由 10.235\,s 降至 8.154\,s，减少约 20.3\%。
 \begin{table}[H]
 \centering\small
-\caption{共同精度比较。达标/未达标统计针对全集；后三列仅针对共同达标的 6679 个矩阵。逻辑载荷按十进制 GB 换算。}
+\caption{两种求解器在十步内达到同一精度（$e\le10^{-6}$）的代价。“达标数”和“十步未达标”统计全部 9388 个矩阵；求解时间、Allreduce 次数和逻辑载荷只统计两种方法都达标的 6679 个矩阵，逻辑载荷按十进制 GB 计。}
 \label{tab:solver-cost}
 \begin{tabular}{lrrrrr}
 \toprule
@@ -817,7 +821,7 @@ Lanczos & 8179 & 1209 & 8.154 & 109162 & 1.127 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.93\linewidth]{\PCAFigureDir/full_accuracy_cost.png}
-\caption{共同达标集合的求解时间、归约次数与逻辑通信载荷。}
+\caption{表~\ref{tab:solver-cost} 后三列的图示（8 个 MPI 进程，6679 个共同达标矩阵）：左为各进程最大求解时间之和，中为 Allreduce 调用次数，右为逻辑通信载荷。Lanczos 调用次数更多，但总载荷和求解时间都更低。}
 \label{fig:solver-cost}
 \end{figure}
 
@@ -827,7 +831,7 @@ Lanczos 的重正交化增加了标量归约，但达到目标所需的迭代预
 以 seed=0、四步幂迭代为基准，固定候选顺序和质量，只改变签名算法与步数。动作变化数统计加入、替换、拒绝这三类决定的变化；最近记录变化数还包含决定不变、但匹配对象改变的情况。表~\ref{tab:decision-change} 显示，八步幂迭代改变了 637 个动作，最终成员对称差为 372。对称差同时计入移入和移出，不等于替换次数。例如，一个成员移出、另一个成员移入，对称差记为 2。完整实验保存 60 条轨迹，多个起点也出现差异（图~\ref{fig:decision-change}）。
 \begin{table}[H]
 \centering\small
-\caption{相对四步幂迭代基线的准入变化。}
+\caption{以 seed=0、四步幂迭代为基线，只改变求解算法和步数 $k$ 时 QD 档案决定的变化。动作变化数：加入、替换、拒绝的决定不同的候选数；最近记录变化数：另外包括决定相同但最相似档案成员不同的情况；最终成员对称差：只出现在其中一个最终档案里的成员数。}
 \label{tab:decision-change}
 \begin{tabular}{lrrrr}
 \toprule
@@ -845,7 +849,7 @@ Lanczos & 8 & 758 & 4945 & 461 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.72\linewidth]{\PCAFigureDir/decision_sensitivity.png}
-\caption{算法、预算和初始向量对准入动作的影响。}
+\caption{相对基线（幂迭代、$k=4$、seed 0）的准入动作变化数随迭代步数的变化，两种算法各画三个初始向量（seed 0/1/2）。只有基线本身为 0；步数增加后各曲线都趋于约 700，说明更精确的签名也会稳定地改变一部分准入决定。}
 \label{fig:decision-change}
 \end{figure}
 

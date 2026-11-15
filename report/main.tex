@@ -8,6 +8,10 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{float}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,skip=6pt}
+\setlength{\intextsep}{14pt plus 4pt minus 2pt}
+\setlength{\textfloatsep}{16pt plus 4pt minus 2pt}
 \usepackage{xcolor}
 \usepackage{listings}
 \usepackage{hyperref}
@@ -664,7 +668,7 @@ The original engine first computes 128 factor panels. Their values are held fixe
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.82\linewidth]{\PCAFigureDir/real_problem_size.png}
-\caption{PCA size experiments on 128 real panels, varying $B$, sampled dates $m$, stocks $N$ and iteration count $k$ after fixing panel values.}
+\caption{Single-thread CPU time of the PCA workflow against problem size (128 real factor panels, log--log axes). Each panel varies only the batch $B$, sampled dates $m$, stocks $N$ or power-iteration steps $k$, keeping the rest fixed. Blue: cross-sectional percentile ranking; orange: PCA solve; green: total from sampling to admission. Ranking takes about 80\% of the total at every size; the solve grows noticeably only with $k$.}
 \label{fig:pca-real-size}
 \end{figure}
 In Figure~\ref{fig:pca-real-size}, time grows with batch size, sampled dates and stocks. More iterations mainly affect the solve; ranking and preparation remain substantial. Matrix--vector work is approximately $O(BmNk)$, and synthetic dimension experiments also show near-linear growth in $B,m,N$. The stock-prefix experiment does not recompute cross-sectional operators or RankIC on a smaller universe: it measures PCA input-size changes, not the cost of mining a smaller stock universe.
@@ -673,7 +677,7 @@ In Figure~\ref{fig:pca-real-size}, time grows with batch size, sampled dates and
 Table~\ref{tab:pca-kernels} measures ranking, iterative multiplication and similarity separately. FP32/FP64 denotes iteration precision; ranking and coarse similarity both use FP32. Ranking is substantially more expensive than the two multiplication stages. FP64 nearly doubles iterative multiplication time but leaves ranking unchanged, so the whole workflow does not slow by the same factor.
 \begin{table}[H]
 \centering\small
-\caption{GPU component timing in ms: one warm-up, then the median of three repeats.}
+\caption{GPU time of each PCA step on one A40 (ms; one warm-up, then the median of three repeats). The iteration precision affects only the matrix--vector products of the power iteration; ranking and similarity are always FP32. Ranking is about 20 times slower than the matrix--vector products and dominates the GPU time.}
 \label{tab:pca-kernels}
 \begin{tabular}{lrrrr}
 \toprule
@@ -693,14 +697,14 @@ For all 9388 preconstructed matrices $R$, 72 CPU cores with the \code{date} layo
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.54\linewidth]{\PCAFigureDir/cpu_gpu_end_to_end.png}
-\caption{PCA workflow time for the same 9388 matrices $R$, using the stated CPU and GPU configurations.}
+\caption{Total PCA workflow time for the same 9388 ranked matrices $R$: 72 CPU cores (72 MPI ranks, FP64), one A40, and two A40s on one machine (FP32). The time covers reading, preparation, transfer, solve, similarity and admission. The configurations use different resources, so this is not a controlled comparison of devices alone.}
 \label{fig:pca-total}
 \end{figure}
 
 Table~\ref{tab:pca-total-stages} shows that 72 CPU processes share reading, whereas the GPU paths have only 1/2 host processes. The single-GPU pure GEMV median is 1.090\,s, much less than the full workflow. Reading, host preparation, upload and synchronisation need joint optimisation. The \code{solve} stage includes GPU preparation and computation, with nested timers; a slower workflow does not imply slower GPU multiplication.
 \begin{table}[H]
 \centering\small
-\caption{Configurations and median stage times for already-ranked $R$, in s. The solve contains preparation and nested stages; kernel and communication timers must not be added to it.}
+\caption{Settings and stage times of the three configurations in Figure~\ref{fig:pca-total} (s, median of three runs). The GPU paths read the data with only one or two host processes, and reading takes about half the total. The solve stage includes data preparation and nested sub-stages, so kernel and communication timers must not be added to it.}
 \label{tab:pca-total-stages}
 \begin{tabular}{lrlrrrr}
 \toprule
@@ -718,7 +722,7 @@ Sequential admission timing includes FP64 refinement and archive-state maintenan
 The independent cuBLAS reference uses identical device inputs, strict FP32 and disabled TF32 (\href{https://docs.nvidia.com/cuda/archive/12.9.1/cublas/index.html}{cuBLAS documentation}). Each block executes 50 operations; three blocks give the median, excluding warm-up, transfers, allocation and normalisation. Because the handwritten kernel fuses the absolute value, Table~\ref{tab:cublas} compares it with library GEMM plus abs, with pure GEMM also shown. Here abs means element-wise absolute value. The speed-up is handwritten time divided by library GEMM+abs time; values above 1 favour the library. cuBLAS is 1.45--3.89 times faster, leaving room to improve handwritten multiplication. This ratio cannot directly be converted into a full-GP speed-up. cuBLAS remains a reference only; production targets use handwritten code.
 \begin{table}[H]
 \centering\small
-\caption{Independent similarity comparison with cuBLAS; times are in $\mu$s.}
+\caption{Handwritten similarity kernel against cuBLAS ($\mu$s, strict FP32, TF32 disabled). $B$ is the number of candidates and $A$ the number of archived signatures. The handwritten kernel fuses the absolute value, so it is compared with library GEMM+abs; the library speed-up is handwritten time divided by GEMM+abs time, and values above 1 favour cuBLAS.}
 \label{tab:cublas}
 \begin{tabular}{rrrrrr}
 \toprule
@@ -733,13 +737,13 @@ $B$ & Archive $A$ & Handwritten & cuBLAS GEMM & GEMM+abs & Speed-up \\
 \end{table}
 
 \subsubsection{MPI + CUDA scaling}
-Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1.
+Figure~\ref{fig:pca-scaling} shows CPU strong scaling for the three layouts. More ranks help at low counts, then gains flatten and some configurations become slower. Read from the figure, one rank takes about 130, 155 and 195\,s for \code{factor}, \code{date} and \code{transpose}. \code{date} is fastest at 72 ranks (13.4\,s, the CPU configuration of Table~\ref{tab:pca-total-stages}, a speed-up of about 12) and then slows down, to about 19\,s and an efficiency of about 0.03 at 288 ranks; \code{factor} is fastest at 144 ranks, about 5.5\,s or a speed-up of about 24; \code{transpose} reaches about 7.5\,s at 144--288 ranks, a speed-up of about 26. The fastest CPU layout is therefore \code{factor}, more than twice as fast as the 72-rank \code{date} configuration used in Table~\ref{tab:pca-total-stages}. Per-iteration vector reduction in \code{date} does not shrink with rank count; \code{transpose} pays redistribution costs, and \code{factor} depends on parallel reading. Weak-scaling time still grows and fluctuates when the equivalent complete-matrix workload per rank is held fixed; efficiency does not remain near 1: at 288 ranks the weak-scaling efficiency is about 0.12 for \code{date}, 0.3 for \code{transpose} and 0.55 for \code{factor}, and \code{factor} has one outlier above 1 at 144 ranks.
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{\PCAFigureDir/strong_scaling.png}
 \medskip
 \includegraphics[width=0.75\linewidth]{\PCAFigureDir/weak_scaling.png}
-\caption{CPU strong scaling (top) and weak scaling (bottom) of the PCA module. Layouts differ in reading, preparation and communication; comparisons use their own total times.}
+\caption{CPU scaling of the PCA module on all 9388 matrices $R$. Top: strong-scaling total time, speed-up and parallel efficiency. Bottom: weak-scaling total time and efficiency $T_1/T_p$. \code{date} partitions dates and reduces every iteration; \code{transpose} redistributes to whole factors and solves locally; \code{factor} assigns whole factors directly. The layouts differ in reading, preparation and communication, so each is judged by its own total time. Note that a layout has different colours in the top and bottom plots.}
 \label{fig:pca-scaling}
 \end{figure}
 
@@ -755,7 +759,7 @@ Given identical signatures, candidate actions, nearest keys, replaced keys and f
 An initial interface check uses 120 dates, 300 stocks and 6 fields, with one generation at each of three depths. CPU/MPI and CUDA both retain 24 archive members, with GP walltimes 189.463\,s and 268.381\,s. The full data dimensions are then used: 1461 dates, 5876 stocks and 132 fields, population 64, warm-start multiplier 3, gene-pool limit 32, and one generation at each depth 1, 2 and 3. Windows are 1/5/10/15/20/30/60, sampling is every fifth date, and power iteration uses four FP64 steps. Table~\ref{tab:live-gp} reports this configuration.
 \begin{table}[H]
 \centering\small
-\caption{Three-depth GP integration at full data dimensions. Setup and GP walltime are timed separately; the shared-CPU row is a later independent run.}
+\caption{Three-depth GP runs on the full data (1461 days, 5876 stocks, 132 fields), population 64, one generation per depth. ``Setup'' is field profiling or cache loading; ``GP walltime'' is the elapsed real time of the whole GP run. All three runs end with the same 325 archive members; the shared-CPU row is a later run on a shared machine.}
 \label{tab:live-gp}
 \begin{tabular}{lrrrrrr}
 \toprule
@@ -791,7 +795,7 @@ Among 9388 matrices, 13.9\% have $\sigma_2/\sigma_1>0.9$. With seed 0, four-step
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.92\linewidth]{\PCAFigureDir/convergence.png}
-\caption{Direction errors of power iteration and Lanczos against iteration count (left) and actual matrix--vector products (right).}
+\caption{Median direction error $e$ (Eq.~(\ref{eq:direction-error}); smaller is closer to the exact SVD) of power iteration (blue) and Lanczos (orange) over 9388 matrices, against iteration count (left) and actual matrix--vector products excluding the residual check (right). The shaded bands on the left show the spread over matrices. For the same number of products, Lanczos converges faster.}
 \label{fig:solver-convergence}
 \end{figure}
 
@@ -799,7 +803,7 @@ Among 9388 matrices, 13.9\% have $\sigma_2/\sigma_1>0.9$. With seed 0, four-step
 SVD first determines an offline iteration budget for each matrix, capped at ten steps. Both methods process all 9388 matrices; unreached targets are reported separately. Costs are then compared on the 6679 matrices where both methods reach the target (Table~\ref{tab:solver-cost}, Figure~\ref{fig:solver-cost}). This common reached set means both methods attain the same error threshold within ten steps, avoiding a timing comparison at different accuracies. Lanczos reaches more matrices and reduces common-set solve time from 10.235\,s to 8.154\,s, about 20.3\%.
 \begin{table}[H]
 \centering\small
-\caption{Matched-accuracy comparison. Reached/unreached counts cover all matrices; the final three columns cover only the common 6679. Logical payload uses decimal GB.}
+\caption{Cost of reaching the same accuracy ($e\le10^{-6}$ within ten steps). The reached and unreached counts cover all 9388 matrices; solve time, Allreduce calls and logical payload cover only the 6679 matrices that both methods reach. Logical payload uses decimal GB.}
 \label{tab:solver-cost}
 \begin{tabular}{lrrrrr}
 \toprule
@@ -813,7 +817,7 @@ Lanczos & 8179 & 1209 & 8.154 & 109162 & 1.127 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.93\linewidth]{\PCAFigureDir/full_accuracy_cost.png}
-\caption{Solve time, reduction calls and logical communication payload for the common reached set.}
+\caption{The last three columns of Table~\ref{tab:solver-cost} (8 MPI ranks, 6679 commonly reached matrices): sum of per-rank maximum solve time (left), Allreduce calls (middle) and logical communication payload (right). Lanczos makes more calls but moves less data and solves faster in total.}
 \label{fig:solver-cost}
 \end{figure}
 
@@ -823,7 +827,7 @@ Lanczos reorthogonalisation adds scalar reductions, but the required iteration b
 Use four-step power iteration with seed 0 as the baseline. Candidate order and quality are fixed; only the signature method and budget change. Action changes count differences between admit, replace and reject; nearest-record changes also include cases where the action stays the same but the matched record differs. Table~\ref{tab:decision-change} shows that eight-step power changes 637 actions and gives a final-membership symmetric difference of 372. This counts both members entering and leaving, not replacement events: one member removed and another added contribute 2. The complete experiment stores 60 trajectories, and different starts also give changes (Figure~\ref{fig:decision-change}).
 \begin{table}[H]
 \centering\small
-\caption{Admission changes relative to the four-step power baseline.}
+\caption{Changes in QD archive decisions against the four-step power-iteration baseline (seed 0) when only the solver and step count $k$ change. Action changes: candidates whose add, replace or reject decision differs; nearest-record changes: also cases with the same decision but a different nearest archive member; final symmetric difference: members present in only one of the two final archives.}
 \label{tab:decision-change}
 \begin{tabular}{lrrrr}
 \toprule
@@ -841,7 +845,7 @@ Lanczos & 8 & 758 & 4945 & 461 \\
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.72\linewidth]{\PCAFigureDir/decision_sensitivity.png}
-\caption{Effects of solver, budget and starting vector on admission actions.}
+\caption{Admission-action changes against the baseline (power iteration, $k=4$, seed 0) as a function of iteration count, for both solvers and three starting vectors (seeds 0/1/2). Only the baseline itself is zero; with more steps all curves settle near 700, so a more accurate signature also changes a stable share of decisions.}
 \label{fig:decision-change}
 \end{figure}
 
