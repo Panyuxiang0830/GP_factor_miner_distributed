@@ -119,6 +119,35 @@ Evolution runs in three stages, with maximum tree depth $1$, $2$ and $3$. Each s
   \item random immigrants make up $10\%$ of each generation;
   \item at the end of a stage, the best $2{,}000$ admitted expressions become a \emph{gene pool}; deeper stages build $70\%$ of their subtrees from these gene pools.
 \end{itemize}
+Figure~\ref{fig:gp} shows the whole loop.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, align=center, minimum height=1.55cm, text width=2.95cm, font=\footnotesize},
+  par/.style={fill=blue!8},
+  grp/.style={draw, dashed, rounded corners, inner sep=0.2cm},
+  lab/.style={font=\scriptsize},
+  arr/.style={-{Stealth}, thick}]
+\node[box] (warm) {\textbf{Warm start}\\ propose $3\times$ population\\of depth-$d$ trees, reusing\\gene-pool subtrees};
+\node[box, par, right=0.6cm of warm] (eval) {\textbf{Evaluate}\\ factor values, daily\\RankIC and fitness\\(Eq.~(2))};
+\node[box, par, right=0.6cm of eval] (qd) {\textbf{PCA-QD archive}\\ signatures, similarity;\\admit or replace\\in order};
+\node[box, right=1.35cm of qd] (pool) {\textbf{Gene pool}\\ best 2{,}000 admitted\\expressions of\\the stage};
+\node[box, below=1.2cm of qd] (sel) {\textbf{Select parents}\\ tournament or\\ $\varepsilon$-lexicase};
+\node[box, below=1.2cm of eval] (var) {\textbf{Make offspring}\\ crossover, mutation;\\2 per family;\\10\% immigrants};
+\node[grp, fit=(eval)(qd), label={[font=\footnotesize]above:parallelised in this work (Sections~\ref{sec:fc}, \ref{sec:pca})}] {};
+\coordinate (low) at ([yshift=-0.55cm]var.south);
+\draw[arr] (warm) -- (eval);
+\draw[arr] (eval) -- (qd);
+\draw[arr] (qd) -- (sel);
+\draw[arr] (sel) -- (var);
+\draw[arr] (var) -- node[right, lab, align=left]{next gen.\\(10 in all)} (eval);
+\draw[arr] (qd) -- node[above, lab, align=center]{after\\gen.\ 10} (pool);
+\draw[arr] (pool.south) -- (pool.south |- low) -- node[below, lab]{next stage: depth $d\to d+1$ ($d=1,2,3$)} (warm.south |- low) -- (warm.south);
+\end{tikzpicture}
+\caption{The hierarchical GP. Each stage starts with a warm start and then evolves for 10 generations; every generation evaluates a full batch of new expressions and updates the PCA-QD archive. The gene pool at the end of a stage supplies subtrees to deeper stages. Shaded boxes are the work done in parallel by the C++ engine; admission itself remains sequential.}
+\label{fig:gp}
+\end{figure}
 
 \subsection{PCA-QD diversity archive}
 \label{sec:pcaqd}

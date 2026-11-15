@@ -118,6 +118,35 @@ GP 的一个阶段大约评估 $10^5$ 个表达式（10 代，每代 10{,}000 �
   \item 每一代有 $10\%$ 是随机移民；
   \item 每个阶段结束时，最好的 $2{,}000$ 个已入档表达式组成\emph{基因池}；更深的阶段有 $70\%$ 的子树取自这些基因池。
 \end{itemize}
+图~\ref{fig:gp} 给出整个流程。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners, align=center, minimum height=1.55cm, text width=2.95cm, font=\footnotesize},
+  par/.style={fill=blue!8},
+  grp/.style={draw, dashed, rounded corners, inner sep=0.2cm},
+  lab/.style={font=\scriptsize},
+  arr/.style={-{Stealth}, thick}]
+\node[box] (warm) {\textbf{热启动}\\ 提出 $3\times$ 种群规模的\\深度 $d$ 表达式；更深阶段\\取用基因池子树};
+\node[box, par, right=0.6cm of warm] (eval) {\textbf{评估}\\ 因子值、每日 RankIC\\与适应度（式~(2)）};
+\node[box, par, right=0.6cm of eval] (qd) {\textbf{PCA-QD 档案}\\ 签名与相似度；\\按顺序准入或替换};
+\node[box, right=1.35cm of qd] (pool) {\textbf{基因池}\\ 本阶段最好的\\2{,}000 个入档表达式};
+\node[box, below=1.2cm of qd] (sel) {\textbf{选择父代}\\ 锦标赛或\\ $\varepsilon$-lexicase};
+\node[box, below=1.2cm of eval] (var) {\textbf{产生子代}\\ 交叉与变异；每家族\\留 2 个；10\% 随机移民};
+\node[grp, fit=(eval)(qd), label={[font=\footnotesize]above:本文并行化的部分（第~\ref{sec:fc}、\ref{sec:pca}~节）}] {};
+\coordinate (low) at ([yshift=-0.55cm]var.south);
+\draw[arr] (warm) -- (eval);
+\draw[arr] (eval) -- (qd);
+\draw[arr] (qd) -- (sel);
+\draw[arr] (sel) -- (var);
+\draw[arr] (var) -- node[right, lab]{下一代（共 10 代）} (eval);
+\draw[arr] (qd) -- node[above, lab]{10 代后} (pool);
+\draw[arr] (pool.south) -- (pool.south |- low) -- node[below, lab]{进入下一阶段：深度 $d\to d+1$（$d=1,2,3$）} (warm.south |- low) -- (warm.south);
+\end{tikzpicture}
+\caption{分层遗传规划的流程。每个阶段先热启动，再进化 10 代；每一代都要评估一整批新表达式并更新 PCA-QD 档案。阶段结束时的基因池为更深的阶段提供子树。阴影框是 C++ 引擎承担并行计算的部分；准入本身仍是串行的。}
+\label{fig:gp}
+\end{figure}
 
 \subsection{PCA-QD 多样性档案}
 \label{sec:pcaqd}
