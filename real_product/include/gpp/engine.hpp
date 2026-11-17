@@ -14,6 +14,7 @@
 // groups of expressions that share subtrees (sorted by child node) and each
 // group is planned and executed on its own.
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -99,6 +100,7 @@ private:
     std::vector<double> target_rank_;
     std::vector<double> initial_;
     gpe::BufferPool pool_;
+    bool trace_ = std::getenv("GPP_TRACE") != nullptr;  // per-chunk timing on stderr
     std::vector<ScoreScratch> scratch_;
     EngineStats stats_;
     std::unique_ptr<GpuScorer> gpu_;

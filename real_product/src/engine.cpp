@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <numeric>
 #include <set>
@@ -18,11 +20,38 @@ class GpuScorer {};  // CPU-only build: never instantiated
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace gpp {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// GPP_NUMA_INTERLEAVE=1: spread pages allocated from now on round-robin over
+// all NUMA nodes (set_mempolicy(MPOL_INTERLEAVE)). Panels are written by one
+// thread and read by threads on every socket, so first-touch placement piles
+// them on one node and the other socket's cores stall on remote reads. The
+// policy is per thread and inherited by threads created later (the OpenMP
+// pool), so call it before the first parallel region.
+void numa_interleave() {
+#if defined(__linux__) && defined(SYS_set_mempolicy)
+    if (!std::getenv("GPP_NUMA_INTERLEAVE")) return;
+    unsigned long mask[16] = {0};
+    int nodes = 0;
+    for (int n = 0; n < 1024; ++n) {
+        const std::string path = "/sys/devices/system/node/node" + std::to_string(n);
+        if (access(path.c_str(), F_OK) != 0) continue;
+        mask[n / 64] |= 1UL << (n % 64);
+        ++nodes;
+    }
+    const int MPOL_INTERLEAVE_ = 3;
+    if (nodes > 1 && syscall(SYS_set_mempolicy, MPOL_INTERLEAVE_, mask, 1024 + 1) != 0)
+        std::fprintf(stderr, "[gpp] set_mempolicy(MPOL_INTERLEAVE) failed\n");
+#endif
+}
 double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
 
 int max_threads() {
@@ -71,6 +100,7 @@ void collect_fields(const gpe::Json& e, std::vector<std::string>& out) {
 }
 
 Engine::Engine(gpe::PanelSet data, EngineOptions options) : data_(std::move(data)), options_(options) {
+    numa_interleave();
     threads_ = options_.threads > 0 ? options_.threads : max_threads();
 #ifdef _OPENMP
     omp_set_num_threads(threads_);
@@ -323,10 +353,31 @@ void Engine::run_group(const gpe::Dag& dag, std::vector<RootScore>& scores) {
             if (static_cast<int>(work.size()) >= options_.narrow_level) {
                 // Node-parallel: one task per node; a root is scored by the
                 // same thread while its panel is still in that core's cache.
+                std::vector<double> op_s(trace_ ? work.size() : 0), score_s(op_s.size());
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (long k = 0; k < static_cast<long>(work.size()); ++k) {
+                    auto t0 = Clock::now();
                     compute(work[k]);
+                    auto t1 = Clock::now();
                     if (is_root[work[k]]) score(work[k]);
+                    if (trace_) {
+                        op_s[k] = std::chrono::duration<double>(t1 - t0).count();
+                        score_s[k] = since(t1);
+                    }
+                }
+                if (trace_) {
+                    size_t worst = 0;
+                    for (size_t k = 0; k < op_s.size(); ++k)
+                        if (op_s[k] + score_s[k] > op_s[worst] + score_s[worst]) worst = k;
+                    std::fprintf(stderr,
+                                 "[gpp trace] chunk %ld: %zu tasks, %zu roots, wall %.2f s, op %.1f core-s, score %.1f "
+                                 "core-s, slowest task %.2f s (%s window %d)\n",
+                                 stats_.chunks, work.size(), done.size(), since(t),
+                                 std::accumulate(op_s.begin(), op_s.end(), 0.0),
+                                 std::accumulate(score_s.begin(), score_s.end(), 0.0),
+                                 op_s.empty() ? 0.0 : op_s[worst] + score_s[worst],
+                                 op_s.empty() ? "-" : gpe::op_info(nodes[work[worst]].op).name,
+                                 op_s.empty() ? -1 : nodes[work[worst]].window);
                 }
                 std::vector<int> leaf_roots;
                 for (int i : done)
@@ -340,6 +391,9 @@ void Engine::run_group(const gpe::Dag& dag, std::vector<RootScore>& scores) {
                 for (int i : work) compute(i);
                 #pragma omp parallel for schedule(dynamic, 1)
                 for (long k = 0; k < static_cast<long>(done.size()); ++k) score(done[k]);
+                if (trace_)
+                    std::fprintf(stderr, "[gpp trace] chunk %ld: narrow, %zu tasks, %zu roots, wall %.2f s\n",
+                                 stats_.chunks, work.size(), done.size(), since(t));
             }
             stats_.compute += since(t);
 

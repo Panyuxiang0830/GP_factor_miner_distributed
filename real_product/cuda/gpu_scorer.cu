@@ -2,7 +2,7 @@
 //
 // Bit-for-bit target: score_root() in src/scoring.cpp. Everything that is a
 // floating-point reduction runs as the same sequential loop as the CPU code
-// (one thread per sum), and the build disables FMA contraction on both
+// (one thread per sum; reduce_kernel runs all days' sums at once), and the build disables FMA contraction on both
 // sides (nvcc --fmad=false, host -ffp-contract=off). What is parallel is the
 // part with exact results: the per-day sort (cub::BlockRadixSort), average
 // ranks (integer scans), element-wise row writes, and independent rows /
@@ -57,6 +57,8 @@ struct DayArgs {
     unsigned long long* valid;
     double* R;                // m x N  (row-major, for multiply_t)
     double* RT;               // N x m  (for multiply)
+    double* ranks;            // days x N average ranks (NaN where the factor is NaN)
+    double* means;            // m: mean of the sampled rank rows (NaN -> 0.5)
 };
 
 // One block per scored day.
@@ -75,8 +77,7 @@ __global__ void __launch_bounds__(kThreads) day_kernel(DayArgs a) {
         After after;
     } tmp;
     __shared__ int s_nvalid, s_pairs;
-    __shared__ double s_mean;
-    extern __shared__ double rank[];  // N
+    double* rank = a.ranks + static_cast<size_t>(blockIdx.x) * a.N;  // global row of this day
 
     const int d = blockIdx.x, t = a.begin + d, N = a.N;
     const float* f = a.panel + static_cast<size_t>(t) * N;
@@ -138,52 +139,62 @@ __global__ void __launch_bounds__(kThreads) day_kernel(DayArgs a) {
     }
     __syncthreads();
 
+    if (threadIdx.x == 0) atomicAdd(a.valid, static_cast<unsigned long long>(s_pairs));
+}
+
+// The sequential reductions of one day, one thread per day: pearson_pairwise
+// with the CPU's loops, and (sampled days) the sum for the row mean. Each sum
+// keeps its own accumulator in the CPU's order, so the results are bitwise the
+// CPU's; running all days' chains at once replaces a block per day in which
+// only thread 0 worked.
+__global__ void reduce_kernel(DayArgs a) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= a.days) return;
+    const int N = a.N;
+    const double* rank = a.ranks + static_cast<size_t>(d) * N;
+    const double* y = a.target + static_cast<size_t>(a.begin + d) * N;
     const bool sampled = a.m > 0 && d % a.sig_step == 0;
-    if (threadIdx.x == 0) {
-        // pearson_pairwise, same loops.
-        double sx = 0.0, sy = 0.0, x0 = 0.0, y0 = 0.0;
-        int cnt = 0;
-        bool xc = true, yc = true;
+    double sx = 0.0, sy = 0.0, x0 = 0.0, y0 = 0.0, sum = 0.0;
+    int cnt = 0;
+    bool xc = true, yc = true;
+    for (int s = 0; s < N; ++s) {
+        const double xv = rank[s], yv = y[s];
+        if (sampled) sum += isnan(xv) ? 0.5 : xv;
+        if (isnan(xv) || isnan(yv)) continue;
+        if (cnt == 0) { x0 = xv; y0 = yv; }
+        xc = xc && xv == x0;
+        yc = yc && yv == y0;
+        sx += xv; sy += yv; ++cnt;
+    }
+    if (sampled) a.means[d / a.sig_step] = sum / N;
+    double r = CUDART_NAN;
+    if (!(cnt < 2 || xc || yc)) {
+        const double mx = sx / cnt, my = sy / cnt;
+        double sxy = 0.0, sxx = 0.0, syy = 0.0;
         for (int s = 0; s < N; ++s) {
             const double xv = rank[s], yv = y[s];
             if (isnan(xv) || isnan(yv)) continue;
-            if (cnt == 0) { x0 = xv; y0 = yv; }
-            xc = xc && xv == x0;
-            yc = yc && yv == y0;
-            sx += xv; sy += yv; ++cnt;
+            const double dx = xv - mx, dy = yv - my;
+            sxy += dx * dy;
+            sxx += dx * dx;
+            syy += dy * dy;
         }
-        double r = CUDART_NAN;
-        if (!(cnt < 2 || xc || yc)) {
-            const double mx = sx / cnt, my = sy / cnt;
-            double sxy = 0.0, sxx = 0.0, syy = 0.0;
-            for (int s = 0; s < N; ++s) {
-                const double xv = rank[s], yv = y[s];
-                if (isnan(xv) || isnan(yv)) continue;
-                const double dx = xv - mx, dy = yv - my;
-                sxy += dx * dy;
-                sxx += dx * dx;
-                syy += dy * dy;
-            }
-            const double dom = (cnt - 1) * sqrt(sxx / (cnt - 1)) * sqrt(syy / (cnt - 1));
-            r = sxy / dom;
-            if (isinf(r)) r = CUDART_NAN;
-        }
-        a.ic[d] = r;
-        atomicAdd(a.valid, static_cast<unsigned long long>(s_pairs));
-    } else if (threadIdx.x == 32 && sampled) {  // another warp: runs concurrently
-        double sum = 0.0;
-        for (int s = 0; s < N; ++s) sum += isnan(rank[s]) ? 0.5 : rank[s];
-        s_mean = sum / N;
+        const double dom = (cnt - 1) * sqrt(sxx / (cnt - 1)) * sqrt(syy / (cnt - 1));
+        r = sxy / dom;
+        if (isinf(r)) r = CUDART_NAN;
     }
-    __syncthreads();
-    if (sampled) {
-        const int q = d / a.sig_step;
-        const double mean = s_mean;
-        for (int s = threadIdx.x; s < N; s += kThreads) {
-            const double v = (isnan(rank[s]) ? 0.5 : rank[s]) - mean;
-            a.R[static_cast<size_t>(q) * N + s] = v;
-            a.RT[static_cast<size_t>(s) * a.m + q] = v;
-        }
+    a.ic[d] = r;
+}
+
+// Centred sampled rows for the power iteration, one block per sampled day.
+__global__ void signature_rows_kernel(DayArgs a) {
+    const int q = blockIdx.x, N = a.N;
+    const double* rank = a.ranks + static_cast<size_t>(q) * a.sig_step * N;
+    const double mean = a.means[q];
+    for (int s = threadIdx.x; s < N; s += blockDim.x) {
+        const double v = (isnan(rank[s]) ? 0.5 : rank[s]) - mean;
+        a.R[static_cast<size_t>(q) * N + s] = v;
+        a.RT[static_cast<size_t>(s) * a.m + q] = v;
     }
 }
 
@@ -225,12 +236,6 @@ __global__ void unit_kernel(double* a, int n, int* flag) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) a[i] = a[i] / s_norm;
 }
 
-template <int ITEMS>
-void enable_shared(int N) {
-    GPP_CUDA(cudaFuncSetAttribute(day_kernel<ITEMS>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  static_cast<int>(N * sizeof(double))));
-}
-
 // Host copy of pca::unit (same arithmetic; compiled without contraction).
 bool unit_host(std::vector<double>& a) {
     double s = 0.0;
@@ -255,6 +260,7 @@ struct GpuScorer::Impl {
         cudaStream_t stream = nullptr;
         float* h_panel = nullptr;
         float* d_panel = nullptr;
+        double *d_ranks = nullptr, *d_means = nullptr;
         double *d_R = nullptr, *d_RT = nullptr, *d_left = nullptr, *d_right = nullptr, *d_ic = nullptr;
         unsigned long long* d_valid = nullptr;
         int* d_flag = nullptr;
@@ -278,11 +284,12 @@ struct GpuScorer::Impl {
 
     void launch(Slot& s) {
         DayArgs a{s.d_panel, devices[s.device].target, N, options.begin, days, options.signature_step, m,
-                  s.d_ic, s.d_valid, s.d_R, s.d_RT};
-        const size_t shared = static_cast<size_t>(N) * sizeof(double);
-        if (items == 4) day_kernel<4><<<days, kThreads, shared, s.stream>>>(a);
-        else if (items == 8) day_kernel<8><<<days, kThreads, shared, s.stream>>>(a);
-        else day_kernel<12><<<days, kThreads, shared, s.stream>>>(a);
+                  s.d_ic, s.d_valid, s.d_R, s.d_RT, s.d_ranks, s.d_means};
+        if (items == 4) day_kernel<4><<<days, kThreads, 0, s.stream>>>(a);
+        else if (items == 8) day_kernel<8><<<days, kThreads, 0, s.stream>>>(a);
+        else day_kernel<12><<<days, kThreads, 0, s.stream>>>(a);
+        reduce_kernel<<<(days + 63) / 64, 64, 0, s.stream>>>(a);
+        if (m > 0) signature_rows_kernel<<<m, 256, 0, s.stream>>>(a);
         GPP_CUDA(cudaGetLastError());
         if (m > 0) {
             // pca::solve(power): right = unit(initial); steps x (left = unit(R right);
@@ -358,9 +365,6 @@ GpuScorer::GpuScorer(int gpus, int streams_per_gpu, int T, int N, const std::vec
         Impl::Device& dev = I.devices[g];
         dev.id = g;
         GPP_CUDA(cudaSetDevice(g));
-        if (I.items == 4) enable_shared<4>(N);
-        else if (I.items == 8) enable_shared<8>(N);
-        else enable_shared<12>(N);
         GPP_CUDA(cudaMalloc(&dev.target, panel * sizeof(double)));
         GPP_CUDA(cudaMemcpy(dev.target, target_rank.data(), panel * sizeof(double), cudaMemcpyHostToDevice));
         GPP_CUDA(cudaMalloc(&dev.initial, N * sizeof(double)));
@@ -380,6 +384,8 @@ GpuScorer::GpuScorer(int gpus, int streams_per_gpu, int T, int N, const std::vec
         GPP_CUDA(cudaMalloc(&s.d_left, std::max(I.m, 1) * sizeof(double)));
         GPP_CUDA(cudaMalloc(&s.d_right, N * sizeof(double)));
         GPP_CUDA(cudaMalloc(&s.d_ic, I.days * sizeof(double)));
+        GPP_CUDA(cudaMalloc(&s.d_ranks, static_cast<size_t>(I.days) * N * sizeof(double)));
+        GPP_CUDA(cudaMalloc(&s.d_means, std::max(I.m, 1) * sizeof(double)));
         GPP_CUDA(cudaMalloc(&s.d_valid, sizeof(unsigned long long)));
         GPP_CUDA(cudaMalloc(&s.d_flag, sizeof(int)));
         GPP_CUDA(cudaMallocHost(&s.h_ic, I.days * sizeof(double)));
@@ -400,7 +406,7 @@ GpuScorer::~GpuScorer() {
         cudaSetDevice(impl_->devices[s.device].id);
         cudaStreamDestroy(s.stream);
         cudaFreeHost(s.h_panel); cudaFree(s.d_panel); cudaFree(s.d_R); cudaFree(s.d_RT);
-        cudaFree(s.d_left); cudaFree(s.d_right); cudaFree(s.d_ic); cudaFree(s.d_valid); cudaFree(s.d_flag);
+        cudaFree(s.d_left); cudaFree(s.d_right); cudaFree(s.d_ic); cudaFree(s.d_ranks); cudaFree(s.d_means); cudaFree(s.d_valid); cudaFree(s.d_flag);
         cudaFreeHost(s.h_ic); cudaFreeHost(s.h_sig); cudaFreeHost(s.h_valid); cudaFreeHost(s.h_flag);
     }
     for (auto& dev : impl_->devices) {
