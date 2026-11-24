@@ -1,0 +1,8 @@
+{
+  "_comment": "256 GB host without GPUs (or without a CUDA build): RankIC and signatures run on the CPU threads inside the node tasks.",
+  "gp": {
+    "engine_threads": 128, "gpus": 0,
+    "memory_budget_gb": 180, "engine_max_chunk": 2000,
+    "progress_chunk_size": 50000, "screening_engine_batch": 50000
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "_comment": "1 TB host. Engine budget 850 GB = ~24,700 panels; a 100k batch runs as a handful of groups.",
+  "gp": {
+    "engine_threads": 128, "gpus": 4, "streams_per_gpu": 4,
+    "memory_budget_gb": 850, "engine_max_chunk": 8000,
+    "progress_chunk_size": 100000, "screening_engine_batch": 150000
+  }
+}
